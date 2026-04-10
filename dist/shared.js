@@ -32,8 +32,12 @@ import { minimatch } from "minimatch";
 export const CHAR_BUDGET = (() => {
     const env = process.env.CHAR_BUDGET;
     if (env) {
-        const parsed = parseInt(env, 10);
-        if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        // Validate that env is a strictly numeric integer string before parsing
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
     }
     return 400_000;
 })();

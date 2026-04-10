@@ -116,6 +116,17 @@ export function register(server) {
 
         const treeData = await buildTree(rootPath, args.excludePatterns);
 
+        // Escape control characters to prevent line-oriented output from breaking
+        function escapeControlChars(str) {
+            return str.replace(/[\x00-\x1F\x7F]/g, (char) => {
+                const code = char.charCodeAt(0);
+                if (code === 0x09) return '\\t';
+                if (code === 0x0A) return '\\n';
+                if (code === 0x0D) return '\\r';
+                return `\\x${code.toString(16).padStart(2, '0')}`;
+            });
+        }
+
         // Format as indented text — more LLM-readable than JSON, ~51% smaller,
         // carries identical information. Tree output is for navigation, not editing,
         // so the agent never needs to copy-paste this into tool calls verbatim.
@@ -124,13 +135,16 @@ export function register(server) {
             const indent = '  '.repeat(depth);
             for (const entry of entries) {
                 if (entry.children) {
-                    lines.push(`${indent}${entry.name}/`);
+                    lines.push(`${indent}${escapeControlChars(entry.name)}/`);
                     lines.push(...formatIndent(entry.children, depth + 1));
                 } else {
                     let suffix = '';
-                    if (entry.symbols) suffix += `  (${entry.symbols})`;
-                    if (entry.symbolNames) suffix += `  [${entry.symbolNames.join(', ')}]`;
-                    lines.push(`${indent}${entry.name}${suffix}`);
+                    if (entry.symbols) suffix += `  (${escapeControlChars(entry.symbols)})`;
+                    if (entry.symbolNames) {
+                        const sanitizedNames = entry.symbolNames.map(escapeControlChars);
+                        suffix += `  [${sanitizedNames.join(', ')}]`;
+                    }
+                    lines.push(`${indent}${escapeControlChars(entry.name)}${suffix}`);
                 }
             }
             return lines;

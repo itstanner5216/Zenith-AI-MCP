@@ -200,9 +200,9 @@ export function register(server) {
         let successCount = 0;
         const errors = [];
 
-        // Track cumulative line delta from range-based edits.
-        // When edit #1 replaces N lines with M lines, subsequent range-based edits
-        // need their startLine/endLine adjusted by (M - N). This is internal
+        // Track cumulative line delta from all edits (range, oldText, symbol).
+        // When edit #1 replaces N lines with M lines, subsequent coordinate-based edits
+        // need their startLine/endLine/nearLine adjusted by (M - N). This is internal
         // bookkeeping — the agent still provides line numbers from its last read,
         // and the server compensates for edits it already applied in this batch.
         let lineDelta = 0;
@@ -321,9 +321,12 @@ export function register(server) {
                     continue;
                 }
 
+                // Apply cumulative line delta to nearLine if provided
+                const adjustedNearLine = edit.nearLine ? edit.nearLine + lineDelta : undefined;
+
                 const symbolMatches = await findSymbol(workingContent, langName, edit.symbol, {
                     kindFilter: 'def',
-                    nearLine: edit.nearLine,
+                    nearLine: adjustedNearLine,
                 });
 
                 if (!symbolMatches || symbolMatches.length === 0) {
@@ -342,8 +345,12 @@ export function register(server) {
                 const end = sym.endLine;       // endLine is inclusive, splice end is exclusive
                 const normalizedNew = normalizeLineEndings(resolvedNewText);
                 const newLines = normalizedNew.split('\n');
-                lines.splice(start, end - start, ...newLines);
+                const oldLineCount = end - start;
+                lines.splice(start, oldLineCount, ...newLines);
                 workingContent = lines.join('\n');
+
+                // Update cumulative line delta
+                lineDelta += newLines.length - oldLineCount;
 
                 successCount++;
                 continue;
@@ -355,7 +362,10 @@ export function register(server) {
                 continue;
             }
 
-            const match = findMatch(workingContent, edit.oldText, edit.nearLine);
+            // Apply cumulative line delta to nearLine if provided
+            const adjustedNearLine = edit.nearLine ? edit.nearLine + lineDelta : undefined;
+
+            const match = findMatch(workingContent, edit.oldText, adjustedNearLine);
 
             if (!match) {
                 errors.push(generateDiagnostic(workingContent, edit.oldText, i, isBatch));
@@ -365,10 +375,13 @@ export function register(server) {
             // Apply edit to working copy
             const normalizedNew = normalizeLineEndings(resolvedNewText);
 
+            // Compute line delta for this edit
+            const oldLines = match.matchedText.split('\n');
+            const newLines = normalizedNew.split('\n');
+
             if (match.strategy === 'indent-stripped') {
                 // Preserve original indentation when applying indent-stripped match
                 const matchedLines = match.matchedText.split('\n');
-                const newLines = normalizedNew.split('\n');
                 const originalIndent = matchedLines[0].match(/^\s*/)?.[0] || '';
                 const oldIndent = normalizeLineEndings(edit.oldText).split('\n')[0].match(/^\s*/)?.[0] || '';
 
@@ -388,6 +401,9 @@ export function register(server) {
                     normalizedNew +
                     workingContent.slice(match.index + match.matchedText.length);
             }
+
+            // Update cumulative line delta
+            lineDelta += newLines.length - oldLines.length;
 
             successCount++;
         }
@@ -443,14 +459,22 @@ export function register(server) {
         // Post-edit AST error detection — strictly additive, never hides content.
         // If the edited file has a supported language, parse it and warn about
         // syntax errors the edit may have introduced.
+        // Skip syntax checks for lossy aliases (.scss->css, .mdx->markdown) to avoid false warnings.
         let syntaxWarning = '';
         try {
-            const langName = getLangForFile(validPath);
-            if (langName) {
-                const syntaxErrors = await checkSyntaxErrors(workingContent, langName);
-                if (syntaxErrors && syntaxErrors.length > 0) {
-                    const locations = syntaxErrors.map(e => `${e.line}:${e.column}`).join(', ');
-                    syntaxWarning = `\n⚠ Parse errors at lines ${locations}`;
+            const ext = path.extname(validPath).toLowerCase();
+            // Skip lossy aliases: .scss and .mdx are mapped to css/markdown but have different syntax
+            const lossyAliases = ['.scss', '.mdx'];
+            const isLossyAlias = lossyAliases.includes(ext);
+
+            if (!isLossyAlias) {
+                const langName = getLangForFile(validPath);
+                if (langName) {
+                    const syntaxErrors = await checkSyntaxErrors(workingContent, langName);
+                    if (syntaxErrors && syntaxErrors.length > 0) {
+                        const locations = syntaxErrors.map(e => `${e.line}:${e.column}`).join(', ');
+                        syntaxWarning = `\n⚠ Parse errors at lines ${locations}`;
+                    }
                 }
             }
         } catch {
