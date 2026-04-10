@@ -1,2 +1,0 @@
-# Zenith-AI-MCP
- 
