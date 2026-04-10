@@ -26,7 +26,17 @@ import { minimatch } from "minimatch";
 // Configuration
 // ---------------------------------------------------------------------------
 
-export const CHAR_BUDGET = 400_000; // safe margin under Claude's 500k limit
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const parsed = parseInt(env, 10);
+        if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+    }
+    return 400_000;
+})();
 export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
 
 export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||

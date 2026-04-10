@@ -128,10 +128,7 @@ export function register(server) {
                 if (args.showLineNumbers) {
                     const lines = content.split('\n');
                     if (lines[lines.length - 1] === '') lines.pop();
-                    content = lines.map((line, i) => {
-                        const num = i + 1;
-                        return (num === 1 || num % 10 === 0) ? `${num}: ${line}` : line;
-                    }).join('\n');
+                    content = lines.map((line, i) => `${i + 1}:${line}`).join('\n');
                 }
 
                 return truncated

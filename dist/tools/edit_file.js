@@ -3,7 +3,7 @@ import fs from "fs/promises";
 import path from 'path';
 import { randomBytes } from 'crypto';
 import { validatePath, normalizeLineEndings, createMinimalDiff } from '../lib.js';
-import { getLangForFile, findSymbol } from '../tree-sitter.js';
+import { getLangForFile, findSymbol, checkSyntaxErrors } from '../tree-sitter.js';
 
 // Cache for failed edits — allows retry without resending newText.
 // Keyed by filePath, stores the full edits array per file.
@@ -200,6 +200,13 @@ export function register(server) {
         let successCount = 0;
         const errors = [];
 
+        // Track cumulative line delta from range-based edits.
+        // When edit #1 replaces N lines with M lines, subsequent range-based edits
+        // need their startLine/endLine adjusted by (M - N). This is internal
+        // bookkeeping — the agent still provides line numbers from its last read,
+        // and the server compensates for edits it already applied in this batch.
+        let lineDelta = 0;
+
         const isBatch = args.edits.length > 1;
         for (let i = 0; i < args.edits.length; i++) {
             const edit = args.edits[i];
@@ -217,8 +224,12 @@ export function register(server) {
             // ---- RANGE-BASED EDIT MODE ----
             if (typeof edit.startLine === 'number' && typeof edit.endLine === 'number') {
                 const lines = workingContent.split('\n');
-                const start = edit.startLine - 1;  // convert to 0-based
-                const end = edit.endLine;           // endLine is inclusive, slice end is exclusive
+
+                // Apply cumulative line delta from prior range-based edits in this batch
+                const adjustedStartLine = edit.startLine + lineDelta;
+                const adjustedEndLine = edit.endLine + lineDelta;
+                const start = adjustedStartLine - 1;  // convert to 0-based
+                const end = adjustedEndLine;           // endLine is inclusive, slice end is exclusive
 
                 if (resolvedNewText === undefined) {
                     errors.push(`${tag}newText required.`);
@@ -243,13 +254,13 @@ export function register(server) {
 
                 if (actualStart === '' && expectedStart === '') {
                     cachePendingBatch(validPath, args.edits);
-                    errors.push(`${tag}startLine ${edit.startLine} is empty.`);
+                    errors.push(`${tag}startLine ${adjustedStartLine} is empty.`);
                     continue;
                 }
 
                 if (actualStart !== expectedStart) {
                     cachePendingBatch(validPath, args.edits);
-                    errors.push(`${tag}verifyStart mismatch at line ${edit.startLine}.`);
+                    errors.push(`${tag}verifyStart mismatch at line ${adjustedStartLine}.`);
                     continue;
                 }
 
@@ -265,21 +276,25 @@ export function register(server) {
 
                 if (actualEnd === '') {
                     cachePendingBatch(validPath, args.edits);
-                    errors.push(`${tag}endLine ${edit.endLine} is empty.`);
+                    errors.push(`${tag}endLine ${adjustedEndLine} is empty.`);
                     continue;
                 }
 
                 if (actualEnd !== expectedEnd) {
                     cachePendingBatch(validPath, args.edits);
-                    errors.push(`${tag}verifyEnd mismatch at line ${edit.endLine}.`);
+                    errors.push(`${tag}verifyEnd mismatch at line ${adjustedEndLine}.`);
                     continue;
                 }
 
                 // Replace the line range
                 const normalizedNew = normalizeLineEndings(resolvedNewText);
                 const newLines = normalizedNew.split('\n');
-                lines.splice(start, end - start, ...newLines);
+                const oldLineCount = end - start;
+                lines.splice(start, oldLineCount, ...newLines);
                 workingContent = lines.join('\n');
+
+                // Update cumulative line delta for subsequent range-based edits
+                lineDelta += newLines.length - oldLineCount;
 
                 // Clear the retry cache
                 clearPendingBatch(validPath);
@@ -425,8 +440,25 @@ export function register(server) {
             };
         }
 
+        // Post-edit AST error detection — strictly additive, never hides content.
+        // If the edited file has a supported language, parse it and warn about
+        // syntax errors the edit may have introduced.
+        let syntaxWarning = '';
+        try {
+            const langName = getLangForFile(validPath);
+            if (langName) {
+                const syntaxErrors = await checkSyntaxErrors(workingContent, langName);
+                if (syntaxErrors && syntaxErrors.length > 0) {
+                    const locations = syntaxErrors.map(e => `${e.line}:${e.column}`).join(', ');
+                    syntaxWarning = `\n⚠ Parse errors at lines ${locations}`;
+                }
+            }
+        } catch {
+            // Syntax check is best-effort — never block a successful edit
+        }
+
         return {
-            content: [{ type: "text", text: "Applied." }],
+            content: [{ type: "text", text: `Applied.${syntaxWarning}` }],
         };
     });
 }
