@@ -2,14 +2,13 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
-import { validatePath } from '../lib.js';
 import { DEFAULT_EXCLUDES } from '../shared.js';
 import { isSupported, getFileSymbolSummary, getFileSymbols } from '../tree-sitter.js';
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("directory_tree", {
         title: "Directory Tree",
-        description: "Recursive tree view as JSON. Directories have 'children', files do not.",
+        description: "Recursive tree view as indented text. Directories end with '/', files may include symbol metadata.",
         inputSchema: {
             path: z.string(),
             excludePatterns: z.array(z.string()).optional().default([]),
@@ -26,11 +25,10 @@ export function register(server) {
 
         async function buildTree(currentPath, excludePatterns = []) {
             if (totalEntries >= MAX_ENTRIES) return [];
-            const validPath = await validatePath(currentPath);
+            const validPath = await ctx.validatePath(currentPath);
             const entries = await fs.readdir(validPath, { withFileTypes: true });
             const result = [];
 
-            // Separate files for parallel symbol processing
             const fileEntries = [];
             const dirEntries = [];
 
@@ -56,7 +54,6 @@ export function register(server) {
                 }
             }
 
-            // Batch symbol lookups for files in parallel
             let symbolResults = null;
             if (showSymbols && fileEntries.length > 0) {
                 const promises = fileEntries.map(async (entry) => {
@@ -64,7 +61,6 @@ export function register(server) {
                     if (!isSupported(fullPath)) return [entry.name, null, null];
                     try {
                         if (showSymbolNames) {
-                            // Get full symbol list
                             const symbols = await getFileSymbols(fullPath, { kindFilter: 'def' });
                             if (!symbols || symbols.length === 0) return [entry.name, null, null];
                             const names = symbols.slice(0, 50).map(s => `${s.name} (${s.type})`);
@@ -82,7 +78,6 @@ export function register(server) {
                 symbolResults = new Map(results.map(([name, summary, names]) => [name, { summary, names }]));
             }
 
-            // Build entries in original order (dirs first, then files)
             for (const entry of dirEntries) {
                 if (totalEntries >= MAX_ENTRIES) break;
                 const entryData = {
@@ -115,7 +110,39 @@ export function register(server) {
         }
 
         const treeData = await buildTree(rootPath, args.excludePatterns);
-        const text = JSON.stringify(treeData) + (totalEntries >= MAX_ENTRIES ? '\n## truncated ##' : '');
+
+        function escapeControlChars(str) {
+            return str.replace(/[\x00-\x1F\x7F]/g, (char) => {
+                const code = char.charCodeAt(0);
+                if (code === 0x09) return '\\t';
+                if (code === 0x0A) return '\\n';
+                if (code === 0x0D) return '\\r';
+                return `\\x${code.toString(16).padStart(2, '0')}`;
+            });
+        }
+
+        function formatIndent(entries, depth = 0) {
+            const lines = [];
+            const indent = '  '.repeat(depth);
+            for (const entry of entries) {
+                if (entry.children) {
+                    lines.push(`${indent}${escapeControlChars(entry.name)}/`);
+                    lines.push(...formatIndent(entry.children, depth + 1));
+                } else {
+                    let suffix = '';
+                    if (entry.symbols) suffix += `  (${escapeControlChars(entry.symbols)})`;
+                    if (entry.symbolNames) {
+                        const sanitizedNames = entry.symbolNames.map(escapeControlChars);
+                        suffix += `  [${sanitizedNames.join(', ')}]`;
+                    }
+                    lines.push(`${indent}${escapeControlChars(entry.name)}${suffix}`);
+                }
+            }
+            return lines;
+        }
+
+        const textLines = formatIndent(treeData);
+        const text = textLines.join('\n') + (totalEntries >= MAX_ENTRIES ? '\n## truncated ##' : '');
         return {
             content: [{ type: "text", text }],
         };

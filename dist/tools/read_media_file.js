@@ -1,6 +1,5 @@
 import { z } from "zod";
 import path from "path";
-import { validatePath } from '../lib.js';
 import { readFileAsBase64Stream } from '../shared.js';
 
 const MIME_TYPES = {
@@ -17,14 +16,14 @@ const MIME_TYPES = {
     ".flac": "audio/flac",
 };
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("read_media_file", {
         title: "Read Media File",
         description: "Read an image or audio file. Returns base64 data and MIME type.",
         inputSchema: { path: z.string() },
         annotations: { readOnlyHint: true }
     }, async (args) => {
-        const validPath = await validatePath(args.path);
+        const validPath = await ctx.validatePath(args.path);
         const extension = path.extname(validPath).toLowerCase();
         const mimeType = MIME_TYPES[extension] || "application/octet-stream";
         const data = await readFileAsBase64Stream(validPath);

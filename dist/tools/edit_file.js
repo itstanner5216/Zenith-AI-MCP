@@ -2,13 +2,11 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from 'path';
 import { randomBytes } from 'crypto';
-import { validatePath, normalizeLineEndings, createMinimalDiff } from '../lib.js';
-import { getLangForFile, findSymbol } from '../tree-sitter.js';
+import { normalizeLineEndings, createMinimalDiff } from '../lib.js';
+import { getLangForFile, findSymbol, checkSyntaxErrors } from '../tree-sitter.js';
 
 // Cache for failed edits — allows retry without resending newText.
-// Keyed by filePath, stores the full edits array per file.
-// Cleared on successful edit or after 120 seconds.
-const _pendingRetries = new Map();  // filePath -> { edits: [...], timestamp }
+const _pendingRetries = new Map();
 const RETRY_TTL_MS = 120 * 1000;
 
 function cachePendingBatch(filePath, edits) {
@@ -46,7 +44,6 @@ function findMatch(content, oldText, nearLine) {
     const trimmedOld = oldLinesTrimmed.join('\n');
     const trimIdx = findOccurrence(trimmedContent, trimmedOld, nearLine);
     if (trimIdx !== -1) {
-        // Map back to original content position
         const origIdx = mapTrimmedIndex(content, trimmedContent, trimIdx, trimmedOld.length);
         if (origIdx !== -1) {
             const endPos = findOriginalEnd(content, origIdx, oldLinesTrimmed.length);
@@ -55,7 +52,6 @@ function findMatch(content, oldText, nearLine) {
     }
 
     // Strategy 3: Indentation-stripped match
-    // Compare lines with leading whitespace stripped, but preserve original indentation
     const oldLines = normalizedOld.split('\n');
     const contentLines = content.split('\n');
     const strippedOld = oldLines.map(l => l.trim());
@@ -72,7 +68,6 @@ function findMatch(content, oldText, nearLine) {
             }
         }
         if (isMatch) {
-            // Build the matched text from original content lines (preserving indentation)
             const matchedLines = contentLines.slice(i, i + strippedOld.length);
             const beforeLines = contentLines.slice(0, i);
             const idx = beforeLines.join('\n').length + (beforeLines.length > 0 ? 1 : 0);
@@ -88,7 +83,6 @@ function findOccurrence(haystack, needle, nearLine) {
         return haystack.indexOf(needle);
     }
 
-    // Find all occurrences
     const occurrences = [];
     let pos = 0;
     while (true) {
@@ -101,7 +95,6 @@ function findOccurrence(haystack, needle, nearLine) {
     if (occurrences.length === 0) return -1;
     if (occurrences.length === 1) return occurrences[0];
 
-    // Pick the one closest to nearLine
     let best = occurrences[0];
     let bestDist = Infinity;
     for (const idx of occurrences) {
@@ -116,16 +109,13 @@ function findOccurrence(haystack, needle, nearLine) {
 }
 
 function mapTrimmedIndex(original, trimmed, trimmedIdx, trimmedLen) {
-    // Count which line the trimmed index falls on
     const trimmedBefore = trimmed.slice(0, trimmedIdx);
     const lineNum = trimmedBefore.split('\n').length - 1;
-
-    // Normalize to \n so line lengths are consistent with the trimmed content
     const normalizedOrig = normalizeLineEndings(original);
     const origLines = normalizedOrig.split('\n');
     let origIdx = 0;
     for (let i = 0; i < lineNum; i++) {
-        origIdx += origLines[i].length + 1; // +1 for \n
+        origIdx += origLines[i].length + 1;
     }
     return origIdx;
 }
@@ -137,7 +127,7 @@ function findOriginalEnd(content, startIdx, numLines) {
         if (nextNewline === -1) return content.length;
         pos = nextNewline + 1;
     }
-    return pos - 1; // exclude final newline
+    return pos - 1;
 }
 
 function generateDiagnostic(content, oldText, editIndex, isBatch) {
@@ -166,7 +156,7 @@ function generateDiagnostic(content, oldText, editIndex, isBatch) {
     return `${tag}oldText not found.`;
 }
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("edit_file", {
         title: "Edit File",
         description: "Edit a text file. Three modes: content match (oldText), line range (startLine/endLine + verify), or symbol. Partial failures apply successful edits and cache failures for retry.",
@@ -186,9 +176,8 @@ export function register(server) {
         },
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
-        const validPath = await validatePath(args.path);
+        const validPath = await ctx.validatePath(args.path);
 
-        // Read file and normalize
         const originalContent = normalizeLineEndings(await fs.readFile(validPath, 'utf-8'));
         let workingContent = originalContent;
 
@@ -196,16 +185,14 @@ export function register(server) {
             throw new Error('No edits provided. Supply an edits array.');
         }
 
-        // Phase 1: Validate ALL edits against working copy
         let successCount = 0;
         const errors = [];
-
         const isBatch = args.edits.length > 1;
+
         for (let i = 0; i < args.edits.length; i++) {
             const edit = args.edits[i];
             const tag = isBatch ? `Edit #${i + 1}: ` : '';
 
-            // Resolve newText from cache if omitted (retry path for both range and oldText modes)
             let resolvedNewText = edit.newText;
             if (resolvedNewText === undefined) {
                 const cached = getCachedNewText(validPath, i);
@@ -217,8 +204,8 @@ export function register(server) {
             // ---- RANGE-BASED EDIT MODE ----
             if (typeof edit.startLine === 'number' && typeof edit.endLine === 'number') {
                 const lines = workingContent.split('\n');
-                const start = edit.startLine - 1;  // convert to 0-based
-                const end = edit.endLine;           // endLine is inclusive, slice end is exclusive
+                const start = edit.startLine - 1;
+                const end = edit.endLine;
 
                 if (resolvedNewText === undefined) {
                     errors.push(`${tag}newText required.`);
@@ -230,14 +217,12 @@ export function register(server) {
                     continue;
                 }
 
-                // verifyStart is mandatory
                 if (!edit.verifyStart) {
                     cachePendingBatch(validPath, args.edits);
                     errors.push(`${tag}verifyStart is required.`);
                     continue;
                 }
 
-                // Exact match on start line (trimmed)
                 const actualStart = lines[start].trim();
                 const expectedStart = edit.verifyStart.trim();
 
@@ -253,7 +238,6 @@ export function register(server) {
                     continue;
                 }
 
-                // verifyEnd is always mandatory
                 if (!edit.verifyEnd) {
                     cachePendingBatch(validPath, args.edits);
                     errors.push(`${tag}verifyEnd is required.`);
@@ -275,15 +259,12 @@ export function register(server) {
                     continue;
                 }
 
-                // Replace the line range
                 const normalizedNew = normalizeLineEndings(resolvedNewText);
                 const newLines = normalizedNew.split('\n');
                 lines.splice(start, end - start, ...newLines);
                 workingContent = lines.join('\n');
 
-                // Clear the retry cache
                 clearPendingBatch(validPath);
-
                 successCount++;
                 continue;
             }
@@ -323,8 +304,8 @@ export function register(server) {
 
                 const sym = symbolMatches[0];
                 const lines = workingContent.split('\n');
-                const start = sym.line - 1;   // 0-based
-                const end = sym.endLine;       // endLine is inclusive, splice end is exclusive
+                const start = sym.line - 1;
+                const end = sym.endLine;
                 const normalizedNew = normalizeLineEndings(resolvedNewText);
                 const newLines = normalizedNew.split('\n');
                 lines.splice(start, end - start, ...newLines);
@@ -347,11 +328,14 @@ export function register(server) {
                 continue;
             }
 
-            // Apply edit to working copy
+            if (resolvedNewText === undefined) {
+                errors.push(`${tag}newText required.`);
+                continue;
+            }
+
             const normalizedNew = normalizeLineEndings(resolvedNewText);
 
             if (match.strategy === 'indent-stripped') {
-                // Preserve original indentation when applying indent-stripped match
                 const matchedLines = match.matchedText.split('\n');
                 const newLines = normalizedNew.split('\n');
                 const originalIndent = matchedLines[0].match(/^\s*/)?.[0] || '';
@@ -359,7 +343,6 @@ export function register(server) {
 
                 const reindentedNew = newLines.map((line, j) => {
                     if (j === 0) return originalIndent + line.trimStart();
-                    // Preserve relative indentation from newText
                     const lineIndent = line.match(/^\s*/)?.[0] || '';
                     const relIndent = lineIndent.length - (oldIndent?.length || 0);
                     return originalIndent + ' '.repeat(Math.max(0, relIndent)) + line.trimStart();
@@ -381,14 +364,12 @@ export function register(server) {
         if (errors.length > 0) {
             cachePendingBatch(validPath, args.edits);
 
-            // All failed — reject entirely
             if (successCount === 0) {
                 throw new Error(
                     `${errors.length} edit(s) failed:\n${errors.join('\n')}`
                 );
             }
 
-            // Partial failure — apply successful edits, report failures
             if (!args.dryRun) {
                 const tempPath = `${validPath}.${randomBytes(16).toString('hex')}.tmp`;
                 try {
@@ -425,8 +406,29 @@ export function register(server) {
             };
         }
 
+        // Post-edit AST error detection
+        let syntaxWarning = '';
+        try {
+            const ext = path.extname(validPath).toLowerCase();
+            const lossyAliases = ['.scss', '.mdx', '.jsonc'];
+            const isLossyAlias = lossyAliases.includes(ext);
+
+            if (!isLossyAlias) {
+                const langName = getLangForFile(validPath);
+                if (langName) {
+                    const syntaxErrors = await checkSyntaxErrors(workingContent, langName);
+                    if (syntaxErrors && syntaxErrors.length > 0) {
+                        const locations = syntaxErrors.map(e => `${e.line}:${e.column}`).join(', ');
+                        syntaxWarning = `\n⚠ Parse errors at lines ${locations}`;
+                    }
+                }
+            }
+        } catch {
+            // Syntax check is best-effort
+        }
+
         return {
-            content: [{ type: "text", text: "Applied." }],
+            content: [{ type: "text", text: `Applied.${syntaxWarning}` }],
         };
     });
 }

@@ -1,6 +1,5 @@
 import { z } from "zod";
 import fs from "fs/promises";
-import { validatePath } from '../lib.js';
 import { CHAR_BUDGET } from '../shared.js';
 
 function countLines(str) {
@@ -26,7 +25,7 @@ async function parallelMap(items, fn, concurrency = 8) {
     return results;
 }
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("read_multiple_files", {
         title: "Read Multiple Files",
         description: "Read multiple files at once. Large files are truncated.",
@@ -45,7 +44,7 @@ export function register(server) {
         // Phase 1: Validate paths and get file sizes
         const fileInfos = await parallelMap(args.paths, async (filePath) => {
             try {
-                const validPath = await validatePath(filePath);
+                const validPath = await ctx.validatePath(filePath);
                 const stat = await fs.stat(validPath);
                 return {
                     requestedPath: filePath,
@@ -64,15 +63,13 @@ export function register(server) {
         });
 
         // Phase 2: Calculate per-file budgets
-        // Strategy: sort by size, allocate equally, redistribute surplus from small files
         const validFiles = fileInfos.filter(f => !f.error);
-        const totalBudget = CHAR_BUDGET - (fileCount * 200); // reserve space for separators
+        const totalBudget = CHAR_BUDGET - (fileCount * 200);
 
         let perFileBudget;
         if (args.maxCharsPerFile) {
             perFileBudget = Math.min(args.maxCharsPerFile, totalBudget);
         } else {
-            // Dynamic budget: start with equal split, redistribute surplus
             const sortedBySize = [...validFiles].sort((a, b) => a.size - b.size);
             const budgets = new Map();
             let remainingBudget = totalBudget;
@@ -80,15 +77,13 @@ export function register(server) {
 
             for (const file of sortedBySize) {
                 const share = Math.floor(remainingBudget / remainingFiles);
-                // Estimate char count (UTF-8 text is roughly 1 byte = 1 char)
                 const needed = Math.min(Math.ceil(file.size * 1.15), share);
                 budgets.set(file.requestedPath, needed);
                 remainingBudget -= needed;
                 remainingFiles--;
             }
 
-            perFileBudget = null; // use per-file budgets map
-            // Store for later use
+            perFileBudget = null;
             fileInfos.forEach(f => {
                 if (!f.error) {
                     f.budget = budgets.get(f.requestedPath) || Math.floor(totalBudget / fileCount);
@@ -105,9 +100,8 @@ export function register(server) {
             const budget = perFileBudget || fileInfo.budget || Math.floor(totalBudget / fileCount);
 
             try {
-                // Bounded read: only load up to budget*4 bytes to avoid OOM on large files
                 let content;
-                const byteLimit = budget * 4; // max 4 bytes per UTF-8 code point
+                const byteLimit = budget * 4;
                 const fd = await fs.open(fileInfo.validPath, 'r');
                 try {
                     const buf = Buffer.allocUnsafe(byteLimit);
@@ -124,14 +118,10 @@ export function register(server) {
                     truncated = true;
                 }
 
-                // Add line numbers if requested
                 if (args.showLineNumbers) {
                     const lines = content.split('\n');
                     if (lines[lines.length - 1] === '') lines.pop();
-                    content = lines.map((line, i) => {
-                        const num = i + 1;
-                        return (num === 1 || num % 10 === 0) ? `${num}: ${line}` : line;
-                    }).join('\n');
+                    content = lines.map((line, i) => `${i + 1}:${line}`).join('\n');
                 }
 
                 return truncated
@@ -144,7 +134,6 @@ export function register(server) {
 
         const text = results.join('\n');
 
-        // Final safety: enforce absolute char limit
         const finalText = text.length > CHAR_BUDGET
             ? text.slice(0, CHAR_BUDGET) + '\n## truncated ##'
             : text;

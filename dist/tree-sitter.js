@@ -598,3 +598,51 @@ export async function treeSitterAvailable() {
         return false;
     }
 }
+
+/**
+ * Parse source code and check for syntax errors.
+ * Returns an array of { line, column } for each ERROR node found.
+ * Returns null if the language is not supported.
+ * Returns empty array if no errors detected.
+ *
+ * @param {string} source   - the source code to check
+ * @param {string} langName - tree-sitter language name
+ * @returns {Promise<Array<{line: number, column: number}> | null>}
+ */
+export async function checkSyntaxErrors(source, langName) {
+    const language = await loadLanguage(langName);
+    if (!language) return null;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        if (!tree.rootNode.hasError()) {
+            return [];
+        }
+
+        const errors = [];
+        const MAX_ERRORS = 10;
+
+        function walk(node) {
+            if (errors.length >= MAX_ERRORS) return;
+            if (node.type === 'ERROR' || node.isMissing()) {
+                errors.push({
+                    line: node.startPosition.row + 1,
+                    column: node.startPosition.column,
+                });
+            }
+            for (let i = 0; i < node.childCount; i++) {
+                if (errors.length >= MAX_ERRORS) return;
+                walk(node.child(i));
+            }
+        }
+
+        walk(tree.rootNode);
+        return errors;
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
+}

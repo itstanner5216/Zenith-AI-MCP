@@ -1,8 +1,7 @@
 import { z } from "zod";
 import fs from "fs/promises";
-import { validatePath } from '../lib.js';
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("delete_file", {
         title: "Delete File",
         description: "Permanently delete a file. Only works on files — not directories. Irreversible.",
@@ -11,7 +10,7 @@ export function register(server) {
     }, async (args) => {
         let validPath;
         try {
-            validPath = await validatePath(args.path);
+            validPath = await ctx.validatePath(args.path);
         } catch (e) {
             if (e.code === 'ENOENT' || (e.message && e.message.includes('ENOENT'))) {
                 throw new Error("Unable to locate file.");

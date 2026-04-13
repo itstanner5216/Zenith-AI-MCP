@@ -1,7 +1,6 @@
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
-import { validatePath } from '../lib.js';
 import {
     DEFAULT_EXCLUDES, isSensitive,
     ripgrepAvailable, ripgrepFindFiles,
@@ -9,7 +8,7 @@ import {
 } from '../shared.js';
 import { isSupported, getLangForFile, getDefinitions } from '../tree-sitter.js';
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("find_files", {
         title: "Find Files",
         description: "Find files by name glob, path substring, extension, or symbol definition.",
@@ -38,15 +37,13 @@ export function register(server) {
         if (!args.namePattern && !args.pathContains && !args.extensions?.length && !args.definesSymbol) {
             throw new Error("Provide at least one of: namePattern (glob), pathContains (path substring), extensions (file extension filter), or definesSymbol");
         }
-        const rootPath = await validatePath(args.path);
+        const rootPath = await ctx.validatePath(args.path);
         const maxResults = Math.min(500, Math.max(1, args.maxResults ?? 100));
         const hasRg = await ripgrepAvailable();
 
         let rawResults = [];
 
         if (hasRg) {
-            // When extensions filter is active, overfetch 5x to absorb filtering losses.
-            // For single-extension searches, pass directly as ripgrep glob for native speed.
             const extGlobs = args.extensions?.length ? args.extensions.map(e => `*${e}`) : null;
             const effectivePattern = (extGlobs?.length === 1 && !args.namePattern)
                 ? extGlobs[0]
@@ -55,7 +52,7 @@ export function register(server) {
             const results = await ripgrepFindFiles(rootPath, {
                 namePattern: effectivePattern,
                 pathContains: args.pathContains || null,
-                maxResults: Math.min(maxResults * 5, 2000), // 5x overfetch absorbs heavy extension filtering
+                maxResults: Math.min(maxResults * 5, 2000),
             });
             if (results !== null) {
                 rawResults = results;
@@ -78,7 +75,7 @@ export function register(server) {
                     if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
                     if (isSensitive(fullPath)) continue;
                     if (entry.isDirectory()) {
-                        try { await validatePath(fullPath); } catch { continue; }
+                        try { await ctx.validatePath(fullPath); } catch { continue; }
                         await walk(fullPath);
                     } else {
                         const nameMatch = !nameRegex || nameRegex.test(entry.name);
@@ -98,10 +95,7 @@ export function register(server) {
         }
 
         // ---- SYMBOL SEARCH MODE ----
-        // When definesSymbol is set, filter to files that actually define the symbol.
-        // This replaces the normal output — results include symbol location info.
         if (args.definesSymbol) {
-            // Filter to tree-sitter supported files only
             const supportedFiles = rawResults.filter(f => isSupported(f));
 
             if (supportedFiles.length === 0) {
@@ -111,9 +105,8 @@ export function register(server) {
                 };
             }
 
-            // Parse files in parallel (capped at 50 concurrent) to find the symbol
             const BATCH_SIZE = 50;
-            const MAX_FILE_SIZE = 512 * 1024; // skip files > 512KB
+            const MAX_FILE_SIZE = 512 * 1024;
             const symbolName = args.definesSymbol;
             const symbolMatches = [];
 
@@ -131,7 +124,6 @@ export function register(server) {
                         const defs = await getDefinitions(source, langName);
                         if (!defs) return null;
 
-                        // Handle dot-qualified names: "MyClass.sendMessage"
                         const parts = symbolName.split('.');
                         const targetName = parts[parts.length - 1];
                         const parentNames = parts.slice(0, -1);
@@ -139,7 +131,6 @@ export function register(server) {
                         let matches = defs.filter(d => d.name === targetName);
                         if (matches.length === 0) return null;
 
-                        // Verify parent containment for qualified names
                         if (parentNames.length > 0) {
                             matches = matches.filter(sym => {
                                 let current = sym;
@@ -168,11 +159,9 @@ export function register(server) {
                     if (result) symbolMatches.push(result);
                 }
 
-                // Stop early if we have enough
                 if (symbolMatches.length >= maxResults) break;
             }
 
-            // Format output
             if (symbolMatches.length === 0) {
                 const text = 'No matches.';
                 return {
@@ -198,7 +187,6 @@ export function register(server) {
             const index = new BM25Index();
             const docs = rawResults.map((filePath, i) => ({
                 id: String(i),
-                // Tokenize path components for BM25 scoring
                 text: filePath.replace(/[/\\]/g, ' ').replace(/\./g, ' ').replace(/-/g, ' ').replace(/_/g, ' _ '),
             }));
             index.build(docs);

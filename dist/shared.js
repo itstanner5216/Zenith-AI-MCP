@@ -26,7 +26,20 @@ import { minimatch } from "minimatch";
 // Configuration
 // ---------------------------------------------------------------------------
 
-export const CHAR_BUDGET = 400_000; // safe margin under Claude's 500k limit
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
+    }
+    return 400_000;
+})();
 export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
 
 export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
@@ -46,20 +59,22 @@ export function isSensitive(filePath) {
 }
 
 // ---------------------------------------------------------------------------
-// BM25 Engine — inline, zero deps
+// BM.X-T Engine — entropy-weighted TAAT search, zero deps
 // ---------------------------------------------------------------------------
 
 const WORD_RE = /[a-z0-9_]+/g;
 
 export class BM25Index {
-    constructor(k1 = 1.2, b = 0.75) {
+    constructor(k1 = 1.2, b = 0.75, beta = 0.6) {
         this.k1 = k1;
         this.b = b;
+        this.beta = beta;
         this._postingLists = new Map(); // term -> Map<docId, tf>
         this._docLengths = new Map();   // docId -> tokenCount
         this._avgDocLength = 0;
-        this._docFreqs = new Map();     // term -> df
         this._idfCache = new Map();     // term -> idf
+        this._termEntropy = new Map();  // term -> normalized entropy [0,1]
+        this._termTotalFreqs = new Map(); // term -> total tf across corpus
         this._totalDocs = 0;
     }
 
@@ -70,32 +85,25 @@ export class BM25Index {
         return tokens.filter(t => t.length > 1 || t === 'a' || t === 'i');
     }
 
-    _computeIdf(term) {
-        const df = this._docFreqs.get(term) || 0;
-        if (df > 0 && this._totalDocs > 0) {
-            return Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1.0);
-        }
-        return 0.0;
-    }
-
     /**
      * Build index from array of { id: string, text: string }.
      */
     build(docs) {
         this._postingLists.clear();
         this._docLengths.clear();
-        this._docFreqs.clear();
         this._idfCache.clear();
+        this._termEntropy.clear();
+        this._termTotalFreqs.clear();
 
         let totalLength = 0;
 
+        // Pass 1: tokenize, build inverted index
         for (const doc of docs) {
             if (!doc.id) continue;
             const tokens = BM25Index.tokenize(doc.text);
             this._docLengths.set(doc.id, tokens.length);
             totalLength += tokens.length;
 
-            // Count term frequencies
             const tfMap = new Map();
             for (const token of tokens) {
                 tfMap.set(token, (tfMap.get(token) || 0) + 1);
@@ -106,22 +114,41 @@ export class BM25Index {
                     this._postingLists.set(term, new Map());
                 }
                 this._postingLists.get(term).set(doc.id, count);
+                this._termTotalFreqs.set(term, (this._termTotalFreqs.get(term) || 0) + count);
             }
         }
 
         this._totalDocs = this._docLengths.size;
         if (this._totalDocs === 0) return;
-
         this._avgDocLength = totalLength / this._totalDocs;
 
+        // Pass 2: IDF
         for (const [term, posting] of this._postingLists) {
-            this._docFreqs.set(term, posting.size);
-            this._idfCache.set(term, this._computeIdf(term));
+            const df = posting.size;
+            this._idfCache.set(term, Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1));
+        }
+
+        // Pass 3: per-term entropy
+        for (const [term, posting] of this._postingLists) {
+            const totalTf = this._termTotalFreqs.get(term);
+            const nDocs = posting.size;
+            if (totalTf === 0 || nDocs <= 1) {
+                this._termEntropy.set(term, 0);
+                continue;
+            }
+            let entropy = 0;
+            for (const tf of posting.values()) {
+                const p = tf / totalTf;
+                entropy -= p * Math.log(p);
+            }
+            const maxEntropy = Math.log(nDocs);
+            this._termEntropy.set(term, maxEntropy > 0 ? entropy / maxEntropy : 0);
         }
     }
 
     /**
-     * TAAT search. Returns array of { id, score } sorted desc by score.
+     * TAAT search with entropy-weighted scoring and sigmoid TF saturation.
+     * Returns array of { id, score } sorted desc, scores normalized to [0, 1].
      */
     search(query, topK = 200) {
         if (this._totalDocs === 0 || !query) return [];
@@ -129,26 +156,50 @@ export class BM25Index {
         const queryTokens = BM25Index.tokenize(query);
         if (queryTokens.length === 0) return [];
 
+        // Count query term frequencies
+        const qtfMap = new Map();
+        for (const t of queryTokens) qtfMap.set(t, (qtfMap.get(t) || 0) + 1);
+
+        // Pre-compute per-term weights and max_possible
+        const termWeights = new Map();
+        let maxPossible = 0;
+
+        for (const [term, qtf] of qtfMap) {
+            if (!this._postingLists.has(term)) continue;
+            const idf = this._idfCache.get(term) || 0;
+            const entropy = this._termEntropy.get(term) || 0;
+            const weight = idf * (1 + this.beta * (1 - entropy));
+            termWeights.set(term, weight);
+            maxPossible += weight * qtf;
+        }
+
+        if (maxPossible === 0) return [];
+
+        // TAAT: accumulate scores by traversing postings
         const { k1, b, _avgDocLength: avgdl } = this;
         const scores = new Map();
 
-        for (const term of queryTokens) {
+        for (const [term, qtf] of qtfMap) {
+            const weight = termWeights.get(term);
+            if (weight === undefined) continue;
+            const w = weight * qtf;
             const posting = this._postingLists.get(term);
-            if (!posting) continue;
-            const idf = this._idfCache.get(term) || 0;
-            if (idf <= 0) continue;
 
             for (const [docId, tf] of posting) {
                 const dl = this._docLengths.get(docId);
-                const tfSat = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl));
-                scores.set(docId, (scores.get(docId) || 0) + idf * tfSat);
+                const K = k1 * (1 - b + b * (dl / avgdl));
+                // Sigmoid TF saturation
+                const tfComponent = 1 / (1 + Math.exp(-k1 * (tf - K / 2) / K));
+                scores.set(docId, (scores.get(docId) || 0) + w * tfComponent);
             }
         }
 
         if (scores.size === 0) return [];
 
+        // Normalize to [0, 1]
+        const invMax = 1 / maxPossible;
         const sorted = [...scores.entries()]
-            .map(([id, score]) => ({ id, score }))
+            .map(([id, s]) => ({ id, score: s * invMax }))
             .sort((a, b) => b.score - a.score);
 
         return sorted.slice(0, topK);

@@ -2,7 +2,6 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
-import { validatePath } from '../lib.js';
 import {
     DEFAULT_EXCLUDES, isSensitive,
     ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
@@ -13,7 +12,7 @@ import {
     isSupported, getLangForFile, getSymbols, getDefinitions,
 } from '../tree-sitter.js';
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("search_files", {
         title: "Search Files",
         description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
@@ -41,7 +40,7 @@ export function register(server) {
         },
         annotations: { readOnlyHint: true }
     }, async (args) => {
-        const rootPath = await validatePath(args.path);
+        const rootPath = await ctx.validatePath(args.path);
 
         // ---- SYMBOL SEARCH / LIST MODE ----
         if (args.symbolQuery || args.listSymbols) {
@@ -182,8 +181,8 @@ export function register(server) {
                         for (const entry of result) {
                             outputLines.push(entry.line);
                         }
+                        if (outputLines.length >= userMaxResults) break;
                     }
-
                     if (outputLines.length >= userMaxResults) break;
                 }
 
@@ -199,29 +198,51 @@ export function register(server) {
                 const text = budgetLines.length > 0
                     ? budgetLines.join('\n')
                     : 'No matches.';
-
                 return {
                     content: [{ type: "text", text }],
                 };
             }
         }
 
-        // ---- EXISTING CONTENT/PATTERN SEARCH ----
+        // ---- CONTENT SEARCH / FILE FIND MODE ----
         const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
-        const contextLines = Math.max(0, Math.min(args.contextLines ?? 0, 10));
-        const contentRegex = args.contentQuery
-            ? new RegExp(args.contentQuery, args.ignoreCase ? 'i' : '')
-            : null;
-        const mode = args.contentQuery ? 'search' : 'files';
+        const contextLines = Math.max(0, args.contextLines ?? 0);
 
         const callerExcludes = args.excludePatterns ?? [];
         const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
         const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
 
-        // Ripgrep path with BM25 pre-filtering
-        if (args.contentQuery) {
-            const hasRg = await ripgrepAvailable();
-            if (hasRg) {
+        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
+
+        let contentRegex;
+        if (mode === 'content') {
+            if (!args.contentQuery) {
+                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
+            }
+            const flags = args.ignoreCase ? 'gi' : 'g';
+            contentRegex = args.literalSearch
+                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+                : new RegExp(args.contentQuery, flags);
+        }
+
+        // ---- RIPGREP PATH ----
+        const hasRg = await ripgrepAvailable();
+        if (hasRg) {
+            if (mode === 'files') {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: userMaxResults,
+                    excludePatterns: allExcludes,
+                });
+                if (results !== null) {
+                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
+                    return {
+                        content: [{ type: "text", text }],
+                    };
+                }
+            }
+
+            if (mode === 'content') {
                 let rgResults = null;
 
                 if (args.contentQuery.length > 2) {
@@ -285,7 +306,6 @@ export function register(server) {
                     const rawLines = rgResults.map(r => `${r.file}:${r.line}: ${r.content}`);
 
                     // ---- POST-FILTER MODE ----
-                    // If results exceed threshold, BM25 rank them and fit within char budget
                     let outputLines;
 
                     if (rawLines.length > RANK_THRESHOLD) {
@@ -294,7 +314,6 @@ export function register(server) {
                         );
                         outputLines = ranked;
                     } else {
-                        // Under threshold: truncate to char budget without ranking
                         outputLines = [];
                         let charCount = 0;
                         for (const line of rawLines) {
@@ -348,7 +367,7 @@ export function register(server) {
                 if (excluded) continue;
                 if (isSensitive(fullPath)) continue;
                 if (entry.isDirectory()) {
-                    try { await validatePath(fullPath); } catch { continue; }
+                    try { await ctx.validatePath(fullPath); } catch { continue; }
                     await walk(fullPath);
                 } else if (entry.isFile()) {
                     if (mode === 'files') {

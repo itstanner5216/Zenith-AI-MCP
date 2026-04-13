@@ -2,20 +2,19 @@ import { z } from "zod";
 import fs from "fs/promises";
 import { createReadStream } from "fs";
 import { createInterface } from "readline";
-import { validatePath, readFileContent, tailFile, headFile, offsetReadFile } from '../lib.js';
+import { readFileContent, tailFile, headFile, offsetReadFile } from '../lib.js';
 import { CHAR_BUDGET } from '../shared.js';
 import { getLangForFile, findSymbol } from '../tree-sitter.js';
 
 function countLines(str) {
     if (!str) return 0;
     const n = (str.match(/\n/g) || []).length;
-    // A trailing newline doesn't represent an extra logical line
     return str.endsWith('\n') ? n : n + 1;
 }
 
-export function register(server) {
+export function register(server, ctx) {
     const handler = async (args) => {
-        const validPath = await validatePath(args.path);
+        const validPath = await ctx.validatePath(args.path);
         const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
 
         // Validate parameter combinations
@@ -38,7 +37,6 @@ export function register(server) {
         }
 
         // ---- SYMBOL MODE ----
-        // Read a specific symbol's body by name, resolved via tree-sitter.
         if (hasSymbolMode) {
             const langName = getLangForFile(validPath);
             if (!langName) {
@@ -62,14 +60,12 @@ export function register(server) {
                 throw new Error('Multiple matches. Use nearLine.');
             }
 
-            // Use the best match (first after nearLine sort, or the only one)
             const sym = matches[0];
             const expand = Math.max(0, Math.min(args.expandLines ?? 0, 50));
             const startLine = Math.max(1, sym.line - expand);
             const endLine = Math.min(totalLines, sym.endLine + expand);
 
             const slice = allLines.slice(startLine - 1, endLine);
-            // Always show line numbers in symbol mode — it's code context
             const numbered = slice.map((line, i) => {
                 const ln = startLine + i;
                 return `${ln}:${line}`;
@@ -82,7 +78,6 @@ export function register(server) {
         }
 
         // ---- GREP MODE ----
-        // Extract matching lines with optional before/after context (like grep -B/-A)
         if (args.grep) {
             const grepPattern = new RegExp(args.grep, args.grepIgnoreCase !== false ? 'i' : '');
             const invertMatch = args.grepInvert ?? false;
@@ -90,11 +85,10 @@ export function register(server) {
             const afterCount = Math.min(Math.max(0, args.grepAfter ?? 0), 30);
             const hasContext = beforeCount > 0 || afterCount > 0;
 
-            const outputEntries = [];  // { num, text, isMatch }
+            const outputEntries = [];
             let totalLines = 0;
             let charCount = 0;
 
-            // Ring buffer for before-context lines
             const beforeBuffer = [];
             let afterRemaining = 0;
             let lastEmittedLine = 0;
@@ -129,10 +123,9 @@ export function register(server) {
                     const isMatch = invertMatch ? !rawMatch : rawMatch;
 
                     if (isMatch) {
-                        // Flush before-context buffer
                         if (hasContext) {
-                            for (const ctx of beforeBuffer) {
-                                emit(ctx.num, ctx.text, false);
+                            for (const bufItem of beforeBuffer) {
+                                emit(bufItem.num, bufItem.text, false);
                             }
                             beforeBuffer.length = 0;
                         }
@@ -140,11 +133,9 @@ export function register(server) {
                         emit(totalLines, line, true);
                         afterRemaining = afterCount;
                     } else if (afterRemaining > 0) {
-                        // After-context line
                         emit(totalLines, line, false);
                         afterRemaining--;
                     } else if (beforeCount > 0) {
-                        // Store in ring buffer for potential before-context
                         beforeBuffer.push({ num: totalLines, text: line });
                         if (beforeBuffer.length > beforeCount) beforeBuffer.shift();
                     }
@@ -165,17 +156,13 @@ export function register(server) {
         }
 
         // ---- WINDOW MODE ----
-        // Returns context windows around specific line numbers.
-        // Triggered by aroundLine and/or ranges params.
         if (hasWindowMode) {
-
-            // Build window list from aroundLine + ranges
             const windows = [];
             if (args.aroundLine !== undefined) {
-                const ctx = args.context ?? 30;
+                const windowRadius = args.context ?? 30;
                 windows.push({
-                    startLine: Math.max(1, args.aroundLine - ctx),
-                    endLine: args.aroundLine + ctx,
+                    startLine: Math.max(1, args.aroundLine - windowRadius),
+                    endLine: args.aroundLine + windowRadius,
                 });
             }
             if (args.ranges && args.ranges.length > 0) {
@@ -184,7 +171,6 @@ export function register(server) {
                 }
             }
 
-            // Sort windows by startLine, then merge overlapping/adjacent windows
             windows.sort((a, b) => a.startLine - b.startLine);
             const merged = [];
             for (const w of windows) {
@@ -195,7 +181,6 @@ export function register(server) {
                 }
             }
 
-            // Stream line-by-line, collect lines that fall inside any window
             const outputLines = [];
             let totalLines = 0;
             let charCount = 0;
@@ -211,7 +196,6 @@ export function register(server) {
                     totalLines++;
                     if (budgetExhausted) return;
 
-                    // Advance window pointer past windows we've already passed
                     while (windowIdx < merged.length && totalLines > merged[windowIdx].endLine) {
                         windowIdx++;
                     }
@@ -267,21 +251,16 @@ export function register(server) {
             content = await readFileContent(validPath);
         }
 
-        // Smart truncation: if content exceeds char budget, truncate with notice
+        // Smart truncation
         let truncated = false;
         if (content && content.length > maxChars) {
-            // Count total lines from full content before truncation
             if (!meta.totalLines) {
                 meta.totalLines = countLines(content);
             }
-
-            // Find a good break point (end of line)
             let cutoff = content.lastIndexOf('\n', maxChars);
             if (cutoff === -1) cutoff = maxChars;
             content = content.slice(0, cutoff);
             truncated = true;
-
-            // Count lines in truncated content for accurate offset guidance
             const truncLines = countLines(content);
             meta.truncatedAt = truncLines;
         }

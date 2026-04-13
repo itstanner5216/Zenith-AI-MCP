@@ -1,11 +1,11 @@
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
-import { validatePath, formatSize, getAllowedDirectories } from '../lib.js';
+import { formatSize } from '../lib.js';
 
 const CAP = 250;
 
-export function register(server) {
+export function register(server, ctx) {
     server.registerTool("list_directory", {
         title: "List Directory",
         description: "List files and directories. Directories have trailing /. Use depth > 1 for recursive (max 10). Use listAllowed=true to list allowed directories instead.",
@@ -20,10 +20,10 @@ export function register(server) {
     }, async (args) => {
         if (args.listAllowed) {
             return {
-                content: [{ type: "text", text: getAllowedDirectories().join('\n') }],
+                content: [{ type: "text", text: ctx.getAllowedDirectories().join('\n') }],
             };
         }
-        const validPath = await validatePath(args.path);
+        const validPath = await ctx.validatePath(args.path);
         const depth = Math.max(1, Math.min(args.depth || 1, 10));
         const includeSizes = args.includeSizes || false;
         const sortBy = args.sortBy || "name";
