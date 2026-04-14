@@ -25,6 +25,32 @@
 (function_declaration
   name: (identifier) @name.definition.function) @definition.function
 
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name.definition.function
+    value: [(arrow_function) (function_expression)]) @definition.function)
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name.definition.function
+      value: [(arrow_function) (function_expression)]) @definition.function))
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name.definition.function
+    value: (call_expression
+      arguments: (arguments
+        [(arrow_function) (function_expression)] @definition.function))))
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name.definition.function
+      value: (call_expression
+        arguments: (arguments
+          [(arrow_function) (function_expression)] @definition.function)))))
+
 (method_definition
   name: (property_identifier) @name.definition.method) @definition.method
 
@@ -39,3 +65,7 @@
 
 (enum_declaration
   name: (identifier) @name.definition.enum) @definition.enum
+
+(pair
+  key: (property_identifier) @name.definition.method
+  value: [(arrow_function) (function_expression)] @definition.method)

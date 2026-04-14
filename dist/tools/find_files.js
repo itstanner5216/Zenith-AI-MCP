@@ -5,8 +5,8 @@ import {
     DEFAULT_EXCLUDES, isSensitive,
     ripgrepAvailable, ripgrepFindFiles,
     BM25Index, CHAR_BUDGET,
-} from '../shared.js';
-import { isSupported, getLangForFile, getDefinitions } from '../tree-sitter.js';
+} from '../core/shared.js';
+import { isSupported, getLangForFile, getDefinitions } from '../core/tree-sitter.js';
 
 export function register(server, ctx) {
     server.registerTool("find_files", {

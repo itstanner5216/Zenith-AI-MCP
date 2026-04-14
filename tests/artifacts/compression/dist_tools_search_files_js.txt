@@ -1,0 +1,631 @@
+FILE: dist/tools/search_files.js
+RAW_CHARS: 18756
+TARGET_70_PERCENT_BUDGET: 13129
+BRIDGE_CHARS: 13091
+FINAL_TOOL_CHARS: 13091
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {  # L22
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of context lines"),
+            literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as literal string."),
+            countOnly: z.boolean().optional().default(false).describe("Return match/file counts only, no content."),
+            includeHidden: z.boolean().optional().default(false).describe("Include hidden files in search."),
+            symbolQuery: z.string().optional().describe(
+                "Search for symbols by name. " +
+                "Substring match (case-insensitive). Cannot be combined with contentQuery."
+            ),
+            symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe(
+                "Filter symbol search to a specific kind. Only used with symbolQuery or listSymbols."
+            ),
+            listSymbols: z.boolean().optional().default(false).describe(
+                "Return an inventory of all symbols."
+            ),
+        },
+        annotations: { readOnlyHint: true }
+    }, async (args) => {
+        const rootPath = await ctx.validatePath(args.path);
+
+        // ---- SYMBOL SEARCH / LIST MODE ----
+        if (args.symbolQuery || args.listSymbols) {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+
+            // Discover files — reuse ripgrep for speed
+            const hasRg = await ripgrepAvailable();
+            let filePaths = [];
+            const callerExcludes = args.excludePatterns ?? [];
+            const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+
+            if (hasRg) {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: 2000,
+                    excludePatterns: [...callerExcludes, ...defaultExcludeGlobs],
+                });
+                if (results) filePaths = results;
+            }
+
+            // JS fallback
+            if (filePaths.length === 0) {
+                async function walk(dir) {
+                    if (filePaths.length >= 2000) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+                    for (const entry of entries) {
+                        if (filePaths.length >= 2000) return;
+                        const fullPath = path.join(dir, entry.name);
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            await walk(fullPath);
+                        } else {
+                            filePaths.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            // Filter to supported files
+            const supportedFiles = filePaths.filter(f => isSupported(f));
+
+            if (supportedFiles.length === 0) {
+                const text = 'No supported files found.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+
+            const MAX_FILE_SIZE = 512 * 1024;
+            const BATCH_SIZE = 50;
+            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
+
+            if (args.listSymbols) {
+                // ---- LIST SYMBOLS MODE ----
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            const names = defs.map(d => `${d.name} (${d.type}:${d.line})`);
+                            return { rel, defs, names };
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        outputLines.push(`${result.rel}: ${result.names.join(', ')}`);
+                    }
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.join('\n');
+                return {
+                    content: [{ type: "text", text }],
+                };
+
+            } else {
+                // ---- SYMBOL QUERY MODE ----
+                const symbolQuery = args.symbolQuery;
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                nameFilter: symbolQuery,
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            return defs.map(d => ({
+                                line: `${rel}:${d.line}  [${d.type}] ${d.name} (lines ${d.line}-${d.endLine})`,
+                                file: rel,
+                            }));
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        for (const entry of result) {
+                            outputLines.push(entry.line);
+                        }
+                        if (outputLines.length >= userMaxResults) break;
+                    }
+                    if (outputLines.length >= userMaxResults) break;
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines.slice(0, userMaxResults)) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.length > 0
+                    ? budgetLines.join('\n')
+                    : 'No matches.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+        }
+
+        // ---- CONTENT SEARCH / FILE FIND MODE ----
+        const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+        const contextLines = Math.max(0, args.contextLines ?? 0);
+
+        const callerExcludes = args.excludePatterns ?? [];
+        const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+        const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
+
+        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
+
+        let contentRegex;
+        if (mode === 'content') {
+            if (!args.contentQuery) {
+                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
+            }
+            const flags = args.ignoreCase ? 'gi' : 'g';
+            contentRegex = args.literalSearch
+                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+                : new RegExp(args.contentQuery, flags);
+        }
+
+        // ---- RIPGREP PATH ----
+        const hasRg = await ripgrepAvailable();
+        if (hasRg) {
+            if (mode === 'files') {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: userMaxResults,
+                    excludePatterns: allExcludes,
+                });
+                if (results !== null) {
+                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
+                    return {
+                        content: [{ type: "text", text }],
+                    };
+                }
+            }
+
+            if (mode === 'content') {
+                let rgResults = null;
+
+                if (args.contentQuery.length > 2) {
+                    try {
+                        const candidateFiles = await bm25PreFilterFiles(
+                            rootPath,
+                            args.contentQuery,
+                            100,
+                            allExcludes
+                        );
+
+                        if (candidateFiles.length > 0) {
+                            rgResults = await ripgrepSearch(rootPath, {
+                                contentQuery: args.contentQuery,
+                                filePattern: args.pattern || null,
+                                ignoreCase: args.ignoreCase ?? true,
+                                maxResults: Math.max(userMaxResults, 500),
+                                excludePatterns: allExcludes,
+                                contextLines,
+                                literalSearch: args.literalSearch ?? false,
+                                includeHidden: args.includeHidden ?? false,
+                                fileList: candidateFiles,
+                            });
+                        }
+                    } catch {
+                    }
+                }
+
+                // Fallback if BM25 didn't run or failed
+                if (rgResults === null) {
+                    rgResults = await ripgrepSearch(rootPath, {
+                        contentQuery: args.contentQuery,
+                        filePattern: args.pattern || null,
+                        ignoreCase: args.ignoreCase ?? true,
+                        maxResults: Math.max(userMaxResults, 500),
+                        excludePatterns: allExcludes,
+                        contextLines,
+                        # ... [lines 290-297 omitted]
+                        return {
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {  # L22
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of context lines"),
+            literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as literal string."),
+            countOnly: z.boolean().optional().default(false).describe("Return match/file counts only, no content."),
+            includeHidden: z.boolean().optional().default(false).describe("Include hidden files in search."),
+            symbolQuery: z.string().optional().describe(
+                "Search for symbols by name. " +
+                "Substring match (case-insensitive). Cannot be combined with contentQuery."
+            ),
+            symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe(
+                "Filter symbol search to a specific kind. Only used with symbolQuery or listSymbols."
+            ),
+            listSymbols: z.boolean().optional().default(false).describe(
+                "Return an inventory of all symbols."
+            ),
+        },
+        annotations: { readOnlyHint: true }
+    }, async (args) => {
+        const rootPath = await ctx.validatePath(args.path);
+
+        // ---- SYMBOL SEARCH / LIST MODE ----
+        if (args.symbolQuery || args.listSymbols) {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+
+            // Discover files — reuse ripgrep for speed
+            const hasRg = await ripgrepAvailable();
+            let filePaths = [];
+            const callerExcludes = args.excludePatterns ?? [];
+            const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+
+            if (hasRg) {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: 2000,
+                    excludePatterns: [...callerExcludes, ...defaultExcludeGlobs],
+                });
+                if (results) filePaths = results;
+            }
+
+            // JS fallback
+            if (filePaths.length === 0) {
+                async function walk(dir) {
+                    if (filePaths.length >= 2000) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+                    for (const entry of entries) {
+                        if (filePaths.length >= 2000) return;
+                        const fullPath = path.join(dir, entry.name);
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            await walk(fullPath);
+                        } else {
+                            filePaths.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            // Filter to supported files
+            const supportedFiles = filePaths.filter(f => isSupported(f));
+
+            if (supportedFiles.length === 0) {
+                const text = 'No supported files found.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+
+            const MAX_FILE_SIZE = 512 * 1024;
+            const BATCH_SIZE = 50;
+            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
+
+            if (args.listSymbols) {
+                // ---- LIST SYMBOLS MODE ----
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            const names = defs.map(d => `${d.name} (${d.type}:${d.line})`);
+                            return { rel, defs, names };
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        outputLines.push(`${result.rel}: ${result.names.join(', ')}`);
+                    }
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.join('\n');
+                return {
+                    content: [{ type: "text", text }],
+                };
+
+            } else {
+                // ---- SYMBOL QUERY MODE ----
+                const symbolQuery = args.symbolQuery;
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                nameFilter: symbolQuery,
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            return defs.map(d => ({
+                                line: `${rel}:${d.line}  [${d.type}] ${d.name} (lines ${d.line}-${d.endLine})`,
+                                file: rel,
+                            }));
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        for (const entry of result) {
+                            outputLines.push(entry.line);
+                        }
+                        if (outputLines.length >= userMaxResults) break;
+                    }
+                    if (outputLines.length >= userMaxResults) break;
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines.slice(0, userMaxResults)) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.length > 0
+                    ? budgetLines.join('\n')
+                    : 'No matches.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+        }
+
+        // ---- CONTENT SEARCH / FILE FIND MODE ----
+        const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+        const contextLines = Math.max(0, args.contextLines ?? 0);
+
+        const callerExcludes = args.excludePatterns ?? [];
+        const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+        const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
+
+        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
+
+        let contentRegex;
+        if (mode === 'content') {
+            if (!args.contentQuery) {
+                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
+            }
+            const flags = args.ignoreCase ? 'gi' : 'g';
+            contentRegex = args.literalSearch
+                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+                : new RegExp(args.contentQuery, flags);
+        }
+
+        // ---- RIPGREP PATH ----
+        const hasRg = await ripgrepAvailable();
+        if (hasRg) {
+            if (mode === 'files') {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: userMaxResults,
+                    excludePatterns: allExcludes,
+                });
+                if (results !== null) {
+                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
+                    return {
+                        content: [{ type: "text", text }],
+                    };
+                }
+            }
+
+            if (mode === 'content') {
+                let rgResults = null;
+
+                if (args.contentQuery.length > 2) {
+                    try {
+                        const candidateFiles = await bm25PreFilterFiles(
+                            rootPath,
+                            args.contentQuery,
+                            100,
+                            allExcludes
+                        );
+
+                        if (candidateFiles.length > 0) {
+                            rgResults = await ripgrepSearch(rootPath, {
+                                contentQuery: args.contentQuery,
+                                filePattern: args.pattern || null,
+                                ignoreCase: args.ignoreCase ?? true,
+                                maxResults: Math.max(userMaxResults, 500),
+                                excludePatterns: allExcludes,
+                                contextLines,
+                                literalSearch: args.literalSearch ?? false,
+                                includeHidden: args.includeHidden ?? false,
+                                fileList: candidateFiles,
+                            });
+                        }
+                    } catch {
+                    }
+                }
+
+                // Fallback if BM25 didn't run or failed
+                if (rgResults === null) {
+                    rgResults = await ripgrepSearch(rootPath, {
+                        contentQuery: args.contentQuery,
+                        filePattern: args.pattern || null,
+                        ignoreCase: args.ignoreCase ?? true,
+                        maxResults: Math.max(userMaxResults, 500),
+                        excludePatterns: allExcludes,
+                        contextLines,
+                        # ... [lines 290-297 omitted]
+                        return {
+
+=== RAW PREVIEW (first 1500 chars) ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of con

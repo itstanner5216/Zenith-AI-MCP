@@ -2,9 +2,10 @@ import { z } from "zod";
 import fs from "fs/promises";
 import { createReadStream } from "fs";
 import { createInterface } from "readline";
-import { readFileContent, tailFile, headFile, offsetReadFile } from '../lib.js';
-import { CHAR_BUDGET } from '../shared.js';
-import { getLangForFile, findSymbol } from '../tree-sitter.js';
+import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
+import { CHAR_BUDGET } from '../core/shared.js';
+import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
+import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
 
 function countLines(str) {
     if (!str) return 0;
@@ -16,6 +17,8 @@ export function register(server, ctx) {
     const handler = async (args) => {
         const validPath = await ctx.validatePath(args.path);
         const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        let standardReadContent = null;
+        let standardReadBudget = maxChars;
 
         // Validate parameter combinations
         if ((args.head && args.tail) || (args.tail && args.offset !== undefined) || (args.head && args.tail && args.offset !== undefined)) {
@@ -34,6 +37,11 @@ export function register(server, ctx) {
         const hasSymbolMode = args.symbol !== undefined;
         if (hasSymbolMode && (args.grep || args.head || args.tail || args.offset !== undefined || hasWindowMode)) {
             throw new Error("Cannot combine 'symbol' with grep/head/tail/offset/aroundLine/ranges. ");
+        }
+
+        if (args.compression && (hasSymbolMode || args.grep || args.head || args.tail ||
+                typeof args.offset === 'number' || hasWindowMode || args.showLineNumbers)) {
+            throw new Error("'compression' is only valid on plain full-file reads. Cannot combine with symbol/grep/head/tail/offset/aroundLine/ranges/showLineNumbers.");
         }
 
         // ---- SYMBOL MODE ----
@@ -231,6 +239,19 @@ export function register(server, ctx) {
         }
 
         // ---- STANDARD READ MODES ----
+
+        // Compression path — plain full-file read only, intercepts before normal read
+        if (args.compression) {
+            standardReadContent = await readFileContent(validPath);
+
+            const compressed = await compressTextFile(validPath, standardReadContent, maxChars);
+            if (compressed !== null) {
+                return { content: [{ type: "text", text: compressed.text }] };
+            }
+
+            standardReadBudget = computeCompressionBudget(standardReadContent.length, maxChars);
+        }
+
         let content;
         let meta = {};
 
@@ -248,18 +269,17 @@ export function register(server, ctx) {
         } else if (args.head) {
             content = await headFile(validPath, args.head);
         } else {
-            content = await readFileContent(validPath);
+            content = standardReadContent ?? await readFileContent(validPath);
         }
 
         // Smart truncation
         let truncated = false;
-        if (content && content.length > maxChars) {
+        if (content && content.length > standardReadBudget) {
             if (!meta.totalLines) {
                 meta.totalLines = countLines(content);
             }
-            let cutoff = content.lastIndexOf('\n', maxChars);
-            if (cutoff === -1) cutoff = maxChars;
-            content = content.slice(0, cutoff);
+            const truncatedResult = truncateToBudget(content, standardReadBudget);
+            content = truncatedResult.text;
             truncated = true;
             const truncLines = countLines(content);
             meta.truncatedAt = truncLines;
@@ -274,10 +294,10 @@ export function register(server, ctx) {
         }
 
         let metaHeader = '';
-        if (truncated) {
+        if (truncated && !args.compression) {
             metaHeader = `## truncated — offset=${meta.truncatedAt} ##\n`;
         }
-        if (!truncated && meta.hasMore) {
+        if (!truncated && meta.hasMore && !args.compression) {
             metaHeader = `## offset=${args.offset + meta.linesReturned} ##\n`;
         }
 
@@ -308,6 +328,7 @@ export function register(server, ctx) {
             symbol: z.string().optional().describe("Read a symbol by name. Dot-qualified for methods."),
             expandLines: z.number().optional().default(0).describe("Extra context around symbol. Max 50."),
             nearLine: z.number().optional().describe("Disambiguate multiple symbol matches."),
+            compression: z.boolean().optional().default(false).describe("Compression is off by default. Set true to turn it on for a full-file read."),
         },
         annotations: { readOnlyHint: true }
     }, handler);

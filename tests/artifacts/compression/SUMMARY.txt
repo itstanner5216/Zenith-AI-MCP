@@ -1,0 +1,61 @@
+Compression artifact summary
+
+FILE: dist/core/shared.js
+  raw=18667
+  target_budget=13066
+  bridge=13046
+  final=13046
+  bridge_accepted=true
+  bridge_has_structured_markers=true
+  final_has_structured_markers=true
+  final_looks_hard_cut=true
+
+FILE: dist/tools/search_files.js
+  raw=18756
+  target_budget=13129
+  bridge=13091
+  final=13091
+  bridge_accepted=true
+  bridge_has_structured_markers=true
+  final_has_structured_markers=true
+  final_looks_hard_cut=true
+
+FILE: dist/tools/read_text_file.js
+  raw=14668
+  target_budget=10267
+  bridge=10266
+  final=10266
+  bridge_accepted=true
+  bridge_has_structured_markers=true
+  final_has_structured_markers=true
+  final_looks_hard_cut=true
+
+FILE: dist/core/tree-sitter.js
+  raw=26698
+  target_budget=18688
+  bridge=18681
+  final=18681
+  bridge_accepted=true
+  bridge_has_structured_markers=true
+  final_has_structured_markers=true
+  final_looks_hard_cut=false
+
+FILE: dist/core/toon_bridge.js
+  raw=1632
+  target_budget=1142
+  bridge=1631
+  final=1056
+  bridge_accepted=false
+  bridge_has_structured_markers=false
+  final_has_structured_markers=false
+  final_looks_hard_cut=true
+
+FILE: dist/tools/write_file.js
+  raw=4440
+  target_budget=3108
+  bridge=3095
+  final=3095
+  bridge_accepted=true
+  bridge_has_structured_markers=true
+  final_has_structured_markers=true
+  final_looks_hard_cut=true

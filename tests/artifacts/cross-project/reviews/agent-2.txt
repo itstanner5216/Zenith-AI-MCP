@@ -1,0 +1,13 @@
+Review: cross-project batch-read compression
+
+Assessed files:
+- /home/tanner/Projects/dcp-fork/lib/messages/inject.ts
+- /home/tanner/Projects/agent-hive-main/packages/pantheon-core/src/services/taskService.ts
+
+Findings:
+- /home/tanner/Projects/dcp-fork/lib/messages/inject.ts: the compressed output is too aggressive. It retains only the early helper wrappers and `resolveContextLimit`, then stops before the main exported behavior (`buildPrunableToolsList`, `insertPruneToolContext`, `insertMessageIdContext`). The reported retention is about 31.4% kept, so the ~70% retention target does not hold. A model reading this would miss what the file actually does.
+- /home/tanner/Projects/agent-hive-main/packages/pantheon-core/src/services/taskService.ts: the output is much closer to the target at about 69.6% kept and does preserve the core sync/create/update/plan/dependency logic. The remaining gap is that it drops the subtask API (`createSubtask` through `readSubtaskReport`), so it is useful for the main task lifecycle but incomplete for the full class surface.
+
+Verdict:
+- `inject.ts`: fail
+- `taskService.ts`: warn

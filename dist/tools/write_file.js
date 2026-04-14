@@ -2,7 +2,7 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { randomBytes } from 'crypto';
-import { normalizeLineEndings } from '../lib.js';
+import { normalizeLineEndings } from '../core/lib.js';
 
 function findResumeOffset(existingTailLines, incomingLines) {
     if (!existingTailLines.length || !incomingLines.length) return 0;

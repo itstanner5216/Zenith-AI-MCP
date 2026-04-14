@@ -2,8 +2,8 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from 'path';
 import { randomBytes } from 'crypto';
-import { normalizeLineEndings, createMinimalDiff } from '../lib.js';
-import { getLangForFile, findSymbol, checkSyntaxErrors } from '../tree-sitter.js';
+import { normalizeLineEndings, createMinimalDiff } from '../core/lib.js';
+import { getLangForFile, findSymbol, checkSyntaxErrors } from '../core/tree-sitter.js';
 
 // Cache for failed edits — allows retry without resending newText.
 const _pendingRetries = new Map();

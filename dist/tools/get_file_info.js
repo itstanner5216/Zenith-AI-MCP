@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getFileStats } from '../lib.js';
+import { getFileStats } from '../core/lib.js';
 
 export function register(server, ctx) {
     server.registerTool("get_file_info", {

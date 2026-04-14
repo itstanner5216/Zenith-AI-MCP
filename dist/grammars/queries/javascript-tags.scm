@@ -9,7 +9,7 @@
 ] @definition.class
 
 [
-  (function
+  (function_expression
     name: (identifier) @name.definition.function)
   (function_declaration
     name: (identifier) @name.definition.function)
@@ -22,12 +22,12 @@
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name.definition.function
-    value: [(arrow_function) (function)])) @definition.function
+    value: [(arrow_function) (function_expression)])) @definition.function
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @name.definition.function
-    value: [(arrow_function) (function)])) @definition.function
+    value: [(arrow_function) (function_expression)])) @definition.function
 
 (assignment_expression
   left: [
@@ -35,12 +35,12 @@
     (member_expression
       property: (property_identifier) @name.definition.function)
   ]
-  right: [(arrow_function) (function)]
+  right: [(arrow_function) (function_expression)]
 ) @definition.function
 
 (pair
   key: (property_identifier) @name.definition.function
-  value: [(arrow_function) (function)]) @definition.function
+  value: [(arrow_function) (function_expression)]) @definition.function
 
 (
   (call_expression

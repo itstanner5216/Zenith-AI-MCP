@@ -1,0 +1,4961 @@
+Compression full review
+
+====================================================================================================
+dist_core_shared_js.txt
+====================================================================================================
+
+FILE: dist/core/shared.js
+RAW_CHARS: 18667
+TARGET_70_PERCENT_BUDGET: 13066
+BRIDGE_CHARS: 13046
+FINAL_TOOL_CHARS: 13046
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
+    }
+    return 400_000;
+})();
+export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
+
+export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
+    'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export const SENSITIVE_PATTERNS = (process.env.SENSITIVE_PATTERNS ||
+    '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export function isSensitive(filePath) {  # L53
+    const rel = path.relative(os.homedir(), filePath);
+    return SENSITIVE_PATTERNS.some(pat =>
+        minimatch(rel, pat, { dot: true, nocase: true }) ||
+        minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BM.X-T Engine — entropy-weighted TAAT search, zero deps
+// ---------------------------------------------------------------------------
+
+const WORD_RE = /[a-z0-9_]+/g;
+
+export class BM25Index {  # L67
+    constructor(k1 = 1.2, b = 0.75, beta = 0.6) {
+        this.k1 = k1;
+        this.b = b;
+        this.beta = beta;
+        this._postingLists = new Map(); // term -> Map<docId, tf>
+        this._docLengths = new Map();   // docId -> tokenCount
+        this._avgDocLength = 0;
+        this._idfCache = new Map();     // term -> idf
+        this._termEntropy = new Map();  // term -> normalized entropy [0,1]
+        this._termTotalFreqs = new Map(); // term -> total tf across corpus
+        this._totalDocs = 0;
+    }
+
+    static tokenize(text) {
+        if (!text) return [];
+        const tokens = text.toLowerCase().match(WORD_RE);
+        if (!tokens) return [];
+        return tokens.filter(t => t.length > 1 || t === 'a' || t === 'i');
+    }
+
+    /**
+     * Build index from array of { id: string, text: string }.
+     */
+    build(docs) {  # L91
+        this._postingLists.clear();
+        this._docLengths.clear();
+        this._idfCache.clear();
+        this._termEntropy.clear();
+        this._termTotalFreqs.clear();
+
+        let totalLength = 0;
+
+        // Pass 1: tokenize, build inverted index
+        for (const doc of docs) {
+            if (!doc.id) continue;
+            const tokens = BM25Index.tokenize(doc.text);
+            this._docLengths.set(doc.id, tokens.length);
+            totalLength += tokens.length;
+
+            const tfMap = new Map();
+            for (const token of tokens) {
+                tfMap.set(token, (tfMap.get(token) || 0) + 1);
+            }
+
+            for (const [term, count] of tfMap) {
+                if (!this._postingLists.has(term)) {
+                    this._postingLists.set(term, new Map());
+                }
+                this._postingLists.get(term).set(doc.id, count);
+                this._termTotalFreqs.set(term, (this._termTotalFreqs.get(term) || 0) + count);
+            }
+        }
+
+        this._totalDocs = this._docLengths.size;
+        if (this._totalDocs === 0) return;
+        this._avgDocLength = totalLength / this._totalDocs;
+
+        // Pass 2: IDF
+        for (const [term, posting] of this._postingLists) {
+            const df = posting.size;
+            this._idfCache.set(term, Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1));
+        }
+
+        // Pass 3: per-term entropy
+        for (const [term, posting] of this._postingLists) {
+            const totalTf = this._termTotalFreqs.get(term);
+            const nDocs = posting.size;
+            if (totalTf === 0 || nDocs <= 1) {
+                this._termEntropy.set(term, 0);
+                continue;
+            }
+            let entropy = 0;
+            for (const tf of posting.values()) {
+                const p = tf / totalTf;
+                entropy -= p * Math.log(p);
+            }
+            const maxEntropy = Math.log(nDocs);
+            this._termEntropy.set(term, maxEntropy > 0 ? entropy / maxEntropy : 0);
+        }
+    }
+
+    /**
+     * TAAT search with entropy-weighted scoring and sigmoid TF saturation.
+     * Returns array of { id, score } sorted desc, scores normalized to [0, 1].
+     */
+    search(query, topK = 200) {  # L153
+        if (this._totalDocs === 0 || !query) return [];
+
+        const queryTokens = BM25Index.tokenize(query);
+        if (queryTokens.length === 0) return [];
+
+        // Count query term frequencies
+        const qtfMap = new Map();
+        for (const t of queryTokens) qtfMap.set(t, (qtfMap.get(t) || 0) + 1);
+
+        // Pre-compute per-term weights and max_possible
+        const termWeights = new Map();
+        let maxPossible = 0;
+
+        for (const [term, qtf] of qtfMap) {
+            if (!this._postingLists.has(term)) continue;
+            const idf = this._idfCache.get(term) || 0;
+            const entropy = this._termEntropy.get(term) || 0;
+            const weight = idf * (1 + this.beta * (1 - entropy));
+            termWeights.set(term, weight);
+            maxPossible += weight * qtf;
+        }
+
+        if (maxPossible === 0) return [];
+
+        // TAAT: accumulate scores by traversing postings
+        const { k1, b, _avgDocLength: avgdl } = this;
+        const scores = new Map();
+
+        for (const [term, qtf] of qtfMap) {
+            const weight = termWeights.get(term);
+            if (weight === undefined) continue;
+            const w = weight * qtf;
+            const posting = this._postingLists.get(term);
+
+            for (const [docId, tf] of posting) {
+                const dl = this._docLengths.get(docId);
+                const K = k1 * (1 - b + b * (dl / avgdl));
+                // Sigmoid TF saturation
+                const tfComponent = 1 / (1 + Math.exp(-k1 * (tf - K / 2) / K));
+                scores.set(docId, (scores.get(docId) || 0) + w * tfComponent);
+            }
+        }
+
+        if (scores.size === 0) return [];
+
+        // Normalize to [0, 1]
+        const invMax = 1 / maxPossible;
+        const sorted = [...scores.entries()]
+            .map(([id, s]) => ({ id, score: s * invMax }))
+            .sort((a, b) => b.score - a.score);
+
+        return sorted.slice(0, topK);
+    }
+}
+# ... [lines 208-219 omitted]
+export function bm25RankResults(lines, query, charBudget = CHAR_BUDGET) {  # L220
+    const index = new BM25Index();
+    const docs = lines.map((line, i) => ({ id: String(i), text: line }));
+    index.build(docs);
+
+    const ranked = index.search(query, lines.length);
+    const result = [];
+    let charCount = 0;
+
+    for (const { id } of ranked) {
+        const line = lines[Number(id)];
+        if (charCount + line.length + 1 > charBudget) break;
+        result.push(line);
+        charCount += line.length + 1; // +1 for newline
+    }
+
+    return { ranked: result, totalCount: lines.length };
+}
+# ... [lines 238-247 omitted]
+export async function bm25PreFilterFiles(rootPath, query, topK = 50, excludePatterns = []) {  # L248
+    const docs = [];
+    const MAX_FILE_SIZE = 512 * 1024; // 512KB max per file for indexing
+    const MAX_FILES = 5000;           // cap to prevent runaway on huge repos
+
+    const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+    const allExcludes = [...excludePatterns, ...defaultExcludeGlobs];
+
+    // Text extensions for BM25 content indexing
+    const textExts = new Set([
+        '.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs',
+        '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp',
+        '.cs', '.php', '.vue', '.svelte', '.html', '.css', '.scss',
+        '.less', '.json', '.yaml', '.yml', '.toml', '.xml', '.md',
+        '.txt', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat',
+        '.sql', '.graphql', '.proto', '.tf', '.hcl', '.lua',
+        '.ex', '.exs', '.erl', '.hs', '.ml', '.clj', '.r',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt',
+        '.env.example', '.gitignore', '.editorconfig',
+    ]);
+
+    // Use ripgrep for file discovery when available — automatically respects
+    // .gitignore, .ignore, and .rgignore files, eliminating noise from build
+    // artifacts, vendored code, and test fixtures that projects exclude.
+    const hasRg = await ripgrepAvailable();
+    let filePaths = [];
+
+    if (hasRg) {
+        const rgFiles = await ripgrepFindFiles(rootPath, {
+            maxResults: MAX_FILES,
+            excludePatterns: allExcludes,
+        });
+        if (rgFiles && rgFiles.length > 0) {
+            filePaths = rgFiles;
+        }
+    }
+
+    // JS fallback — manual walk (no .gitignore awareness)
+    if (filePaths.length === 0) {
+        async function walk(dir) {
+            if (filePaths.length >= MAX_FILES) return;
+            let entries;
+            try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                if (filePaths.length >= MAX_FILES) return;
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.relative(rootPath, fullPath);
+
+                if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                const excluded = allExcludes.some(pat =>
+                    minimatch(rel, pat, { dot: true }) ||
+                    minimatch(rel, pat.replace(/^\*\*\//, ''), { dot: true })
+                );
+                if (excluded) continue;
+                if (isSensitive(fullPath)) continue;
+
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile()) {
+                    filePaths.push(fullPath);
+                }
+            }
+        }
+        await walk(rootPath);
+    }
+
+    // Index text files with BM25
+    for (const fullPath of filePaths) {
+        if (docs.length >= MAX_FILES) break;
+        const ext = path.extname(fullPath).toLowerCase();
+        const nameLC = path.basename(fullPath).toLowerCase();
+        const isText = textExts.has(ext) ||
+            nameLC === 'dockerfile' || nameLC === 'makefile' ||
+            nameLC === 'cmakelists.txt' || nameLC === 'gemfile' ||
+            nameLC === 'rakefile' || nameLC === 'justfile' ||
+            nameLC.startsWith('.') && !nameLC.includes('.');
+
+        if (!isText) continue;
+
+        try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > MAX_FILE_SIZE || stat.size === 0) continue;
+
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const rel = path.relative(rootPath, fullPath);
+            const pathTokens = rel.replace(/[/\\]/g, ' ').replace(/\./g, ' ');
+            const boostedText = `${pathTokens} ${pathTokens} ${pathTokens} ${content.slice(0, 8192)}`;
+            docs.push({ id: fullPath, text: boostedText });
+        } catch { /* skip unreadable */ }
+    }
+
+    if (docs.length === 0) return [];
+    # ... [lines 340-343 omitted]
+    return results.map(r => r.id);
+    # ... [9 lines omitted]
+
+// ---------------------------------------------------------------------------
+// Ripgrep
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
+    }
+    return 400_000;
+})();
+export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
+
+export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
+    'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export const SENSITIVE_PATTERNS = (process.env.SENSITIVE_PATTERNS ||
+    '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export function isSensitive(filePath) {  # L53
+    const rel = path.relative(os.homedir(), filePath);
+    return SENSITIVE_PATTERNS.some(pat =>
+        minimatch(rel, pat, { dot: true, nocase: true }) ||
+        minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BM.X-T Engine — entropy-weighted TAAT search, zero deps
+// ---------------------------------------------------------------------------
+
+const WORD_RE = /[a-z0-9_]+/g;
+
+export class BM25Index {  # L67
+    constructor(k1 = 1.2, b = 0.75, beta = 0.6) {
+        this.k1 = k1;
+        this.b = b;
+        this.beta = beta;
+        this._postingLists = new Map(); // term -> Map<docId, tf>
+        this._docLengths = new Map();   // docId -> tokenCount
+        this._avgDocLength = 0;
+        this._idfCache = new Map();     // term -> idf
+        this._termEntropy = new Map();  // term -> normalized entropy [0,1]
+        this._termTotalFreqs = new Map(); // term -> total tf across corpus
+        this._totalDocs = 0;
+    }
+
+    static tokenize(text) {
+        if (!text) return [];
+        const tokens = text.toLowerCase().match(WORD_RE);
+        if (!tokens) return [];
+        return tokens.filter(t => t.length > 1 || t === 'a' || t === 'i');
+    }
+
+    /**
+     * Build index from array of { id: string, text: string }.
+     */
+    build(docs) {  # L91
+        this._postingLists.clear();
+        this._docLengths.clear();
+        this._idfCache.clear();
+        this._termEntropy.clear();
+        this._termTotalFreqs.clear();
+
+        let totalLength = 0;
+
+        // Pass 1: tokenize, build inverted index
+        for (const doc of docs) {
+            if (!doc.id) continue;
+            const tokens = BM25Index.tokenize(doc.text);
+            this._docLengths.set(doc.id, tokens.length);
+            totalLength += tokens.length;
+
+            const tfMap = new Map();
+            for (const token of tokens) {
+                tfMap.set(token, (tfMap.get(token) || 0) + 1);
+            }
+
+            for (const [term, count] of tfMap) {
+                if (!this._postingLists.has(term)) {
+                    this._postingLists.set(term, new Map());
+                }
+                this._postingLists.get(term).set(doc.id, count);
+                this._termTotalFreqs.set(term, (this._termTotalFreqs.get(term) || 0) + count);
+            }
+        }
+
+        this._totalDocs = this._docLengths.size;
+        if (this._totalDocs === 0) return;
+        this._avgDocLength = totalLength / this._totalDocs;
+
+        // Pass 2: IDF
+        for (const [term, posting] of this._postingLists) {
+            const df = posting.size;
+            this._idfCache.set(term, Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1));
+        }
+
+        // Pass 3: per-term entropy
+        for (const [term, posting] of this._postingLists) {
+            const totalTf = this._termTotalFreqs.get(term);
+            const nDocs = posting.size;
+            if (totalTf === 0 || nDocs <= 1) {
+                this._termEntropy.set(term, 0);
+                continue;
+            }
+            let entropy = 0;
+            for (const tf of posting.values()) {
+                const p = tf / totalTf;
+                entropy -= p * Math.log(p);
+            }
+            const maxEntropy = Math.log(nDocs);
+            this._termEntropy.set(term, maxEntropy > 0 ? entropy / maxEntropy : 0);
+        }
+    }
+
+    /**
+     * TAAT search with entropy-weighted scoring and sigmoid TF saturation.
+     * Returns array of { id, score } sorted desc, scores normalized to [0, 1].
+     */
+    search(query, topK = 200) {  # L153
+        if (this._totalDocs === 0 || !query) return [];
+
+        const queryTokens = BM25Index.tokenize(query);
+        if (queryTokens.length === 0) return [];
+
+        // Count query term frequencies
+        const qtfMap = new Map();
+        for (const t of queryTokens) qtfMap.set(t, (qtfMap.get(t) || 0) + 1);
+
+        // Pre-compute per-term weights and max_possible
+        const termWeights = new Map();
+        let maxPossible = 0;
+
+        for (const [term, qtf] of qtfMap) {
+            if (!this._postingLists.has(term)) continue;
+            const idf = this._idfCache.get(term) || 0;
+            const entropy = this._termEntropy.get(term) || 0;
+            const weight = idf * (1 + this.beta * (1 - entropy));
+            termWeights.set(term, weight);
+            maxPossible += weight * qtf;
+        }
+
+        if (maxPossible === 0) return [];
+
+        // TAAT: accumulate scores by traversing postings
+        const { k1, b, _avgDocLength: avgdl } = this;
+        const scores = new Map();
+
+        for (const [term, qtf] of qtfMap) {
+            const weight = termWeights.get(term);
+            if (weight === undefined) continue;
+            const w = weight * qtf;
+            const posting = this._postingLists.get(term);
+
+            for (const [docId, tf] of posting) {
+                const dl = this._docLengths.get(docId);
+                const K = k1 * (1 - b + b * (dl / avgdl));
+                // Sigmoid TF saturation
+                const tfComponent = 1 / (1 + Math.exp(-k1 * (tf - K / 2) / K));
+                scores.set(docId, (scores.get(docId) || 0) + w * tfComponent);
+            }
+        }
+
+        if (scores.size === 0) return [];
+
+        // Normalize to [0, 1]
+        const invMax = 1 / maxPossible;
+        const sorted = [...scores.entries()]
+            .map(([id, s]) => ({ id, score: s * invMax }))
+            .sort((a, b) => b.score - a.score);
+
+        return sorted.slice(0, topK);
+    }
+}
+# ... [lines 208-219 omitted]
+export function bm25RankResults(lines, query, charBudget = CHAR_BUDGET) {  # L220
+    const index = new BM25Index();
+    const docs = lines.map((line, i) => ({ id: String(i), text: line }));
+    index.build(docs);
+
+    const ranked = index.search(query, lines.length);
+    const result = [];
+    let charCount = 0;
+
+    for (const { id } of ranked) {
+        const line = lines[Number(id)];
+        if (charCount + line.length + 1 > charBudget) break;
+        result.push(line);
+        charCount += line.length + 1; // +1 for newline
+    }
+
+    return { ranked: result, totalCount: lines.length };
+}
+# ... [lines 238-247 omitted]
+export async function bm25PreFilterFiles(rootPath, query, topK = 50, excludePatterns = []) {  # L248
+    const docs = [];
+    const MAX_FILE_SIZE = 512 * 1024; // 512KB max per file for indexing
+    const MAX_FILES = 5000;           // cap to prevent runaway on huge repos
+
+    const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+    const allExcludes = [...excludePatterns, ...defaultExcludeGlobs];
+
+    // Text extensions for BM25 content indexing
+    const textExts = new Set([
+        '.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs',
+        '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp',
+        '.cs', '.php', '.vue', '.svelte', '.html', '.css', '.scss',
+        '.less', '.json', '.yaml', '.yml', '.toml', '.xml', '.md',
+        '.txt', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat',
+        '.sql', '.graphql', '.proto', '.tf', '.hcl', '.lua',
+        '.ex', '.exs', '.erl', '.hs', '.ml', '.clj', '.r',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt',
+        '.env.example', '.gitignore', '.editorconfig',
+    ]);
+
+    // Use ripgrep for file discovery when available — automatically respects
+    // .gitignore, .ignore, and .rgignore files, eliminating noise from build
+    // artifacts, vendored code, and test fixtures that projects exclude.
+    const hasRg = await ripgrepAvailable();
+    let filePaths = [];
+
+    if (hasRg) {
+        const rgFiles = await ripgrepFindFiles(rootPath, {
+            maxResults: MAX_FILES,
+            excludePatterns: allExcludes,
+        });
+        if (rgFiles && rgFiles.length > 0) {
+            filePaths = rgFiles;
+        }
+    }
+
+    // JS fallback — manual walk (no .gitignore awareness)
+    if (filePaths.length === 0) {
+        async function walk(dir) {
+            if (filePaths.length >= MAX_FILES) return;
+            let entries;
+            try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                if (filePaths.length >= MAX_FILES) return;
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.relative(rootPath, fullPath);
+
+                if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                const excluded = allExcludes.some(pat =>
+                    minimatch(rel, pat, { dot: true }) ||
+                    minimatch(rel, pat.replace(/^\*\*\//, ''), { dot: true })
+                );
+                if (excluded) continue;
+                if (isSensitive(fullPath)) continue;
+
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile()) {
+                    filePaths.push(fullPath);
+                }
+            }
+        }
+        await walk(rootPath);
+    }
+
+    // Index text files with BM25
+    for (const fullPath of filePaths) {
+        if (docs.length >= MAX_FILES) break;
+        const ext = path.extname(fullPath).toLowerCase();
+        const nameLC = path.basename(fullPath).toLowerCase();
+        const isText = textExts.has(ext) ||
+            nameLC === 'dockerfile' || nameLC === 'makefile' ||
+            nameLC === 'cmakelists.txt' || nameLC === 'gemfile' ||
+            nameLC === 'rakefile' || nameLC === 'justfile' ||
+            nameLC.startsWith('.') && !nameLC.includes('.');
+
+        if (!isText) continue;
+
+        try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > MAX_FILE_SIZE || stat.size === 0) continue;
+
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const rel = path.relative(rootPath, fullPath);
+            const pathTokens = rel.replace(/[/\\]/g, ' ').replace(/\./g, ' ');
+            const boostedText = `${pathTokens} ${pathTokens} ${pathTokens} ${content.slice(0, 8192)}`;
+            docs.push({ id: fullPath, text: boostedText });
+        } catch { /* skip unreadable */ }
+    }
+
+    if (docs.length === 0) return [];
+    # ... [lines 340-343 omitted]
+    return results.map(r => r.id);
+    # ... [9 lines omitted]
+
+// ---------------------------------------------------------------------------
+// Ripgrep
+
+=== RAW PREVIEW (first 1500 chars) ===
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET en
+
+
+====================================================================================================
+dist_core_toon_bridge_js.txt
+====================================================================================================
+
+FILE: dist/core/toon_bridge.js
+RAW_CHARS: 1632
+TARGET_70_PERCENT_BUDGET: 1142
+BRIDGE_CHARS: 1631
+FINAL_TOOL_CHARS: 1056
+BRIDGE_ACCEPTED: false
+FINAL_MODE: bridge rejected, 70% fallback truncation used
+BRIDGE_HAS_STRUCTURED_MARKERS: false
+FINAL_HAS_STRUCTURED_MARKERS: false
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+// toon_bridge.js
+// Accepts a file path and budget (chars) via CLI args.
+// Runs tree-sitter to extract code structure, then calls toon's
+// --structured mode via subprocess, returning the compressed result.
+//
+// Usage: node toon_bridge.js <filepath> <budget_chars>
+
+import { readFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { getCompressionStructure, getLangForFile } from './tree-sitter.js';
+
+const inputPath = process.argv[2];
+const budget    = parseInt(process.argv[3], 10);
+
+if (!inputPath || isNaN(budget)) {
+    process.stderr.write('Usage: node toon_bridge.js <filepath> <budget_chars>\n');
+    process.exit(1);
+}
+
+const content = readFileSync(inputPath, 'utf8');
+
+if (content.length <= budget) {
+    process.stdout.write(content);
+    process.exit(0);
+}
+
+let structure = null;
+const langName = getLangForFile(inputPath);
+
+if (langName) {
+    try {
+        const defs = await getCompressionStructure(content, langName);
+        if (defs && defs.length > 0) {
+            structure = defs;
+        }
+    } catch (e) {
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+// toon_bridge.js
+// Accepts a file path and budget (chars) via CLI args.
+// Runs tree-sitter to extract code structure, then calls toon's
+// --structured mode via subprocess, returning the compressed result.
+//
+// Usage: node toon_bridge.js <filepath> <budget_chars>
+
+import { readFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { getCompressionStructure, getLangForFile } from './tree-sitter.js';
+
+const inputPath = process.argv[2];
+const budget    = parseInt(process.argv[3], 10);
+
+if (!inputPath || isNaN(budget)) {
+    process.stderr.write('Usage: node toon_bridge.js <filepath> <budget_chars>\n');
+    process.exit(1);
+}
+
+const content = readFileSync(inputPath, 'utf8');
+
+if (content.length <= budget) {
+    process.stdout.write(content);
+    process.exit(0);
+}
+
+let structure = null;
+const langName = getLangForFile(inputPath);
+
+if (langName) {
+    try {
+        const defs = await getCompressionStructure(content, langName);
+        if (defs && defs.length > 0) {
+            structure = defs;
+        }
+    } catch (e) {
+        process.stderr.write(`tree-sitter parse failed for ${inputPath}: ${e.message}\n`);
+    }
+}
+
+// Hand off to toon --structured (falls back to regex codec if structure is null)
+const payload = JSON.stringify({ content, budget, structure });
+
+const toonProjectDir = process.env.TOON_PROJECT_DIR || '/home/tanner/Projects/toon';
+
+const result = execFileSync('python3', ['-m', 'toon', '--structured'], {
+    input:     payload,
+    encoding:  'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+    timeout:   30_000,
+    cwd:       toonProjectDir,
+});
+
+process.stdout.write(result);
+
+=== RAW PREVIEW (first 1500 chars) ===
+// toon_bridge.js
+// Accepts a file path and budget (chars) via CLI args.
+// Runs tree-sitter to extract code structure, then calls toon's
+// --structured mode via subprocess, returning the compressed result.
+//
+// Usage: node toon_bridge.js <filepath> <budget_chars>
+
+import { readFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { getCompressionStructure, getLangForFile } from './tree-sitter.js';
+
+const inputPath = process.argv[2];
+const budget    = parseInt(process.argv[3], 10);
+
+if (!inputPath || isNaN(budget)) {
+    process.stderr.write('Usage: node toon_bridge.js <filepath> <budget_chars>\n');
+    process.exit(1);
+}
+
+const content = readFileSync(inputPath, 'utf8');
+
+if (content.length <= budget) {
+    process.stdout.write(content);
+    process.exit(0);
+}
+
+let structure = null;
+const langName = getLangForFile(inputPath);
+
+if (langName) {
+    try {
+        const defs = await getCompressionStructure(content, langName);
+        if (defs && defs.length > 0) {
+            structure = defs;
+        }
+    } catch (e) {
+        process.stderr.write(`tree-sitter parse failed for ${inputPath}: ${e.message}\n`);
+    }
+}
+
+// Hand off to toon --structured (falls back to regex codec if structure is null)
+const payload = JSON.stringify({ content, budget, structure });
+
+const toonProjectDir = process.env.TOON_PROJECT_DIR || '/home/tanner/Projects/toon';
+
+const result = execFileSync('python3', ['-m', 'toon', '--structured'], {
+    input:     payload,
+    encoding:
+
+
+====================================================================================================
+dist_core_tree-sitter_js.txt
+====================================================================================================
+
+FILE: dist/core/tree-sitter.js
+RAW_CHARS: 26698
+TARGET_70_PERCENT_BUDGET: 18688
+BRIDGE_CHARS: 18681
+FINAL_TOOL_CHARS: 18681
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: false
+
+=== FINAL TOOL OUTPUT ===
+// ---------------------------------------------------------------------------
+// tree-sitter.js — Shared tree-sitter module for symbol-aware tools
+//
+// Provides:
+//   1. Lazy initialization of web-tree-sitter WASM runtime
+//   2. Grammar loading by file extension (cached after first load)
+//   3. Query file loading (.scm patterns) per language
+//   4. getSymbols()      — extract symbols (definitions + references) from source
+//   5. getDefinitions()  — convenience: only definitions
+//   6. getSymbolSummary()— count symbols by type for a file
+//   7. findSymbol()      — find a specific symbol by name, with disambiguation
+//   8. isSupported()     — check if tree-sitter supports a file extension
+//
+// Grammars:  ./grammars/grammars/tree-sitter-{lang}.wasm
+// Queries:   ./grammars/queries/{lang}-tags.scm
+// Runtime:   ./grammars/tree-sitter.wasm
+//
+// All loading is lazy. Nothing is loaded until first use.
+// Language objects and compiled queries are cached permanently.
+// Parsed symbols are cached by source hash (LRU, 100 entries).
+// ---------------------------------------------------------------------------
+
+import { Parser, Language, Query } from 'web-tree-sitter';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+const GRAMMARS_DIR = path.join(__dirname, '..', 'grammars', 'grammars');
+const QUERIES_DIR  = path.join(__dirname, '..', 'grammars', 'queries');
+const TS_WASM_PATH = path.join(__dirname, '..', 'grammars', 'tree-sitter.wasm');
+
+// ---------------------------------------------------------------------------
+// Extension → language mapping
+// ---------------------------------------------------------------------------
+
+const EXT_TO_LANG = {
+    // JavaScript / TypeScript
+    '.js':   'javascript',
+    '.mjs':  'javascript',
+    '.cjs':  'javascript',
+    '.jsx':  'javascript',
+    '.ts':   'typescript',
+    '.mts':  'typescript',
+    '.cts':  'typescript',
+    '.tsx':  'tsx',
+    // Python
+    '.py':   'python',
+    '.pyi':  'python',
+    // Shell
+    '.sh':   'bash',
+    '.bash': 'bash',
+    '.zsh':  'bash',
+    // Go
+    '.go':   'go',
+    // Rust
+    '.rs':   'rust',
+    // Java
+    '.java': 'java',
+    // C / C++
+    '.c':    'c',
+    '.h':    'c',
+    '.cpp':  'cpp',
+    '.cc':   'cpp',
+    '.cxx':  'cpp',
+    '.hpp':  'cpp',
+    '.hh':   'cpp',
+    '.hxx':  'cpp',
+    // C#
+    '.cs':   'csharp',
+    // Kotlin
+    '.kt':   'kotlin',
+    '.kts':  'kotlin',
+    // PHP
+    '.php':  'php',
+    // Ruby
+    '.rb':     'ruby',
+    '.rake':   'ruby',
+    '.gemspec': 'ruby',
+    // Swift
+    '.swift': 'swift',
+    // Web
+    '.css':  'css',
+    '.scss': 'css',
+    // Data formats
+    '.json':  'json',
+    '.jsonc': 'json',
+    '.yaml':  'yaml',
+    '.yml':   'yaml',
+    '.sql':   'sql',
+    // Documentation
+    '.md':  'markdown',
+    '.mdx': 'markdown',
+};
+
+/**
+ * Get the tree-sitter language name for a file path.
+ * Returns null if the extension is not supported.
+ */
+export function getLangForFile(filePath) {  # L107
+    const ext = path.extname(filePath).toLowerCase();
+    return EXT_TO_LANG[ext] || null;
+}
+
+/**
+ * Get all supported file extensions.
+ */
+export function getSupportedExtensions() {  # L115
+    return Object.keys(EXT_TO_LANG);
+}
+
+/**
+ * Check if a file can be parsed by tree-sitter.
+ */
+export function isSupported(filePath) {  # L122
+    return getLangForFile(filePath) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Initialization & caching
+// ---------------------------------------------------------------------------
+
+let _initPromise = null;
+const _languageCache = new Map();       // lang name → Language object (or null)
+const _queryStringCache = new Map();    // lang name → raw .scm string (or null)
+const _compiledQueryCache = new Map();  // lang name → Query object (or null)
+
+// Symbol cache: hash(source) → Symbol[]
+const SYMBOL_CACHE_MAX = 100;
+const _symbolCache = new Map();         // hash → { symbols, ts }
+
+/**
+ * Initialize the tree-sitter WASM runtime. Idempotent.
+ */
+async function ensureInit() {  # L142
+    if (!_initPromise) {
+        _initPromise = Parser.init({
+            locateFile: () => TS_WASM_PATH,
+        });
+    }
+    return _initPromise;
+}
+
+/**
+ * Load a Language grammar (WASM), cached permanently.
+ * Returns null if the grammar file doesn't exist.
+ */
+async function loadLanguage(langName) {  # L155
+    if (_languageCache.has(langName)) {
+        return _languageCache.get(langName);
+    }
+
+    await ensureInit();
+
+    const wasmPath = path.join(GRAMMARS_DIR, `tree-sitter-${langName}.wasm`);
+    try {
+        await fs.access(wasmPath);
+    } catch {
+        _languageCache.set(langName, null);
+        return null;
+    }
+
+    try {
+        const language = await Language.load(wasmPath);
+        _languageCache.set(langName, language);
+        return language;
+    } catch (err) {
+        console.error(`Failed to load grammar for ${langName}:`, err.message);
+        _languageCache.set(langName, null);
+        return null;
+    }
+}
+
+/**
+ * Load the .scm query string for a language. Cached permanently.
+ */
+async function loadQueryString(langName) {  # L184
+    if (_queryStringCache.has(langName)) {
+        return _queryStringCache.get(langName);
+    }
+
+    const scmPath = path.join(QUERIES_DIR, `${langName}-tags.scm`);
+    try {
+        const content = await fs.readFile(scmPath, 'utf-8');
+        _queryStringCache.set(langName, content);
+        return content;
+    } catch {
+        _queryStringCache.set(langName, null);
+        return null;
+    }
+}
+
+/**
+ * Get a compiled Query object for a language. Cached permanently.
+ * Returns null if language or query unavailable.
+ */
+async function getCompiledQuery(langName) {  # L204
+    if (_compiledQueryCache.has(langName)) {
+        return _compiledQueryCache.get(langName);
+    }
+
+    const language = await loadLanguage(langName);
+    if (!language) {
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+
+    const queryString = await loadQueryString(langName);
+    if (!queryString) {
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+
+    try {
+        const query = new Query(language, queryString);
+        _compiledQueryCache.set(langName, query);
+        return query;
+    } catch (err) {
+        console.error(`Failed to compile query for ${langName}:`, err.message);
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol cache helpers
+// ---------------------------------------------------------------------------
+
+function sourceHash(source) {  # L236
+    return createHash('md5').update(source).digest('hex');
+}
+
+function getCachedSymbols(hash) {  # L240
+    const entry = _symbolCache.get(hash);
+    if (entry) {
+        entry.ts = Date.now(); // touch for LRU
+        return entry.symbols;
+    }
+    return null;
+}
+
+function setCachedSymbols(hash, symbols) {  # L249
+    // Evict oldest if at capacity
+    if (_symbolCache.size >= SYMBOL_CACHE_MAX) {
+        let oldestKey = null, oldestTs = Infinity;
+        for (const [key, val] of _symbolCache) {
+            if (val.ts < oldestTs) {
+                oldestTs = val.ts;
+                oldestKey = key;
+            }
+        }
+        if (oldestKey) _symbolCache.delete(oldestKey);
+    }
+    _symbolCache.set(hash, { symbols, ts: Date.now() });
+}
+# ... [lines 263-295 omitted]
+export async function getSymbols(source, langName, options = {}) {  # L296
+    // Check cache first
+    const hash = sourceHash(langName + ':' + source);
+    const cached = getCachedSymbols(hash);
+    if (cached) {
+        return applyFilters(cached, options);
+    }
+
+    const language = await loadLanguage(langName);
+    if (!language) return null;
+
+    const query = await getCompiledQuery(langName);
+    if (!query) return null;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    // Use matches() to get grouped captures per pattern match.
+    // Each match contains both @name.definition.X and @definition.X captures.
+    const matches = query.matches(tree.rootNode);
+    const symbols = [];
+    const seen = new Set();
+
+    for (const match of matches) {
+        const { captures } = match;
+
+        // Find the name capture and the definition/reference body capture
+        let nameCapture = null;
+        let bodyCapture = null;
+
+        for (const cap of captures) {
+            if (cap.name.startsWith('name.')) {
+                nameCapture = cap;
+            } else if (cap.name.startsWith('definition.') || cap.name.startsWith('reference.')) {
+                bodyCapture = cap;
+            }
+        }
+
+        if (!nameCapture) continue;
+
+        const tag = nameCapture.name;
+        let kind, type;
+        if (tag.startsWith('name.definition.')) {
+            kind = 'def';
+            type = tag.slice('name.definition.'.length);
+        } else if (tag.startsWith('name.reference.')) {
+            kind = 'ref';
+            type = tag.slice('name.reference.'.length);
+        } else {
+            continue;
+        }
+
+        const name = nameCapture.node.text;
+        const line = nameCapture.node.startPosition.row + 1;
+        const column = nameCapture.node.startPosition.column;
+
+        // endLine comes from the body capture if available, otherwise from
+        // the name capture's own end (single-line symbol)
+        let endLine;
+        if (bodyCapture) {
+            endLine = bodyCapture.node.endPosition.row + 1;
+        } else {
+            endLine = nameCapture.node.endPosition.row + 1;
+        }
+
+        // Dedup by name:kind:line
+        const key = `${name}:${kind}:${line}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        symbols.push({ name, kind, type, line, endLine, column });
+    }
+
+    // Clean up parse tree and parser (query is cached, don't delete it)
+    tree.delete();
+    parser.delete();
+
+    // Sort by line number
+    symbols.sort((a, b) => a.line - b.line);
+
+    // Cache the full unfiltered result
+    setCachedSymbols(hash, symbols);
+
+    return applyFilters(symbols, options);
+}
+
+/**
+ * Apply optional filters to a symbol list.
+ */
+function applyFilters(symbols, options) {  # L386
+    if (!options.kindFilter && !options.nameFilter && !options.typeFilter && !options.excludeNames) {
+        return symbols;
+    }
+
+    return symbols.filter(sym => {
+        if (options.kindFilter && sym.kind !== options.kindFilter) return false;
+        if (options.typeFilter && sym.type !== options.typeFilter) return false;
+        if (options.nameFilter && !sym.name.toLowerCase().includes(options.nameFilter.toLowerCase())) return false;
+        if (options.excludeNames && options.excludeNames.includes(sym.name)) return false;
+        return true;
+    });
+}
+
+/**
+ * Get only definitions from source code.
+ * Convenience wrapper around getSymbols with kindFilter='def'.
+ */
+export async function getDefinitions(source, langName, options = {}) {  # L404
+    return getSymbols(source, langName, { ...options, kindFilter: 'def' });
+}
+
+const COMPRESSION_ANCHOR_RULES = {
+    javascript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    typescript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    tsx: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    python: {
+        return_statement: { kind: 'return', priority: 400 },
+        raise_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        elif_clause: { kind: 'if', priority: 310 },
+        for_statement: { kind: 'loop', priority: 260 },
+        while_statement: { kind: 'loop', priority: 250 },
+        try_statement: { kind: 'try', priority: 280 },
+        except_clause: { kind: 'catch', priority: 270 },
+        with_statement: { kind: 'with', priority: 220 },
+        await: { kind: 'await', priority: 180 },
+        call: { kind: 'call', priority: 140 },
+# ... [lines 463-465 omitted]
+function maybeAddAnchor(block, anchor) {  # L466
+    if (!block.anchors) block.anchors = [];
+
+    const existing = block.anchors.find(
+        item => item.startLine === anchor.startLine && item.endLine === anchor.endLine
+    );
+
+    if (existing) {
+        if (anchor.priority > existing.priority) {
+            existing.priority = anchor.priority;
+            existing.kind = anchor.kind;
+        }
+        return;
+    }
+
+    block.anchors.push(anchor);
+}
+
+function assignAnchorToInnermostBlock(blocks, startLine, endLine, kind, priority) {  # L484
+    let target = null;
+
+    for (const block of blocks) {
+        if (block.startLine > startLine || block.endLine < endLine) continue;
+        if (!target || (block.endLine - block.startLine) < (target.endLine - target.startLine)) {
+            target = block;
+        }
+    }
+
+    if (!target || startLine <= target.startLine) return;
+
+    maybeAddAnchor(target, { startLine, endLine, kind, priority });
+}
+
+function shouldCaptureAnchor(node, parent, rule) {  # L499
+    if (node.type === 'call_expression' && parent && (
+        parent.type === 'call_expression' ||
+        parent.type === 'await_expression' ||
+        parent.type === 'expression_statement'
+    )) {
+        return false;
+    }
+
+    if (node.type === 'call' && parent && parent.type === 'await') {
+        return false;
+    }
+
+    return !!rule;
+}
+
+export async function getCompressionStructure(source, langName) {  # L515
+    const defs = await getDefinitions(source, langName);
+    if (!defs || defs.length === 0) return defs;
+
+    const blocks = defs.map(d => ({
+        type: d.type,
+        name: d.name,
+        startLine: d.line - 1,
+        endLine: d.endLine - 1,
+        exported: false,
+        anchors: [],
+    }));
+
+    const rules = COMPRESSION_ANCHOR_RULES[langName];
+    if (!rules) return blocks;
+
+    const language = await loadLanguage(langName);
+    if (!language) return blocks;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        function walk(node, parent = null) {
+            const rule = rules[node.type];
+            if (shouldCaptureAnchor(node, parent, rule)) {
+                const startLine = node.startPosition.row;
+                const rawEndLine = node.endPosition.row;
+                const endLine = rawEndLine <= startLine + 1 ? rawEndLine : startLine;
+                assignAnchorToInnermostBlock(blocks, startLine, endLine, rule.kind, rule.priority);
+            }
+
+            for (let i = 0; i < node.childCount; i++) {
+                walk(node.child(i), node);
+            }
+        }
+
+        walk(tree.rootNode, null);
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
+
+    for (const block of blocks) {
+        if (block.anchors.length > 0) {
+            block.anchors.sort((a, b) => b.priority - a.priority || a.startLine - b.startLine);
+            block.anchors = block.anchors.slice(0, 16);
+        }
+    }
+
+    return blocks;
+}
+# ... [lines 568-575 omitted]
+export async function getSymbolSummary(source, langName) {  # L576
+    const symbols = await getSymbols(source, langName);
+    if (!symbols) return null;
+
+    const defs = {};
+    const refs = {};
+    let defTotal = 0, refTotal = 0;
+
+    for (const sym of symbols) {
+        if (sym.kind === 'def') {
+            defs[sym.type] = (defs[sym.type] || 0) + 1;
+            defTotal++;
+        } else {
+            refs[sym.type] = (refs[sym.type] || 0) + 1;
+            refTotal++;
+        }
+    }
+
+    return { defs, refs, defTotal, refTotal };
+}
+# ... [lines 596-601 omitted]
+export async function getSymbolSummaryString(source, langName) {  # L602
+    const summary = await getSymbolSummary(source, langName);
+    if (!summary || summary.defTotal === 0) return null;
+
+    const parts = [];
+    // Ordered by typical importance
+    const order = ['class', 'interface', 'type', 'enum', 'function', 'method', 'module',
+                   'key', 'section', 'selector', 'keyframes', 'media',
+                   'variable', 'constant', 'property', 'object', 'mixin', 'extension',
+                   'macro', 'resource', 'output', 'provider', 'local'];
+    const used = new Set();
+
+    for (const t of order) {
+        if (summary.defs[t]) {
+            const count = summary.defs[t];
+            const label = count === 1 ? t : pluralize(t);
+            parts.push(`${count} ${label}`);
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+// ---------------------------------------------------------------------------
+// tree-sitter.js — Shared tree-sitter module for symbol-aware tools
+//
+// Provides:
+//   1. Lazy initialization of web-tree-sitter WASM runtime
+//   2. Grammar loading by file extension (cached after first load)
+//   3. Query file loading (.scm patterns) per language
+//   4. getSymbols()      — extract symbols (definitions + references) from source
+//   5. getDefinitions()  — convenience: only definitions
+//   6. getSymbolSummary()— count symbols by type for a file
+//   7. findSymbol()      — find a specific symbol by name, with disambiguation
+//   8. isSupported()     — check if tree-sitter supports a file extension
+//
+// Grammars:  ./grammars/grammars/tree-sitter-{lang}.wasm
+// Queries:   ./grammars/queries/{lang}-tags.scm
+// Runtime:   ./grammars/tree-sitter.wasm
+//
+// All loading is lazy. Nothing is loaded until first use.
+// Language objects and compiled queries are cached permanently.
+// Parsed symbols are cached by source hash (LRU, 100 entries).
+// ---------------------------------------------------------------------------
+
+import { Parser, Language, Query } from 'web-tree-sitter';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+const GRAMMARS_DIR = path.join(__dirname, '..', 'grammars', 'grammars');
+const QUERIES_DIR  = path.join(__dirname, '..', 'grammars', 'queries');
+const TS_WASM_PATH = path.join(__dirname, '..', 'grammars', 'tree-sitter.wasm');
+
+// ---------------------------------------------------------------------------
+// Extension → language mapping
+// ---------------------------------------------------------------------------
+
+const EXT_TO_LANG = {
+    // JavaScript / TypeScript
+    '.js':   'javascript',
+    '.mjs':  'javascript',
+    '.cjs':  'javascript',
+    '.jsx':  'javascript',
+    '.ts':   'typescript',
+    '.mts':  'typescript',
+    '.cts':  'typescript',
+    '.tsx':  'tsx',
+    // Python
+    '.py':   'python',
+    '.pyi':  'python',
+    // Shell
+    '.sh':   'bash',
+    '.bash': 'bash',
+    '.zsh':  'bash',
+    // Go
+    '.go':   'go',
+    // Rust
+    '.rs':   'rust',
+    // Java
+    '.java': 'java',
+    // C / C++
+    '.c':    'c',
+    '.h':    'c',
+    '.cpp':  'cpp',
+    '.cc':   'cpp',
+    '.cxx':  'cpp',
+    '.hpp':  'cpp',
+    '.hh':   'cpp',
+    '.hxx':  'cpp',
+    // C#
+    '.cs':   'csharp',
+    // Kotlin
+    '.kt':   'kotlin',
+    '.kts':  'kotlin',
+    // PHP
+    '.php':  'php',
+    // Ruby
+    '.rb':     'ruby',
+    '.rake':   'ruby',
+    '.gemspec': 'ruby',
+    // Swift
+    '.swift': 'swift',
+    // Web
+    '.css':  'css',
+    '.scss': 'css',
+    // Data formats
+    '.json':  'json',
+    '.jsonc': 'json',
+    '.yaml':  'yaml',
+    '.yml':   'yaml',
+    '.sql':   'sql',
+    // Documentation
+    '.md':  'markdown',
+    '.mdx': 'markdown',
+};
+
+/**
+ * Get the tree-sitter language name for a file path.
+ * Returns null if the extension is not supported.
+ */
+export function getLangForFile(filePath) {  # L107
+    const ext = path.extname(filePath).toLowerCase();
+    return EXT_TO_LANG[ext] || null;
+}
+
+/**
+ * Get all supported file extensions.
+ */
+export function getSupportedExtensions() {  # L115
+    return Object.keys(EXT_TO_LANG);
+}
+
+/**
+ * Check if a file can be parsed by tree-sitter.
+ */
+export function isSupported(filePath) {  # L122
+    return getLangForFile(filePath) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Initialization & caching
+// ---------------------------------------------------------------------------
+
+let _initPromise = null;
+const _languageCache = new Map();       // lang name → Language object (or null)
+const _queryStringCache = new Map();    // lang name → raw .scm string (or null)
+const _compiledQueryCache = new Map();  // lang name → Query object (or null)
+
+// Symbol cache: hash(source) → Symbol[]
+const SYMBOL_CACHE_MAX = 100;
+const _symbolCache = new Map();         // hash → { symbols, ts }
+
+/**
+ * Initialize the tree-sitter WASM runtime. Idempotent.
+ */
+async function ensureInit() {  # L142
+    if (!_initPromise) {
+        _initPromise = Parser.init({
+            locateFile: () => TS_WASM_PATH,
+        });
+    }
+    return _initPromise;
+}
+
+/**
+ * Load a Language grammar (WASM), cached permanently.
+ * Returns null if the grammar file doesn't exist.
+ */
+async function loadLanguage(langName) {  # L155
+    if (_languageCache.has(langName)) {
+        return _languageCache.get(langName);
+    }
+
+    await ensureInit();
+
+    const wasmPath = path.join(GRAMMARS_DIR, `tree-sitter-${langName}.wasm`);
+    try {
+        await fs.access(wasmPath);
+    } catch {
+        _languageCache.set(langName, null);
+        return null;
+    }
+
+    try {
+        const language = await Language.load(wasmPath);
+        _languageCache.set(langName, language);
+        return language;
+    } catch (err) {
+        console.error(`Failed to load grammar for ${langName}:`, err.message);
+        _languageCache.set(langName, null);
+        return null;
+    }
+}
+
+/**
+ * Load the .scm query string for a language. Cached permanently.
+ */
+async function loadQueryString(langName) {  # L184
+    if (_queryStringCache.has(langName)) {
+        return _queryStringCache.get(langName);
+    }
+
+    const scmPath = path.join(QUERIES_DIR, `${langName}-tags.scm`);
+    try {
+        const content = await fs.readFile(scmPath, 'utf-8');
+        _queryStringCache.set(langName, content);
+        return content;
+    } catch {
+        _queryStringCache.set(langName, null);
+        return null;
+    }
+}
+
+/**
+ * Get a compiled Query object for a language. Cached permanently.
+ * Returns null if language or query unavailable.
+ */
+async function getCompiledQuery(langName) {  # L204
+    if (_compiledQueryCache.has(langName)) {
+        return _compiledQueryCache.get(langName);
+    }
+
+    const language = await loadLanguage(langName);
+    if (!language) {
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+
+    const queryString = await loadQueryString(langName);
+    if (!queryString) {
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+
+    try {
+        const query = new Query(language, queryString);
+        _compiledQueryCache.set(langName, query);
+        return query;
+    } catch (err) {
+        console.error(`Failed to compile query for ${langName}:`, err.message);
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol cache helpers
+// ---------------------------------------------------------------------------
+
+function sourceHash(source) {  # L236
+    return createHash('md5').update(source).digest('hex');
+}
+
+function getCachedSymbols(hash) {  # L240
+    const entry = _symbolCache.get(hash);
+    if (entry) {
+        entry.ts = Date.now(); // touch for LRU
+        return entry.symbols;
+    }
+    return null;
+}
+
+function setCachedSymbols(hash, symbols) {  # L249
+    // Evict oldest if at capacity
+    if (_symbolCache.size >= SYMBOL_CACHE_MAX) {
+        let oldestKey = null, oldestTs = Infinity;
+        for (const [key, val] of _symbolCache) {
+            if (val.ts < oldestTs) {
+                oldestTs = val.ts;
+                oldestKey = key;
+            }
+        }
+        if (oldestKey) _symbolCache.delete(oldestKey);
+    }
+    _symbolCache.set(hash, { symbols, ts: Date.now() });
+}
+# ... [lines 263-295 omitted]
+export async function getSymbols(source, langName, options = {}) {  # L296
+    // Check cache first
+    const hash = sourceHash(langName + ':' + source);
+    const cached = getCachedSymbols(hash);
+    if (cached) {
+        return applyFilters(cached, options);
+    }
+
+    const language = await loadLanguage(langName);
+    if (!language) return null;
+
+    const query = await getCompiledQuery(langName);
+    if (!query) return null;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    // Use matches() to get grouped captures per pattern match.
+    // Each match contains both @name.definition.X and @definition.X captures.
+    const matches = query.matches(tree.rootNode);
+    const symbols = [];
+    const seen = new Set();
+
+    for (const match of matches) {
+        const { captures } = match;
+
+        // Find the name capture and the definition/reference body capture
+        let nameCapture = null;
+        let bodyCapture = null;
+
+        for (const cap of captures) {
+            if (cap.name.startsWith('name.')) {
+                nameCapture = cap;
+            } else if (cap.name.startsWith('definition.') || cap.name.startsWith('reference.')) {
+                bodyCapture = cap;
+            }
+        }
+
+        if (!nameCapture) continue;
+
+        const tag = nameCapture.name;
+        let kind, type;
+        if (tag.startsWith('name.definition.')) {
+            kind = 'def';
+            type = tag.slice('name.definition.'.length);
+        } else if (tag.startsWith('name.reference.')) {
+            kind = 'ref';
+            type = tag.slice('name.reference.'.length);
+        } else {
+            continue;
+        }
+
+        const name = nameCapture.node.text;
+        const line = nameCapture.node.startPosition.row + 1;
+        const column = nameCapture.node.startPosition.column;
+
+        // endLine comes from the body capture if available, otherwise from
+        // the name capture's own end (single-line symbol)
+        let endLine;
+        if (bodyCapture) {
+            endLine = bodyCapture.node.endPosition.row + 1;
+        } else {
+            endLine = nameCapture.node.endPosition.row + 1;
+        }
+
+        // Dedup by name:kind:line
+        const key = `${name}:${kind}:${line}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        symbols.push({ name, kind, type, line, endLine, column });
+    }
+
+    // Clean up parse tree and parser (query is cached, don't delete it)
+    tree.delete();
+    parser.delete();
+
+    // Sort by line number
+    symbols.sort((a, b) => a.line - b.line);
+
+    // Cache the full unfiltered result
+    setCachedSymbols(hash, symbols);
+
+    return applyFilters(symbols, options);
+}
+
+/**
+ * Apply optional filters to a symbol list.
+ */
+function applyFilters(symbols, options) {  # L386
+    if (!options.kindFilter && !options.nameFilter && !options.typeFilter && !options.excludeNames) {
+        return symbols;
+    }
+
+    return symbols.filter(sym => {
+        if (options.kindFilter && sym.kind !== options.kindFilter) return false;
+        if (options.typeFilter && sym.type !== options.typeFilter) return false;
+        if (options.nameFilter && !sym.name.toLowerCase().includes(options.nameFilter.toLowerCase())) return false;
+        if (options.excludeNames && options.excludeNames.includes(sym.name)) return false;
+        return true;
+    });
+}
+
+/**
+ * Get only definitions from source code.
+ * Convenience wrapper around getSymbols with kindFilter='def'.
+ */
+export async function getDefinitions(source, langName, options = {}) {  # L404
+    return getSymbols(source, langName, { ...options, kindFilter: 'def' });
+}
+
+const COMPRESSION_ANCHOR_RULES = {
+    javascript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    typescript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    tsx: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    python: {
+        return_statement: { kind: 'return', priority: 400 },
+        raise_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        elif_clause: { kind: 'if', priority: 310 },
+        for_statement: { kind: 'loop', priority: 260 },
+        while_statement: { kind: 'loop', priority: 250 },
+        try_statement: { kind: 'try', priority: 280 },
+        except_clause: { kind: 'catch', priority: 270 },
+        with_statement: { kind: 'with', priority: 220 },
+        await: { kind: 'await', priority: 180 },
+        call: { kind: 'call', priority: 140 },
+# ... [lines 463-465 omitted]
+function maybeAddAnchor(block, anchor) {  # L466
+    if (!block.anchors) block.anchors = [];
+
+    const existing = block.anchors.find(
+        item => item.startLine === anchor.startLine && item.endLine === anchor.endLine
+    );
+
+    if (existing) {
+        if (anchor.priority > existing.priority) {
+            existing.priority = anchor.priority;
+            existing.kind = anchor.kind;
+        }
+        return;
+    }
+
+    block.anchors.push(anchor);
+}
+
+function assignAnchorToInnermostBlock(blocks, startLine, endLine, kind, priority) {  # L484
+    let target = null;
+
+    for (const block of blocks) {
+        if (block.startLine > startLine || block.endLine < endLine) continue;
+        if (!target || (block.endLine - block.startLine) < (target.endLine - target.startLine)) {
+            target = block;
+        }
+    }
+
+    if (!target || startLine <= target.startLine) return;
+
+    maybeAddAnchor(target, { startLine, endLine, kind, priority });
+}
+
+function shouldCaptureAnchor(node, parent, rule) {  # L499
+    if (node.type === 'call_expression' && parent && (
+        parent.type === 'call_expression' ||
+        parent.type === 'await_expression' ||
+        parent.type === 'expression_statement'
+    )) {
+        return false;
+    }
+
+    if (node.type === 'call' && parent && parent.type === 'await') {
+        return false;
+    }
+
+    return !!rule;
+}
+
+export async function getCompressionStructure(source, langName) {  # L515
+    const defs = await getDefinitions(source, langName);
+    if (!defs || defs.length === 0) return defs;
+
+    const blocks = defs.map(d => ({
+        type: d.type,
+        name: d.name,
+        startLine: d.line - 1,
+        endLine: d.endLine - 1,
+        exported: false,
+        anchors: [],
+    }));
+
+    const rules = COMPRESSION_ANCHOR_RULES[langName];
+    if (!rules) return blocks;
+
+    const language = await loadLanguage(langName);
+    if (!language) return blocks;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        function walk(node, parent = null) {
+            const rule = rules[node.type];
+            if (shouldCaptureAnchor(node, parent, rule)) {
+                const startLine = node.startPosition.row;
+                const rawEndLine = node.endPosition.row;
+                const endLine = rawEndLine <= startLine + 1 ? rawEndLine : startLine;
+                assignAnchorToInnermostBlock(blocks, startLine, endLine, rule.kind, rule.priority);
+            }
+
+            for (let i = 0; i < node.childCount; i++) {
+                walk(node.child(i), node);
+            }
+        }
+
+        walk(tree.rootNode, null);
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
+
+    for (const block of blocks) {
+        if (block.anchors.length > 0) {
+            block.anchors.sort((a, b) => b.priority - a.priority || a.startLine - b.startLine);
+            block.anchors = block.anchors.slice(0, 16);
+        }
+    }
+
+    return blocks;
+}
+# ... [lines 568-575 omitted]
+export async function getSymbolSummary(source, langName) {  # L576
+    const symbols = await getSymbols(source, langName);
+    if (!symbols) return null;
+
+    const defs = {};
+    const refs = {};
+    let defTotal = 0, refTotal = 0;
+
+    for (const sym of symbols) {
+        if (sym.kind === 'def') {
+            defs[sym.type] = (defs[sym.type] || 0) + 1;
+            defTotal++;
+        } else {
+            refs[sym.type] = (refs[sym.type] || 0) + 1;
+            refTotal++;
+        }
+    }
+
+    return { defs, refs, defTotal, refTotal };
+}
+# ... [lines 596-601 omitted]
+export async function getSymbolSummaryString(source, langName) {  # L602
+    const summary = await getSymbolSummary(source, langName);
+    if (!summary || summary.defTotal === 0) return null;
+
+    const parts = [];
+    // Ordered by typical importance
+    const order = ['class', 'interface', 'type', 'enum', 'function', 'method', 'module',
+                   'key', 'section', 'selector', 'keyframes', 'media',
+                   'variable', 'constant', 'property', 'object', 'mixin', 'extension',
+                   'macro', 'resource', 'output', 'provider', 'local'];
+    const used = new Set();
+
+    for (const t of order) {
+        if (summary.defs[t]) {
+            const count = summary.defs[t];
+            const label = count === 1 ? t : pluralize(t);
+            parts.push(`${count} ${label}`);
+
+=== RAW PREVIEW (first 1500 chars) ===
+// ---------------------------------------------------------------------------
+// tree-sitter.js — Shared tree-sitter module for symbol-aware tools
+//
+// Provides:
+//   1. Lazy initialization of web-tree-sitter WASM runtime
+//   2. Grammar loading by file extension (cached after first load)
+//   3. Query file loading (.scm patterns) per language
+//   4. getSymbols()      — extract symbols (definitions + references) from source
+//   5. getDefinitions()  — convenience: only definitions
+//   6. getSymbolSummary()— count symbols by type for a file
+//   7. findSymbol()      — find a specific symbol by name, with disambiguation
+//   8. isSupported()     — check if tree-sitter supports a file extension
+//
+// Grammars:  ./grammars/grammars/tree-sitter-{lang}.wasm
+// Queries:   ./grammars/queries/{lang}-tags.scm
+// Runtime:   ./grammars/tree-sitter.wasm
+//
+// All loading is lazy. Nothing is loaded until first use.
+// Language objects and compiled queries are cached permanently.
+// Parsed symbols are cached by source hash (LRU, 100 entries).
+// ---------------------------------------------------------------------------
+
+import { Parser, Language, Query } from 'web-tree-sitter';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ---------------------------------------------------------------------------
+// Paths
+
+
+====================================================================================================
+dist_tools_read_text_file_js.txt
+====================================================================================================
+
+FILE: dist/tools/read_text_file.js
+RAW_CHARS: 14668
+TARGET_70_PERCENT_BUDGET: 10267
+BRIDGE_CHARS: 10266
+FINAL_TOOL_CHARS: 10266
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
+import { CHAR_BUDGET } from '../core/shared.js';
+import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
+import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
+
+# ... [lines 10-14 omitted]
+
+export function register(server, ctx) {  # L16
+    const handler = async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+        const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        let standardReadContent = null;
+        let standardReadBudget = maxChars;
+
+        // Validate parameter combinations
+        if ((args.head && args.tail) || (args.tail && args.offset !== undefined) || (args.head && args.tail && args.offset !== undefined)) {
+            throw new Error("Cannot combine tail with head or offset. Use offset+head for windowed reads, or tail alone.");
+        }
+
+        if (args.grep && (args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine 'grep' with head/tail/offset.");
+        }
+
+        const hasWindowMode = args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0);
+        if (hasWindowMode && (args.grep || args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine aroundLine/ranges with grep/head/tail/offset. ");
+        }
+
+        const hasSymbolMode = args.symbol !== undefined;
+        if (hasSymbolMode && (args.grep || args.head || args.tail || args.offset !== undefined || hasWindowMode)) {
+            throw new Error("Cannot combine 'symbol' with grep/head/tail/offset/aroundLine/ranges. ");
+        }
+
+        if (args.compression && (hasSymbolMode || args.grep || args.head || args.tail ||
+                typeof args.offset === 'number' || hasWindowMode || args.showLineNumbers)) {
+            throw new Error("'compression' is only valid on plain full-file reads. Cannot combine with symbol/grep/head/tail/offset/aroundLine/ranges/showLineNumbers.");
+        }
+
+        // ---- SYMBOL MODE ----
+        if (hasSymbolMode) {
+            const langName = getLangForFile(validPath);
+            if (!langName) {
+                throw new Error('Unsupported file type.');
+            }
+
+            const source = await fs.readFile(validPath, 'utf-8');
+            const allLines = source.split('\n');
+            const totalLines = allLines.length;
+
+            const matches = await findSymbol(source, langName, args.symbol, {
+                kindFilter: 'def',
+                nearLine: args.nearLine,
+            });
+
+            if (!matches || matches.length === 0) {
+                throw new Error('Symbol not found.');
+            }
+
+            if (matches.length > 1 && !args.nearLine) {
+                throw new Error('Multiple matches. Use nearLine.');
+            }
+
+            const sym = matches[0];
+            const expand = Math.max(0, Math.min(args.expandLines ?? 0, 50));
+            const startLine = Math.max(1, sym.line - expand);
+            const endLine = Math.min(totalLines, sym.endLine + expand);
+
+            const slice = allLines.slice(startLine - 1, endLine);
+            const numbered = slice.map((line, i) => {
+                const ln = startLine + i;
+                return `${ln}:${line}`;
+            });
+
+            const text = numbered.join('\n');
+            return {
+                content: [{ type: "text", text }],
+            };
+        }
+
+        // ---- GREP MODE ----
+        if (args.grep) {
+            const grepPattern = new RegExp(args.grep, args.grepIgnoreCase !== false ? 'i' : '');
+            const invertMatch = args.grepInvert ?? false;
+            const beforeCount = Math.min(Math.max(0, args.grepBefore ?? 0), 20);
+            const afterCount = Math.min(Math.max(0, args.grepAfter ?? 0), 30);
+            const hasContext = beforeCount > 0 || afterCount > 0;
+
+            const outputEntries = [];
+            let totalLines = 0;
+            let charCount = 0;
+
+            const beforeBuffer = [];
+            let afterRemaining = 0;
+            let lastEmittedLine = 0;
+
+            function emit(lineNum, line, isMatch) {
+                if (outputEntries.length > 0 && lineNum <= outputEntries[outputEntries.length - 1].num) return;
+
+                if (hasContext && lastEmittedLine > 0 && lineNum > lastEmittedLine + 1) {
+                    const sep = '---';
+                    if (charCount + sep.length + 1 <= maxChars) {
+                        outputEntries.push({ num: -1, text: sep, isMatch: false });
+                        charCount += sep.length + 1;
+                    }
+                }
+
+                const marker = isMatch ? '*' : '';
+                const formatted = `${lineNum}:${marker}${line}`;
+                if (charCount + formatted.length + 1 <= maxChars) {
+                    outputEntries.push({ num: lineNum, text: formatted, isMatch });
+                    charCount += formatted.length + 1;
+                    lastEmittedLine = lineNum;
+                }
+            }
+
+            await new Promise((resolve, reject) => {
+                const stream = createReadStream(validPath, { encoding: 'utf-8' });
+                const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+                rl.on('line', (line) => {
+                    totalLines++;
+                    const rawMatch = grepPattern.test(line);
+                    const isMatch = invertMatch ? !rawMatch : rawMatch;
+
+                    if (isMatch) {
+                        if (hasContext) {
+                            for (const bufItem of beforeBuffer) {
+                                emit(bufItem.num, bufItem.text, false);
+                            }
+                            beforeBuffer.length = 0;
+                        }
+
+                        emit(totalLines, line, true);
+                        afterRemaining = afterCount;
+                    } else if (afterRemaining > 0) {
+                        emit(totalLines, line, false);
+                        afterRemaining--;
+                    } else if (beforeCount > 0) {
+                        beforeBuffer.push({ num: totalLines, text: line });
+                        if (beforeBuffer.length > beforeCount) beforeBuffer.shift();
+                    }
+                });
+
+                rl.on('close', resolve);
+                rl.on('error', reject);
+                stream.on('error', reject);
+            });
+
+            const content = outputEntries.length > 0
+                ? outputEntries.map(e => e.text).join('\n')
+                : 'No matches.';
+
+            return {
+                content: [{ type: "text", text: content }],
+            };
+        }
+
+        // ---- WINDOW MODE ----
+        if (hasWindowMode) {
+            const windows = [];
+            if (args.aroundLine !== undefined) {
+                const windowRadius = args.context ?? 30;
+                windows.push({
+                    startLine: Math.max(1, args.aroundLine - windowRadius),
+                    endLine: args.aroundLine + windowRadius,
+                });
+            }
+            if (args.ranges && args.ranges.length > 0) {
+                for (const r of args.ranges) {
+                    windows.push({ startLine: Math.max(1, r.startLine), endLine: r.endLine });
+                }
+            }
+
+            windows.sort((a, b) => a.startLine - b.startLine);
+            const merged = [];
+            for (const w of windows) {
+                if (merged.length === 0 || w.startLine > merged[merged.length - 1].endLine + 1) {
+                    merged.push({ ...w });
+                } else {
+                    merged[merged.length - 1].endLine = Math.max(merged[merged.length - 1].endLine, w.endLine);
+                }
+            }
+
+            const outputLines = [];
+            let totalLines = 0;
+            let charCount = 0;
+            let windowIdx = 0;
+            let lastCollectedLine = -1;
+            let budgetExhausted = false;
+
+            await new Promise((resolve, reject) => {
+                const stream = createReadStream(validPath, { encoding: 'utf-8' });
+                const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+                rl.on('line', (line) => {
+                    totalLines++;
+                    if (budgetExhausted) return;
+
+                    while (windowIdx < merged.length && totalLines > merged[windowIdx].endLine) {
+                        windowIdx++;
+                    }
+                    if (windowIdx >= merged.length) return;
+
+            # ... [lines 212-313 omitted]
+            path: z.string(),
+            tail: z.number().optional().describe("Last N lines."),
+            head: z.number().optional().describe("First N lines."),
+            offset: z.number().optional().describe("Start line (0-based). Combine with head."),
+            grep: z.string().optional().describe("Regex to match lines."),
+            grepIgnoreCase: z.boolean().optional().default(true),
+            grepBefore: z.number().optional().default(0).describe("Context lines before match. Max 20."),
+            grepAfter: z.number().optional().default(0).describe("Context lines after match. Max 30."),
+            grepInvert: z.boolean().optional().default(false).describe("Return non-matching lines."),
+            showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
+            maxChars: z.number().optional().default(50000).describe("Max characters (up to 400000)."),
+            aroundLine: z.number().optional().describe("Center a window on this line."),
+            context: z.number().optional().default(30).describe("Window size for aroundLine."),
+            ranges: z.array(z.object({ startLine: z.number(), endLine: z.number() })).optional().describe("Explicit line ranges to return."),
+            symbol: z.string().optional().describe("Read a symbol by name. Dot-qualified for methods."),
+            expandLines: z.number().optional().default(0).describe("Extra context around symbol. Max 50."),
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
+import { CHAR_BUDGET } from '../core/shared.js';
+import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
+import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
+
+# ... [lines 10-14 omitted]
+
+export function register(server, ctx) {  # L16
+    const handler = async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+        const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        let standardReadContent = null;
+        let standardReadBudget = maxChars;
+
+        // Validate parameter combinations
+        if ((args.head && args.tail) || (args.tail && args.offset !== undefined) || (args.head && args.tail && args.offset !== undefined)) {
+            throw new Error("Cannot combine tail with head or offset. Use offset+head for windowed reads, or tail alone.");
+        }
+
+        if (args.grep && (args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine 'grep' with head/tail/offset.");
+        }
+
+        const hasWindowMode = args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0);
+        if (hasWindowMode && (args.grep || args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine aroundLine/ranges with grep/head/tail/offset. ");
+        }
+
+        const hasSymbolMode = args.symbol !== undefined;
+        if (hasSymbolMode && (args.grep || args.head || args.tail || args.offset !== undefined || hasWindowMode)) {
+            throw new Error("Cannot combine 'symbol' with grep/head/tail/offset/aroundLine/ranges. ");
+        }
+
+        if (args.compression && (hasSymbolMode || args.grep || args.head || args.tail ||
+                typeof args.offset === 'number' || hasWindowMode || args.showLineNumbers)) {
+            throw new Error("'compression' is only valid on plain full-file reads. Cannot combine with symbol/grep/head/tail/offset/aroundLine/ranges/showLineNumbers.");
+        }
+
+        // ---- SYMBOL MODE ----
+        if (hasSymbolMode) {
+            const langName = getLangForFile(validPath);
+            if (!langName) {
+                throw new Error('Unsupported file type.');
+            }
+
+            const source = await fs.readFile(validPath, 'utf-8');
+            const allLines = source.split('\n');
+            const totalLines = allLines.length;
+
+            const matches = await findSymbol(source, langName, args.symbol, {
+                kindFilter: 'def',
+                nearLine: args.nearLine,
+            });
+
+            if (!matches || matches.length === 0) {
+                throw new Error('Symbol not found.');
+            }
+
+            if (matches.length > 1 && !args.nearLine) {
+                throw new Error('Multiple matches. Use nearLine.');
+            }
+
+            const sym = matches[0];
+            const expand = Math.max(0, Math.min(args.expandLines ?? 0, 50));
+            const startLine = Math.max(1, sym.line - expand);
+            const endLine = Math.min(totalLines, sym.endLine + expand);
+
+            const slice = allLines.slice(startLine - 1, endLine);
+            const numbered = slice.map((line, i) => {
+                const ln = startLine + i;
+                return `${ln}:${line}`;
+            });
+
+            const text = numbered.join('\n');
+            return {
+                content: [{ type: "text", text }],
+            };
+        }
+
+        // ---- GREP MODE ----
+        if (args.grep) {
+            const grepPattern = new RegExp(args.grep, args.grepIgnoreCase !== false ? 'i' : '');
+            const invertMatch = args.grepInvert ?? false;
+            const beforeCount = Math.min(Math.max(0, args.grepBefore ?? 0), 20);
+            const afterCount = Math.min(Math.max(0, args.grepAfter ?? 0), 30);
+            const hasContext = beforeCount > 0 || afterCount > 0;
+
+            const outputEntries = [];
+            let totalLines = 0;
+            let charCount = 0;
+
+            const beforeBuffer = [];
+            let afterRemaining = 0;
+            let lastEmittedLine = 0;
+
+            function emit(lineNum, line, isMatch) {
+                if (outputEntries.length > 0 && lineNum <= outputEntries[outputEntries.length - 1].num) return;
+
+                if (hasContext && lastEmittedLine > 0 && lineNum > lastEmittedLine + 1) {
+                    const sep = '---';
+                    if (charCount + sep.length + 1 <= maxChars) {
+                        outputEntries.push({ num: -1, text: sep, isMatch: false });
+                        charCount += sep.length + 1;
+                    }
+                }
+
+                const marker = isMatch ? '*' : '';
+                const formatted = `${lineNum}:${marker}${line}`;
+                if (charCount + formatted.length + 1 <= maxChars) {
+                    outputEntries.push({ num: lineNum, text: formatted, isMatch });
+                    charCount += formatted.length + 1;
+                    lastEmittedLine = lineNum;
+                }
+            }
+
+            await new Promise((resolve, reject) => {
+                const stream = createReadStream(validPath, { encoding: 'utf-8' });
+                const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+                rl.on('line', (line) => {
+                    totalLines++;
+                    const rawMatch = grepPattern.test(line);
+                    const isMatch = invertMatch ? !rawMatch : rawMatch;
+
+                    if (isMatch) {
+                        if (hasContext) {
+                            for (const bufItem of beforeBuffer) {
+                                emit(bufItem.num, bufItem.text, false);
+                            }
+                            beforeBuffer.length = 0;
+                        }
+
+                        emit(totalLines, line, true);
+                        afterRemaining = afterCount;
+                    } else if (afterRemaining > 0) {
+                        emit(totalLines, line, false);
+                        afterRemaining--;
+                    } else if (beforeCount > 0) {
+                        beforeBuffer.push({ num: totalLines, text: line });
+                        if (beforeBuffer.length > beforeCount) beforeBuffer.shift();
+                    }
+                });
+
+                rl.on('close', resolve);
+                rl.on('error', reject);
+                stream.on('error', reject);
+            });
+
+            const content = outputEntries.length > 0
+                ? outputEntries.map(e => e.text).join('\n')
+                : 'No matches.';
+
+            return {
+                content: [{ type: "text", text: content }],
+            };
+        }
+
+        // ---- WINDOW MODE ----
+        if (hasWindowMode) {
+            const windows = [];
+            if (args.aroundLine !== undefined) {
+                const windowRadius = args.context ?? 30;
+                windows.push({
+                    startLine: Math.max(1, args.aroundLine - windowRadius),
+                    endLine: args.aroundLine + windowRadius,
+                });
+            }
+            if (args.ranges && args.ranges.length > 0) {
+                for (const r of args.ranges) {
+                    windows.push({ startLine: Math.max(1, r.startLine), endLine: r.endLine });
+                }
+            }
+
+            windows.sort((a, b) => a.startLine - b.startLine);
+            const merged = [];
+            for (const w of windows) {
+                if (merged.length === 0 || w.startLine > merged[merged.length - 1].endLine + 1) {
+                    merged.push({ ...w });
+                } else {
+                    merged[merged.length - 1].endLine = Math.max(merged[merged.length - 1].endLine, w.endLine);
+                }
+            }
+
+            const outputLines = [];
+            let totalLines = 0;
+            let charCount = 0;
+            let windowIdx = 0;
+            let lastCollectedLine = -1;
+            let budgetExhausted = false;
+
+            await new Promise((resolve, reject) => {
+                const stream = createReadStream(validPath, { encoding: 'utf-8' });
+                const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+                rl.on('line', (line) => {
+                    totalLines++;
+                    if (budgetExhausted) return;
+
+                    while (windowIdx < merged.length && totalLines > merged[windowIdx].endLine) {
+                        windowIdx++;
+                    }
+                    if (windowIdx >= merged.length) return;
+
+            # ... [lines 212-313 omitted]
+            path: z.string(),
+            tail: z.number().optional().describe("Last N lines."),
+            head: z.number().optional().describe("First N lines."),
+            offset: z.number().optional().describe("Start line (0-based). Combine with head."),
+            grep: z.string().optional().describe("Regex to match lines."),
+            grepIgnoreCase: z.boolean().optional().default(true),
+            grepBefore: z.number().optional().default(0).describe("Context lines before match. Max 20."),
+            grepAfter: z.number().optional().default(0).describe("Context lines after match. Max 30."),
+            grepInvert: z.boolean().optional().default(false).describe("Return non-matching lines."),
+            showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
+            maxChars: z.number().optional().default(50000).describe("Max characters (up to 400000)."),
+            aroundLine: z.number().optional().describe("Center a window on this line."),
+            context: z.number().optional().default(30).describe("Window size for aroundLine."),
+            ranges: z.array(z.object({ startLine: z.number(), endLine: z.number() })).optional().describe("Explicit line ranges to return."),
+            symbol: z.string().optional().describe("Read a symbol by name. Dot-qualified for methods."),
+            expandLines: z.number().optional().default(0).describe("Extra context around symbol. Max 50."),
+
+=== RAW PREVIEW (first 1500 chars) ===
+import { z } from "zod";
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
+import { CHAR_BUDGET } from '../core/shared.js';
+import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
+import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
+
+function countLines(str) {
+    if (!str) return 0;
+    const n = (str.match(/\n/g) || []).length;
+    return str.endsWith('\n') ? n : n + 1;
+}
+
+export function register(server, ctx) {
+    const handler = async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+        const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        let standardReadContent = null;
+        let standardReadBudget = maxChars;
+
+        // Validate parameter combinations
+        if ((args.head && args.tail) || (args.tail && args.offset !== undefined) || (args.head && args.tail && args.offset !== undefined)) {
+            throw new Error("Cannot combine tail with head or offset. Use offset+head for windowed reads, or tail alone.");
+        }
+
+        if (args.grep && (args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine 'grep' with head/tail/offset.");
+        }
+
+        const hasWindowMode = args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0);
+        if (hasWindowM
+
+
+====================================================================================================
+dist_tools_search_files_js.txt
+====================================================================================================
+
+FILE: dist/tools/search_files.js
+RAW_CHARS: 18756
+TARGET_70_PERCENT_BUDGET: 13129
+BRIDGE_CHARS: 13091
+FINAL_TOOL_CHARS: 13091
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {  # L22
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of context lines"),
+            literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as literal string."),
+            countOnly: z.boolean().optional().default(false).describe("Return match/file counts only, no content."),
+            includeHidden: z.boolean().optional().default(false).describe("Include hidden files in search."),
+            symbolQuery: z.string().optional().describe(
+                "Search for symbols by name. " +
+                "Substring match (case-insensitive). Cannot be combined with contentQuery."
+            ),
+            symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe(
+                "Filter symbol search to a specific kind. Only used with symbolQuery or listSymbols."
+            ),
+            listSymbols: z.boolean().optional().default(false).describe(
+                "Return an inventory of all symbols."
+            ),
+        },
+        annotations: { readOnlyHint: true }
+    }, async (args) => {
+        const rootPath = await ctx.validatePath(args.path);
+
+        // ---- SYMBOL SEARCH / LIST MODE ----
+        if (args.symbolQuery || args.listSymbols) {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+
+            // Discover files — reuse ripgrep for speed
+            const hasRg = await ripgrepAvailable();
+            let filePaths = [];
+            const callerExcludes = args.excludePatterns ?? [];
+            const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+
+            if (hasRg) {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: 2000,
+                    excludePatterns: [...callerExcludes, ...defaultExcludeGlobs],
+                });
+                if (results) filePaths = results;
+            }
+
+            // JS fallback
+            if (filePaths.length === 0) {
+                async function walk(dir) {
+                    if (filePaths.length >= 2000) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+                    for (const entry of entries) {
+                        if (filePaths.length >= 2000) return;
+                        const fullPath = path.join(dir, entry.name);
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            await walk(fullPath);
+                        } else {
+                            filePaths.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            // Filter to supported files
+            const supportedFiles = filePaths.filter(f => isSupported(f));
+
+            if (supportedFiles.length === 0) {
+                const text = 'No supported files found.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+
+            const MAX_FILE_SIZE = 512 * 1024;
+            const BATCH_SIZE = 50;
+            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
+
+            if (args.listSymbols) {
+                // ---- LIST SYMBOLS MODE ----
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            const names = defs.map(d => `${d.name} (${d.type}:${d.line})`);
+                            return { rel, defs, names };
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        outputLines.push(`${result.rel}: ${result.names.join(', ')}`);
+                    }
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.join('\n');
+                return {
+                    content: [{ type: "text", text }],
+                };
+
+            } else {
+                // ---- SYMBOL QUERY MODE ----
+                const symbolQuery = args.symbolQuery;
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                nameFilter: symbolQuery,
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            return defs.map(d => ({
+                                line: `${rel}:${d.line}  [${d.type}] ${d.name} (lines ${d.line}-${d.endLine})`,
+                                file: rel,
+                            }));
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        for (const entry of result) {
+                            outputLines.push(entry.line);
+                        }
+                        if (outputLines.length >= userMaxResults) break;
+                    }
+                    if (outputLines.length >= userMaxResults) break;
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines.slice(0, userMaxResults)) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.length > 0
+                    ? budgetLines.join('\n')
+                    : 'No matches.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+        }
+
+        // ---- CONTENT SEARCH / FILE FIND MODE ----
+        const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+        const contextLines = Math.max(0, args.contextLines ?? 0);
+
+        const callerExcludes = args.excludePatterns ?? [];
+        const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+        const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
+
+        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
+
+        let contentRegex;
+        if (mode === 'content') {
+            if (!args.contentQuery) {
+                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
+            }
+            const flags = args.ignoreCase ? 'gi' : 'g';
+            contentRegex = args.literalSearch
+                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+                : new RegExp(args.contentQuery, flags);
+        }
+
+        // ---- RIPGREP PATH ----
+        const hasRg = await ripgrepAvailable();
+        if (hasRg) {
+            if (mode === 'files') {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: userMaxResults,
+                    excludePatterns: allExcludes,
+                });
+                if (results !== null) {
+                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
+                    return {
+                        content: [{ type: "text", text }],
+                    };
+                }
+            }
+
+            if (mode === 'content') {
+                let rgResults = null;
+
+                if (args.contentQuery.length > 2) {
+                    try {
+                        const candidateFiles = await bm25PreFilterFiles(
+                            rootPath,
+                            args.contentQuery,
+                            100,
+                            allExcludes
+                        );
+
+                        if (candidateFiles.length > 0) {
+                            rgResults = await ripgrepSearch(rootPath, {
+                                contentQuery: args.contentQuery,
+                                filePattern: args.pattern || null,
+                                ignoreCase: args.ignoreCase ?? true,
+                                maxResults: Math.max(userMaxResults, 500),
+                                excludePatterns: allExcludes,
+                                contextLines,
+                                literalSearch: args.literalSearch ?? false,
+                                includeHidden: args.includeHidden ?? false,
+                                fileList: candidateFiles,
+                            });
+                        }
+                    } catch {
+                    }
+                }
+
+                // Fallback if BM25 didn't run or failed
+                if (rgResults === null) {
+                    rgResults = await ripgrepSearch(rootPath, {
+                        contentQuery: args.contentQuery,
+                        filePattern: args.pattern || null,
+                        ignoreCase: args.ignoreCase ?? true,
+                        maxResults: Math.max(userMaxResults, 500),
+                        excludePatterns: allExcludes,
+                        contextLines,
+                        # ... [lines 290-297 omitted]
+                        return {
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {  # L22
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of context lines"),
+            literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as literal string."),
+            countOnly: z.boolean().optional().default(false).describe("Return match/file counts only, no content."),
+            includeHidden: z.boolean().optional().default(false).describe("Include hidden files in search."),
+            symbolQuery: z.string().optional().describe(
+                "Search for symbols by name. " +
+                "Substring match (case-insensitive). Cannot be combined with contentQuery."
+            ),
+            symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe(
+                "Filter symbol search to a specific kind. Only used with symbolQuery or listSymbols."
+            ),
+            listSymbols: z.boolean().optional().default(false).describe(
+                "Return an inventory of all symbols."
+            ),
+        },
+        annotations: { readOnlyHint: true }
+    }, async (args) => {
+        const rootPath = await ctx.validatePath(args.path);
+
+        // ---- SYMBOL SEARCH / LIST MODE ----
+        if (args.symbolQuery || args.listSymbols) {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+
+            // Discover files — reuse ripgrep for speed
+            const hasRg = await ripgrepAvailable();
+            let filePaths = [];
+            const callerExcludes = args.excludePatterns ?? [];
+            const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+
+            if (hasRg) {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: 2000,
+                    excludePatterns: [...callerExcludes, ...defaultExcludeGlobs],
+                });
+                if (results) filePaths = results;
+            }
+
+            // JS fallback
+            if (filePaths.length === 0) {
+                async function walk(dir) {
+                    if (filePaths.length >= 2000) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+                    for (const entry of entries) {
+                        if (filePaths.length >= 2000) return;
+                        const fullPath = path.join(dir, entry.name);
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            await walk(fullPath);
+                        } else {
+                            filePaths.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            // Filter to supported files
+            const supportedFiles = filePaths.filter(f => isSupported(f));
+
+            if (supportedFiles.length === 0) {
+                const text = 'No supported files found.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+
+            const MAX_FILE_SIZE = 512 * 1024;
+            const BATCH_SIZE = 50;
+            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
+
+            if (args.listSymbols) {
+                // ---- LIST SYMBOLS MODE ----
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            const names = defs.map(d => `${d.name} (${d.type}:${d.line})`);
+                            return { rel, defs, names };
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        outputLines.push(`${result.rel}: ${result.names.join(', ')}`);
+                    }
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.join('\n');
+                return {
+                    content: [{ type: "text", text }],
+                };
+
+            } else {
+                // ---- SYMBOL QUERY MODE ----
+                const symbolQuery = args.symbolQuery;
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                nameFilter: symbolQuery,
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            return defs.map(d => ({
+                                line: `${rel}:${d.line}  [${d.type}] ${d.name} (lines ${d.line}-${d.endLine})`,
+                                file: rel,
+                            }));
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        for (const entry of result) {
+                            outputLines.push(entry.line);
+                        }
+                        if (outputLines.length >= userMaxResults) break;
+                    }
+                    if (outputLines.length >= userMaxResults) break;
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines.slice(0, userMaxResults)) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.length > 0
+                    ? budgetLines.join('\n')
+                    : 'No matches.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+        }
+
+        // ---- CONTENT SEARCH / FILE FIND MODE ----
+        const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+        const contextLines = Math.max(0, args.contextLines ?? 0);
+
+        const callerExcludes = args.excludePatterns ?? [];
+        const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+        const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
+
+        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
+
+        let contentRegex;
+        if (mode === 'content') {
+            if (!args.contentQuery) {
+                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
+            }
+            const flags = args.ignoreCase ? 'gi' : 'g';
+            contentRegex = args.literalSearch
+                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+                : new RegExp(args.contentQuery, flags);
+        }
+
+        // ---- RIPGREP PATH ----
+        const hasRg = await ripgrepAvailable();
+        if (hasRg) {
+            if (mode === 'files') {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: userMaxResults,
+                    excludePatterns: allExcludes,
+                });
+                if (results !== null) {
+                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
+                    return {
+                        content: [{ type: "text", text }],
+                    };
+                }
+            }
+
+            if (mode === 'content') {
+                let rgResults = null;
+
+                if (args.contentQuery.length > 2) {
+                    try {
+                        const candidateFiles = await bm25PreFilterFiles(
+                            rootPath,
+                            args.contentQuery,
+                            100,
+                            allExcludes
+                        );
+
+                        if (candidateFiles.length > 0) {
+                            rgResults = await ripgrepSearch(rootPath, {
+                                contentQuery: args.contentQuery,
+                                filePattern: args.pattern || null,
+                                ignoreCase: args.ignoreCase ?? true,
+                                maxResults: Math.max(userMaxResults, 500),
+                                excludePatterns: allExcludes,
+                                contextLines,
+                                literalSearch: args.literalSearch ?? false,
+                                includeHidden: args.includeHidden ?? false,
+                                fileList: candidateFiles,
+                            });
+                        }
+                    } catch {
+                    }
+                }
+
+                // Fallback if BM25 didn't run or failed
+                if (rgResults === null) {
+                    rgResults = await ripgrepSearch(rootPath, {
+                        contentQuery: args.contentQuery,
+                        filePattern: args.pattern || null,
+                        ignoreCase: args.ignoreCase ?? true,
+                        maxResults: Math.max(userMaxResults, 500),
+                        excludePatterns: allExcludes,
+                        contextLines,
+                        # ... [lines 290-297 omitted]
+                        return {
+
+=== RAW PREVIEW (first 1500 chars) ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of con
+
+
+====================================================================================================
+dist_tools_write_file_js.txt
+====================================================================================================
+
+FILE: dist/tools/write_file.js
+RAW_CHARS: 4440
+TARGET_70_PERCENT_BUDGET: 3108
+BRIDGE_CHARS: 3095
+FINAL_TOOL_CHARS: 3095
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { randomBytes } from 'crypto';
+import { normalizeLineEndings } from '../core/lib.js';
+
+# ... [lines 7-30 omitted]
+
+export function register(server, ctx) {  # L32
+    server.registerTool("write_file", {
+        title: "Write File",
+        description: "Create or overwrite a file. Auto-creates parent directories. Use 'append' to add instead of replace.",
+        inputSchema: {
+            path: z.string(),
+            content: z.string(),
+            createOnly: z.boolean().optional().default(false).describe("If true, fails when the file already exists."),
+            append: z.boolean().optional().default(false).describe("If true, appends content to the end of an existing file. Creates the file if it doesn't exist."),
+        },
+        annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
+    }, async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+
+        const normalizedContent = normalizeLineEndings(args.content);
+
+        let existed = false;
+        try {
+            await fs.stat(validPath);
+            existed = true;
+        } catch { /* file doesn't exist */ }
+
+        if (args.createOnly && existed) {
+            throw new Error(
+                `File already exists. " ` +
+                `Use createOnly=false to overwrite, or use edit_file for targeted changes.`
+            );
+        }
+
+        const parentDir = path.dirname(validPath);
+        try {
+            await fs.mkdir(parentDir, { recursive: true });
+        } catch (err) {
+            if (err.code !== 'EEXIST') {
+                throw new Error(`Cannot create parent directory: ${err.message}`);
+            }
+        }
+
+        let finalContent = normalizedContent;
+        let resumedLines = 0;
+        if (args.append && existed) {
+            try {
+                const existing = await fs.readFile(validPath, 'utf-8');
+                const existingLines = existing.split('\n');
+                const incomingLines = normalizedContent.split('\n');
+
+                const tailLines = existingLines.slice(-500);
+                const overlap = findResumeOffset(tailLines, incomingLines);
+
+                let appendContent;
+                if (overlap > 0) {
+                    resumedLines = overlap;
+                    appendContent = incomingLines.slice(overlap).join('\n');
+                } else {
+                    appendContent = normalizedContent;
+                }
+
+                const separator = existing.endsWith('\n') ? '' : '\n';
+                finalContent = existing + separator + appendContent;
+            } catch (err) {
+                throw new Error(`Cannot read existing file for append: ${err.message}`);
+            }
+        }
+
+        const tempPath = `${validPath}.${randomBytes(16).toString('hex')}.tmp`;
+        try {
+            # ... [lines 98-101 omitted]
+            if (tempStat.size !== expectedBytes) {
+                throw new Error('Write verification failed.');
+            # ... [lines 104-108 omitted]
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { randomBytes } from 'crypto';
+import { normalizeLineEndings } from '../core/lib.js';
+
+# ... [lines 7-30 omitted]
+
+export function register(server, ctx) {  # L32
+    server.registerTool("write_file", {
+        title: "Write File",
+        description: "Create or overwrite a file. Auto-creates parent directories. Use 'append' to add instead of replace.",
+        inputSchema: {
+            path: z.string(),
+            content: z.string(),
+            createOnly: z.boolean().optional().default(false).describe("If true, fails when the file already exists."),
+            append: z.boolean().optional().default(false).describe("If true, appends content to the end of an existing file. Creates the file if it doesn't exist."),
+        },
+        annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
+    }, async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+
+        const normalizedContent = normalizeLineEndings(args.content);
+
+        let existed = false;
+        try {
+            await fs.stat(validPath);
+            existed = true;
+        } catch { /* file doesn't exist */ }
+
+        if (args.createOnly && existed) {
+            throw new Error(
+                `File already exists. " ` +
+                `Use createOnly=false to overwrite, or use edit_file for targeted changes.`
+            );
+        }
+
+        const parentDir = path.dirname(validPath);
+        try {
+            await fs.mkdir(parentDir, { recursive: true });
+        } catch (err) {
+            if (err.code !== 'EEXIST') {
+                throw new Error(`Cannot create parent directory: ${err.message}`);
+            }
+        }
+
+        let finalContent = normalizedContent;
+        let resumedLines = 0;
+        if (args.append && existed) {
+            try {
+                const existing = await fs.readFile(validPath, 'utf-8');
+                const existingLines = existing.split('\n');
+                const incomingLines = normalizedContent.split('\n');
+
+                const tailLines = existingLines.slice(-500);
+                const overlap = findResumeOffset(tailLines, incomingLines);
+
+                let appendContent;
+                if (overlap > 0) {
+                    resumedLines = overlap;
+                    appendContent = incomingLines.slice(overlap).join('\n');
+                } else {
+                    appendContent = normalizedContent;
+                }
+
+                const separator = existing.endsWith('\n') ? '' : '\n';
+                finalContent = existing + separator + appendContent;
+            } catch (err) {
+                throw new Error(`Cannot read existing file for append: ${err.message}`);
+            }
+        }
+
+        const tempPath = `${validPath}.${randomBytes(16).toString('hex')}.tmp`;
+        try {
+            # ... [lines 98-101 omitted]
+            if (tempStat.size !== expectedBytes) {
+                throw new Error('Write verification failed.');
+            # ... [lines 104-108 omitted]
+
+=== RAW PREVIEW (first 1500 chars) ===
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { randomBytes } from 'crypto';
+import { normalizeLineEndings } from '../core/lib.js';
+
+function findResumeOffset(existingTailLines, incomingLines) {
+    if (!existingTailLines.length || !incomingLines.length) return 0;
+
+    const trim = (s) => s.trimEnd();
+    const firstIncoming = trim(incomingLines[0]);
+
+    for (let i = 0; i < existingTailLines.length; i++) {
+        if (trim(existingTailLines[i]) !== firstIncoming) continue;
+
+        const overlapLen = Math.min(existingTailLines.length - i, incomingLines.length);
+
+        let matched = true;
+        for (let j = 0; j < overlapLen; j++) {
+            if (trim(existingTailLines[i + j]) !== trim(incomingLines[j])) {
+                matched = false;
+                break;
+            }
+        }
+
+        if (matched) return overlapLen;
+    }
+
+    return 0;
+}
+
+export function register(server, ctx) {
+    server.registerTool("write_file", {
+        title: "Write File",
+        description: "Create or overwrite a file. Auto-creates parent directories. Use 'append' to add instead of replace.",
+        inputSchema: {
+            path: z.string(),
+            content: z.string(),
+            createOnly: z.boolean().optional().default(false).describe("If true, fails when the file already exists."),
+            append: z.boolean().optional().default(false).describe("If true, appends content to the end of an existing file. Creates the file if it does
+
+
+====================================================================================================
+read_multiple_files_output.txt
+====================================================================================================
+
+dist/core/shared.js
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
+    }
+    return 400_000;
+})();
+export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
+
+export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
+    'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export const SENSITIVE_PATTERNS = (process.env.SENSITIVE_PATTERNS ||
+    '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export function isSensitive(filePath) {  # L53
+    const rel = path.relative(os.homedir(), filePath);
+    return SENSITIVE_PATTERNS.some(pat =>
+        minimatch(rel, pat, { dot: true, nocase: true }) ||
+        minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BM.X-T Engine — entropy-weighted TAAT search, zero deps
+// ---------------------------------------------------------------------------
+
+const WORD_RE = /[a-z0-9_]+/g;
+
+export class BM25Index {  # L67
+    constructor(k1 = 1.2, b = 0.75, beta = 0.6) {
+        this.k1 = k1;
+        this.b = b;
+        this.beta = beta;
+        this._postingLists = new Map(); // term -> Map<docId, tf>
+        this._docLengths = new Map();   // docId -> tokenCount
+        this._avgDocLength = 0;
+        this._idfCache = new Map();     // term -> idf
+        this._termEntropy = new Map();  // term -> normalized entropy [0,1]
+        this._termTotalFreqs = new Map(); // term -> total tf across corpus
+        this._totalDocs = 0;
+    }
+
+    static tokenize(text) {
+        if (!text) return [];
+        const tokens = text.toLowerCase().match(WORD_RE);
+        if (!tokens) return [];
+        return tokens.filter(t => t.length > 1 || t === 'a' || t === 'i');
+    }
+
+    /**
+     * Build index from array of { id: string, text: string }.
+     */
+    build(docs) {  # L91
+        this._postingLists.clear();
+        this._docLengths.clear();
+        this._idfCache.clear();
+        this._termEntropy.clear();
+        this._termTotalFreqs.clear();
+
+        let totalLength = 0;
+
+        // Pass 1: tokenize, build inverted index
+        for (const doc of docs) {
+            if (!doc.id) continue;
+            const tokens = BM25Index.tokenize(doc.text);
+            this._docLengths.set(doc.id, tokens.length);
+            totalLength += tokens.length;
+
+            const tfMap = new Map();
+            for (const token of tokens) {
+                tfMap.set(token, (tfMap.get(token) || 0) + 1);
+            }
+
+            for (const [term, count] of tfMap) {
+                if (!this._postingLists.has(term)) {
+                    this._postingLists.set(term, new Map());
+                }
+                this._postingLists.get(term).set(doc.id, count);
+                this._termTotalFreqs.set(term, (this._termTotalFreqs.get(term) || 0) + count);
+            }
+        }
+
+        this._totalDocs = this._docLengths.size;
+        if (this._totalDocs === 0) return;
+        this._avgDocLength = totalLength / this._totalDocs;
+
+        // Pass 2: IDF
+        for (const [term, posting] of this._postingLists) {
+            const df = posting.size;
+            this._idfCache.set(term, Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1));
+        }
+
+        // Pass 3: per-term entropy
+        for (const [term, posting] of this._postingLists) {
+            const totalTf = this._termTotalFreqs.get(term);
+            const nDocs = posting.size;
+            if (totalTf === 0 || nDocs <= 1) {
+                this._termEntropy.set(term, 0);
+                continue;
+            }
+            let entropy = 0;
+            for (const tf of posting.values()) {
+                const p = tf / totalTf;
+                entropy -= p * Math.log(p);
+            }
+            const maxEntropy = Math.log(nDocs);
+            this._termEntropy.set(term, maxEntropy > 0 ? entropy / maxEntropy : 0);
+        }
+    }
+
+    /**
+     * TAAT search with entropy-weighted scoring and sigmoid TF saturation.
+     * Returns array of { id, score } sorted desc, scores normalized to [0, 1].
+     */
+    search(query, topK = 200) {  # L153
+        if (this._totalDocs === 0 || !query) return [];
+
+        const queryTokens = BM25Index.tokenize(query);
+        if (queryTokens.length === 0) return [];
+
+        // Count query term frequencies
+        const qtfMap = new Map();
+        for (const t of queryTokens) qtfMap.set(t, (qtfMap.get(t) || 0) + 1);
+
+        // Pre-compute per-term weights and max_possible
+        const termWeights = new Map();
+        let maxPossible = 0;
+
+        for (const [term, qtf] of qtfMap) {
+            if (!this._postingLists.has(term)) continue;
+            const idf = this._idfCache.get(term) || 0;
+            const entropy = this._termEntropy.get(term) || 0;
+            const weight = idf * (1 + this.beta * (1 - entropy));
+            termWeights.set(term, weight);
+            maxPossible += weight * qtf;
+        }
+
+        if (maxPossible === 0) return [];
+
+        // TAAT: accumulate scores by traversing postings
+        const { k1, b, _avgDocLength: avgdl } = this;
+        const scores = new Map();
+
+        for (const [term, qtf] of qtfMap) {
+            const weight = termWeights.get(term);
+            if (weight === undefined) continue;
+            const w = weight * qtf;
+            const posting = this._postingLists.get(term);
+
+            for (const [docId, tf] of posting) {
+                const dl = this._docLengths.get(docId);
+                const K = k1 * (1 - b + b * (dl / avgdl));
+                // Sigmoid TF saturation
+                const tfComponent = 1 / (1 + Math.exp(-k1 * (tf - K / 2) / K));
+                scores.set(docId, (scores.get(docId) || 0) + w * tfComponent);
+            }
+        }
+
+        if (scores.size === 0) return [];
+
+        // Normalize to [0, 1]
+        const invMax = 1 / maxPossible;
+        const sorted = [...scores.entries()]
+            .map(([id, s]) => ({ id, score: s * invMax }))
+            .sort((a, b) => b.score - a.score);
+
+        return sorted.slice(0, topK);
+    }
+}
+# ... [lines 208-219 omitted]
+export function bm25RankResults(lines, query, charBudget = CHAR_BUDGET) {  # L220
+    const index = new BM25Index();
+    const docs = lines.map((line, i) => ({ id: String(i), text: line }));
+    index.build(docs);
+
+    const ranked = index.search(query, lines.length);
+    const result = [];
+    let charCount = 0;
+
+    for (const { id } of ranked) {
+        const line = lines[Number(id)];
+        if (charCount + line.length + 1 > charBudget) break;
+        result.push(line);
+        charCount += line.length + 1; // +1 for newline
+    }
+
+    return { ranked: result, totalCount: lines.length };
+}
+# ... [lines 238-247 omitted]
+export async function bm25PreFilterFiles(rootPath, query, topK = 50, excludePatterns = []) {  # L248
+    const docs = [];
+    const MAX_FILE_SIZE = 512 * 1024; // 512KB max per file for indexing
+    const MAX_FILES = 5000;           // cap to prevent runaway on huge repos
+
+    const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+    const allExcludes = [...excludePatterns, ...defaultExcludeGlobs];
+
+    // Text extensions for BM25 content indexing
+    const textExts = new Set([
+        '.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs',
+        '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp',
+        '.cs', '.php', '.vue', '.svelte', '.html', '.css', '.scss',
+        '.less', '.json', '.yaml', '.yml', '.toml', '.xml', '.md',
+        '.txt', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat',
+        '.sql', '.graphql', '.proto', '.tf', '.hcl', '.lua',
+        '.ex', '.exs', '.erl', '.hs', '.ml', '.clj', '.r',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt',
+        '.env.example', '.gitignore', '.editorconfig',
+    ]);
+
+    // Use ripgrep for file discovery when available — automatically respects
+    // .gitignore, .ignore, and .rgignore files, eliminating noise from build
+    // artifacts, vendored code, and test fixtures that projects exclude.
+    const hasRg = await ripgrepAvailable();
+    let filePaths = [];
+
+    if (hasRg) {
+        const rgFiles = await ripgrepFindFiles(rootPath, {
+            maxResults: MAX_FILES,
+            excludePatterns: allExcludes,
+        });
+        if (rgFiles && rgFiles.length > 0) {
+            filePaths = rgFiles;
+        }
+    }
+
+    // JS fallback — manual walk (no .gitignore awareness)
+    if (filePaths.length === 0) {
+        async function walk(dir) {
+            if (filePaths.length >= MAX_FILES) return;
+            let entries;
+            try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                if (filePaths.length >= MAX_FILES) return;
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.relative(rootPath, fullPath);
+
+                if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                const excluded = allExcludes.some(pat =>
+                    minimatch(rel, pat, { dot: true }) ||
+                    minimatch(rel, pat.replace(/^\*\*\//, ''), { dot: true })
+                );
+                if (excluded) continue;
+                if (isSensitive(fullPath)) continue;
+
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile()) {
+                    filePaths.push(fullPath);
+                }
+            }
+        }
+        await walk(rootPath);
+    }
+
+    // Index text files with BM25
+    for (const fullPath of filePaths) {
+        if (docs.length >= MAX_FILES) break;
+        const ext = path.extname(fullPath).toLowerCase();
+        const nameLC = path.basename(fullPath).toLowerCase();
+        const isText = textExts.has(ext) ||
+            nameLC === 'dockerfile' || nameLC === 'makefile' ||
+            nameLC === 'cmakelists.txt' || nameLC === 'gemfile' ||
+            nameLC === 'rakefile' || nameLC === 'justfile' ||
+            nameLC.startsWith('.') && !nameLC.includes('.');
+
+        if (!isText) continue;
+
+        try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > MAX_FILE_SIZE || stat.size === 0) continue;
+
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const rel = path.relative(rootPath, fullPath);
+            const pathTokens = rel.replace(/[/\\]/g, ' ').replace(/\./g, ' ');
+            const boostedText = `${pathTokens} ${pathTokens} ${pathTokens} ${content.slice(0, 8192)}`;
+            docs.push({ id: fullPath, text: boostedText });
+        } catch { /* skip unreadable */ }
+    }
+
+    if (docs.length === 0) return [];
+    # ... [lines 340-343 omitted]
+    return results.map(r => r.id);
+    # ... [9 lines omitted]
+
+// ---------------------------------------------------------------------------
+
+dist/tools/search_files.js
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { minimatch } from "minimatch";
+import {
+    DEFAULT_EXCLUDES, isSensitive,
+    ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
+    bm25RankResults, bm25PreFilterFiles,
+    CHAR_BUDGET, RANK_THRESHOLD,
+} from '../core/shared.js';
+import {
+    isSupported, getLangForFile, getSymbols, getDefinitions,
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
+
+export function register(server, ctx) {  # L22
+    server.registerTool("search_files", {
+        title: "Search Files",
+        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
+        inputSchema: {
+            path: z.string(),
+            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
+            contentQuery: z.string().optional().describe("Text or regex to search"),
+            excludePatterns: z.array(z.string()).optional().default([]),
+            ignoreCase: z.boolean().optional().default(true),
+            maxResults: z.number().optional().default(50),
+            contextLines: z.number().optional().default(0).describe("Number of context lines"),
+            literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as literal string."),
+            countOnly: z.boolean().optional().default(false).describe("Return match/file counts only, no content."),
+            includeHidden: z.boolean().optional().default(false).describe("Include hidden files in search."),
+            symbolQuery: z.string().optional().describe(
+                "Search for symbols by name. " +
+                "Substring match (case-insensitive). Cannot be combined with contentQuery."
+            ),
+            symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe(
+                "Filter symbol search to a specific kind. Only used with symbolQuery or listSymbols."
+            ),
+            listSymbols: z.boolean().optional().default(false).describe(
+                "Return an inventory of all symbols."
+            ),
+        },
+        annotations: { readOnlyHint: true }
+    }, async (args) => {
+        const rootPath = await ctx.validatePath(args.path);
+
+        // ---- SYMBOL SEARCH / LIST MODE ----
+        if (args.symbolQuery || args.listSymbols) {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+
+            // Discover files — reuse ripgrep for speed
+            const hasRg = await ripgrepAvailable();
+            let filePaths = [];
+            const callerExcludes = args.excludePatterns ?? [];
+            const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+
+            if (hasRg) {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: 2000,
+                    excludePatterns: [...callerExcludes, ...defaultExcludeGlobs],
+                });
+                if (results) filePaths = results;
+            }
+
+            // JS fallback
+            if (filePaths.length === 0) {
+                async function walk(dir) {
+                    if (filePaths.length >= 2000) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+                    for (const entry of entries) {
+                        if (filePaths.length >= 2000) return;
+                        const fullPath = path.join(dir, entry.name);
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            await walk(fullPath);
+                        } else {
+                            filePaths.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            // Filter to supported files
+            const supportedFiles = filePaths.filter(f => isSupported(f));
+
+            if (supportedFiles.length === 0) {
+                const text = 'No supported files found.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+
+            const MAX_FILE_SIZE = 512 * 1024;
+            const BATCH_SIZE = 50;
+            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
+
+            if (args.listSymbols) {
+                // ---- LIST SYMBOLS MODE ----
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            const names = defs.map(d => `${d.name} (${d.type}:${d.line})`);
+                            return { rel, defs, names };
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        outputLines.push(`${result.rel}: ${result.names.join(', ')}`);
+                    }
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.join('\n');
+                return {
+                    content: [{ type: "text", text }],
+                };
+
+            } else {
+                // ---- SYMBOL QUERY MODE ----
+                const symbolQuery = args.symbolQuery;
+                const outputLines = [];
+
+                for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                    const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (filePath) => {
+                        try {
+                            const stat = await fs.stat(filePath);
+                            if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                            const langName = getLangForFile(filePath);
+                            if (!langName) return null;
+
+                            const source = await fs.readFile(filePath, 'utf-8');
+                            const defs = await getDefinitions(source, langName, {
+                                nameFilter: symbolQuery,
+                                typeFilter: typeFilter,
+                            });
+                            if (!defs || defs.length === 0) return null;
+
+                            const rel = path.relative(rootPath, filePath);
+                            return defs.map(d => ({
+                                line: `${rel}:${d.line}  [${d.type}] ${d.name} (lines ${d.line}-${d.endLine})`,
+                                file: rel,
+                            }));
+                        } catch {
+                            return null;
+                        }
+                    }));
+
+                    for (const result of results) {
+                        if (!result) continue;
+                        for (const entry of result) {
+                            outputLines.push(entry.line);
+                        }
+                        if (outputLines.length >= userMaxResults) break;
+                    }
+                    if (outputLines.length >= userMaxResults) break;
+                }
+
+                // Enforce char budget
+                const budgetLines = [];
+                let charCount = 0;
+                for (const line of outputLines.slice(0, userMaxResults)) {
+                    if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                    budgetLines.push(line);
+                    charCount += line.length + 1;
+                }
+
+                const text = budgetLines.length > 0
+                    ? budgetLines.join('\n')
+                    : 'No matches.';
+                return {
+                    content: [{ type: "text", text }],
+                };
+            }
+        }
+
+        // ---- CONTENT SEARCH / FILE FIND MODE ----
+        const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
+        const contextLines = Math.max(0, args.contextLines ?? 0);
+
+        const callerExcludes = args.excludePatterns ?? [];
+        const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+        const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
+
+        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
+
+        let contentRegex;
+        if (mode === 'content') {
+            if (!args.contentQuery) {
+                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
+            }
+            const flags = args.ignoreCase ? 'gi' : 'g';
+            contentRegex = args.literalSearch
+                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags)
+                : new RegExp(args.contentQuery, flags);
+        }
+
+        // ---- RIPGREP PATH ----
+        const hasRg = await ripgrepAvailable();
+        if (hasRg) {
+            if (mode === 'files') {
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: args.pattern || null,
+                    maxResults: userMaxResults,
+                    excludePatterns: allExcludes,
+                });
+                if (results !== null) {
+                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
+                    return {
+                        content: [{ type: "text", text }],
+                    };
+                }
+            }
+
+            if (mode === 'content') {
+                let rgResults = null;
+
+                if (args.contentQuery.length > 2) {
+                    try {
+                        const candidateFiles = await bm25PreFilterFiles(
+                            rootPath,
+                            args.contentQuery,
+                            100,
+                            allExcludes
+                        );
+
+                        if (candidateFiles.length > 0) {
+                            rgResults = await ripgrepSearch(rootPath, {
+                                contentQuery: args.contentQuery,
+                                filePattern: args.pattern || null,
+                                ignoreCase: args.ignoreCase ?? true,
+                                maxResults: Math.max(userMaxResults, 500),
+                                excludePatterns: allExcludes,
+                                contextLines,
+                                literalSearch: args.literalSearch ?? false,
+                                includeHidden: args.includeHidden ?? false,
+                                fileList: candidateFiles,
+                            });
+                        }
+                    } catch {
+                    }
+                }
+
+                // Fallback if BM25 didn't run or failed
+                if (rgResults === null) {
+                    rgResults = await ripgrepSearch(rootPath, {
+                        contentQuery: args.contentQuery,
+                        filePattern: args.pattern || null,
+                        ignoreCase: args.ignoreCase ?? true,
+                        maxResults: Math.max(userMaxResults, 500),
+                        excludePatterns: allExcludes,
+                        contextLines,
+                        # ... [lines 290-297 omitted]
+                        return {
+
+dist/tools/read_text_file.js
+import { z } from "zod";
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
+import { CHAR_BUDGET } from '../core/shared.js';
+import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
+import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
+
+# ... [lines 10-14 omitted]
+
+export function register(server, ctx) {  # L16
+    const handler = async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+        const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        let standardReadContent = null;
+        let standardReadBudget = maxChars;
+
+        // Validate parameter combinations
+        if ((args.head && args.tail) || (args.tail && args.offset !== undefined) || (args.head && args.tail && args.offset !== undefined)) {
+            throw new Error("Cannot combine tail with head or offset. Use offset+head for windowed reads, or tail alone.");
+        }
+
+        if (args.grep && (args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine 'grep' with head/tail/offset.");
+        }
+
+        const hasWindowMode = args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0);
+        if (hasWindowMode && (args.grep || args.head || args.tail || args.offset !== undefined)) {
+            throw new Error("Cannot combine aroundLine/ranges with grep/head/tail/offset. ");
+        }
+
+        const hasSymbolMode = args.symbol !== undefined;
+        if (hasSymbolMode && (args.grep || args.head || args.tail || args.offset !== undefined || hasWindowMode)) {
+            throw new Error("Cannot combine 'symbol' with grep/head/tail/offset/aroundLine/ranges. ");
+        }
+
+        if (args.compression && (hasSymbolMode || args.grep || args.head || args.tail ||
+                typeof args.offset === 'number' || hasWindowMode || args.showLineNumbers)) {
+            throw new Error("'compression' is only valid on plain full-file reads. Cannot combine with symbol/grep/head/tail/offset/aroundLine/ranges/showLineNumbers.");
+        }
+
+        // ---- SYMBOL MODE ----
+        if (hasSymbolMode) {
+            const langName = getLangForFile(validPath);
+            if (!langName) {
+                throw new Error('Unsupported file type.');
+            }
+
+            const source = await fs.readFile(validPath, 'utf-8');
+            const allLines = source.split('\n');
+            const totalLines = allLines.length;
+
+            const matches = await findSymbol(source, langName, args.symbol, {
+                kindFilter: 'def',
+                nearLine: args.nearLine,
+            });
+
+            if (!matches || matches.length === 0) {
+                throw new Error('Symbol not found.');
+            }
+
+            if (matches.length > 1 && !args.nearLine) {
+                throw new Error('Multiple matches. Use nearLine.');
+            }
+
+            const sym = matches[0];
+            const expand = Math.max(0, Math.min(args.expandLines ?? 0, 50));
+            const startLine = Math.max(1, sym.line - expand);
+            const endLine = Math.min(totalLines, sym.endLine + expand);
+
+            const slice = allLines.slice(startLine - 1, endLine);
+            const numbered = slice.map((line, i) => {
+                const ln = startLine + i;
+                return `${ln}:${line}`;
+            });
+
+            const text = numbered.join('\n');
+            return {
+                content: [{ type: "text", text }],
+            };
+        }
+
+        // ---- GREP MODE ----
+        if (args.grep) {
+            const grepPattern = new RegExp(args.grep, args.grepIgnoreCase !== false ? 'i' : '');
+            const invertMatch = args.grepInvert ?? false;
+            const beforeCount = Math.min(Math.max(0, args.grepBefore ?? 0), 20);
+            const afterCount = Math.min(Math.max(0, args.grepAfter ?? 0), 30);
+            const hasContext = beforeCount > 0 || afterCount > 0;
+
+            const outputEntries = [];
+            let totalLines = 0;
+            let charCount = 0;
+
+            const beforeBuffer = [];
+            let afterRemaining = 0;
+            let lastEmittedLine = 0;
+
+            function emit(lineNum, line, isMatch) {
+                if (outputEntries.length > 0 && lineNum <= outputEntries[outputEntries.length - 1].num) return;
+
+                if (hasContext && lastEmittedLine > 0 && lineNum > lastEmittedLine + 1) {
+                    const sep = '---';
+                    if (charCount + sep.length + 1 <= maxChars) {
+                        outputEntries.push({ num: -1, text: sep, isMatch: false });
+                        charCount += sep.length + 1;
+                    }
+                }
+
+                const marker = isMatch ? '*' : '';
+                const formatted = `${lineNum}:${marker}${line}`;
+                if (charCount + formatted.length + 1 <= maxChars) {
+                    outputEntries.push({ num: lineNum, text: formatted, isMatch });
+                    charCount += formatted.length + 1;
+                    lastEmittedLine = lineNum;
+                }
+            }
+
+            await new Promise((resolve, reject) => {
+                const stream = createReadStream(validPath, { encoding: 'utf-8' });
+                const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+                rl.on('line', (line) => {
+                    totalLines++;
+                    const rawMatch = grepPattern.test(line);
+                    const isMatch = invertMatch ? !rawMatch : rawMatch;
+
+                    if (isMatch) {
+                        if (hasContext) {
+                            for (const bufItem of beforeBuffer) {
+                                emit(bufItem.num, bufItem.text, false);
+                            }
+                            beforeBuffer.length = 0;
+                        }
+
+                        emit(totalLines, line, true);
+                        afterRemaining = afterCount;
+                    } else if (afterRemaining > 0) {
+                        emit(totalLines, line, false);
+                        afterRemaining--;
+                    } else if (beforeCount > 0) {
+                        beforeBuffer.push({ num: totalLines, text: line });
+                        if (beforeBuffer.length > beforeCount) beforeBuffer.shift();
+                    }
+                });
+
+                rl.on('close', resolve);
+                rl.on('error', reject);
+                stream.on('error', reject);
+            });
+
+            const content = outputEntries.length > 0
+                ? outputEntries.map(e => e.text).join('\n')
+                : 'No matches.';
+
+            return {
+                content: [{ type: "text", text: content }],
+            };
+        }
+
+        // ---- WINDOW MODE ----
+        if (hasWindowMode) {
+            const windows = [];
+            if (args.aroundLine !== undefined) {
+                const windowRadius = args.context ?? 30;
+                windows.push({
+                    startLine: Math.max(1, args.aroundLine - windowRadius),
+                    endLine: args.aroundLine + windowRadius,
+                });
+            }
+            if (args.ranges && args.ranges.length > 0) {
+                for (const r of args.ranges) {
+                    windows.push({ startLine: Math.max(1, r.startLine), endLine: r.endLine });
+                }
+            }
+
+            windows.sort((a, b) => a.startLine - b.startLine);
+            const merged = [];
+            for (const w of windows) {
+                if (merged.length === 0 || w.startLine > merged[merged.length - 1].endLine + 1) {
+                    merged.push({ ...w });
+                } else {
+                    merged[merged.length - 1].endLine = Math.max(merged[merged.length - 1].endLine, w.endLine);
+                }
+            }
+
+            const outputLines = [];
+            let totalLines = 0;
+            let charCount = 0;
+            let windowIdx = 0;
+            let lastCollectedLine = -1;
+            let budgetExhausted = false;
+
+            await new Promise((resolve, reject) => {
+                const stream = createReadStream(validPath, { encoding: 'utf-8' });
+                const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+                rl.on('line', (line) => {
+                    totalLines++;
+                    if (budgetExhausted) return;
+
+                    while (windowIdx < merged.length && totalLines > merged[windowIdx].endLine) {
+                        windowIdx++;
+                    }
+                    if (windowIdx >= merged.length) return;
+
+            # ... [lines 212-313 omitted]
+            path: z.string(),
+            tail: z.number().optional().describe("Last N lines."),
+            head: z.number().optional().describe("First N lines."),
+            offset: z.number().optional().describe("Start line (0-based). Combine with head."),
+            grep: z.string().optional().describe("Regex to match lines."),
+            grepIgnoreCase: z.boolean().optional().default(true),
+            grepBefore: z.number().optional().default(0).describe("Context lines before match. Max 20."),
+            grepAfter: z.number().optional().default(0).describe("Context lines after match. Max 30."),
+            grepInvert: z.boolean().optional().default(false).describe("Return non-matching lines."),
+            showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
+            maxChars: z.number().optional().default(50000).describe("Max characters (up to 400000)."),
+            aroundLine: z.number().optional().describe("Center a window on this line."),
+            context: z.number().optional().default(30).describe("Window size for aroundLine."),
+            ranges: z.array(z.object({ startLine: z.number(), endLine: z.number() })).optional().describe("Explicit line ranges to return."),
+            symbol: z.string().optional().describe("Read a symbol by name. Dot-qualified for methods."),
+
+dist/core/tree-sitter.js
+// ---------------------------------------------------------------------------
+// tree-sitter.js — Shared tree-sitter module for symbol-aware tools
+//
+// Provides:
+//   1. Lazy initialization of web-tree-sitter WASM runtime
+//   2. Grammar loading by file extension (cached after first load)
+//   3. Query file loading (.scm patterns) per language
+//   4. getSymbols()      — extract symbols (definitions + references) from source
+//   5. getDefinitions()  — convenience: only definitions
+//   6. getSymbolSummary()— count symbols by type for a file
+//   7. findSymbol()      — find a specific symbol by name, with disambiguation
+//   8. isSupported()     — check if tree-sitter supports a file extension
+//
+// Grammars:  ./grammars/grammars/tree-sitter-{lang}.wasm
+// Queries:   ./grammars/queries/{lang}-tags.scm
+// Runtime:   ./grammars/tree-sitter.wasm
+//
+// All loading is lazy. Nothing is loaded until first use.
+// Language objects and compiled queries are cached permanently.
+// Parsed symbols are cached by source hash (LRU, 100 entries).
+// ---------------------------------------------------------------------------
+
+import { Parser, Language, Query } from 'web-tree-sitter';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+const GRAMMARS_DIR = path.join(__dirname, '..', 'grammars', 'grammars');
+const QUERIES_DIR  = path.join(__dirname, '..', 'grammars', 'queries');
+const TS_WASM_PATH = path.join(__dirname, '..', 'grammars', 'tree-sitter.wasm');
+
+// ---------------------------------------------------------------------------
+// Extension → language mapping
+// ---------------------------------------------------------------------------
+
+const EXT_TO_LANG = {
+    // JavaScript / TypeScript
+    '.js':   'javascript',
+    '.mjs':  'javascript',
+    '.cjs':  'javascript',
+    '.jsx':  'javascript',
+    '.ts':   'typescript',
+    '.mts':  'typescript',
+    '.cts':  'typescript',
+    '.tsx':  'tsx',
+    // Python
+    '.py':   'python',
+    '.pyi':  'python',
+    // Shell
+    '.sh':   'bash',
+    '.bash': 'bash',
+    '.zsh':  'bash',
+    // Go
+    '.go':   'go',
+    // Rust
+    '.rs':   'rust',
+    // Java
+    '.java': 'java',
+    // C / C++
+    '.c':    'c',
+    '.h':    'c',
+    '.cpp':  'cpp',
+    '.cc':   'cpp',
+    '.cxx':  'cpp',
+    '.hpp':  'cpp',
+    '.hh':   'cpp',
+    '.hxx':  'cpp',
+    // C#
+    '.cs':   'csharp',
+    // Kotlin
+    '.kt':   'kotlin',
+    '.kts':  'kotlin',
+    // PHP
+    '.php':  'php',
+    // Ruby
+    '.rb':     'ruby',
+    '.rake':   'ruby',
+    '.gemspec': 'ruby',
+    // Swift
+    '.swift': 'swift',
+    // Web
+    '.css':  'css',
+    '.scss': 'css',
+    // Data formats
+    '.json':  'json',
+    '.jsonc': 'json',
+    '.yaml':  'yaml',
+    '.yml':   'yaml',
+    '.sql':   'sql',
+    // Documentation
+    '.md':  'markdown',
+    '.mdx': 'markdown',
+};
+
+/**
+ * Get the tree-sitter language name for a file path.
+ * Returns null if the extension is not supported.
+ */
+export function getLangForFile(filePath) {  # L107
+    const ext = path.extname(filePath).toLowerCase();
+    return EXT_TO_LANG[ext] || null;
+}
+
+/**
+ * Get all supported file extensions.
+ */
+export function getSupportedExtensions() {  # L115
+    return Object.keys(EXT_TO_LANG);
+}
+
+/**
+ * Check if a file can be parsed by tree-sitter.
+ */
+export function isSupported(filePath) {  # L122
+    return getLangForFile(filePath) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Initialization & caching
+// ---------------------------------------------------------------------------
+
+let _initPromise = null;
+const _languageCache = new Map();       // lang name → Language object (or null)
+const _queryStringCache = new Map();    // lang name → raw .scm string (or null)
+const _compiledQueryCache = new Map();  // lang name → Query object (or null)
+
+// Symbol cache: hash(source) → Symbol[]
+const SYMBOL_CACHE_MAX = 100;
+const _symbolCache = new Map();         // hash → { symbols, ts }
+
+/**
+ * Initialize the tree-sitter WASM runtime. Idempotent.
+ */
+async function ensureInit() {  # L142
+    if (!_initPromise) {
+        _initPromise = Parser.init({
+            locateFile: () => TS_WASM_PATH,
+        });
+    }
+    return _initPromise;
+}
+
+/**
+ * Load a Language grammar (WASM), cached permanently.
+ * Returns null if the grammar file doesn't exist.
+ */
+async function loadLanguage(langName) {  # L155
+    if (_languageCache.has(langName)) {
+        return _languageCache.get(langName);
+    }
+
+    await ensureInit();
+
+    const wasmPath = path.join(GRAMMARS_DIR, `tree-sitter-${langName}.wasm`);
+    try {
+        await fs.access(wasmPath);
+    } catch {
+        _languageCache.set(langName, null);
+        return null;
+    }
+
+    try {
+        const language = await Language.load(wasmPath);
+        _languageCache.set(langName, language);
+        return language;
+    } catch (err) {
+        console.error(`Failed to load grammar for ${langName}:`, err.message);
+        _languageCache.set(langName, null);
+        return null;
+    }
+}
+
+/**
+ * Load the .scm query string for a language. Cached permanently.
+ */
+async function loadQueryString(langName) {  # L184
+    if (_queryStringCache.has(langName)) {
+        return _queryStringCache.get(langName);
+    }
+
+    const scmPath = path.join(QUERIES_DIR, `${langName}-tags.scm`);
+    try {
+        const content = await fs.readFile(scmPath, 'utf-8');
+        _queryStringCache.set(langName, content);
+        return content;
+    } catch {
+        _queryStringCache.set(langName, null);
+        return null;
+    }
+}
+
+/**
+ * Get a compiled Query object for a language. Cached permanently.
+ * Returns null if language or query unavailable.
+ */
+async function getCompiledQuery(langName) {  # L204
+    if (_compiledQueryCache.has(langName)) {
+        return _compiledQueryCache.get(langName);
+    }
+
+    const language = await loadLanguage(langName);
+    if (!language) {
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+
+    const queryString = await loadQueryString(langName);
+    if (!queryString) {
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+
+    try {
+        const query = new Query(language, queryString);
+        _compiledQueryCache.set(langName, query);
+        return query;
+    } catch (err) {
+        console.error(`Failed to compile query for ${langName}:`, err.message);
+        _compiledQueryCache.set(langName, null);
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symbol cache helpers
+// ---------------------------------------------------------------------------
+
+function sourceHash(source) {  # L236
+    return createHash('md5').update(source).digest('hex');
+}
+
+function getCachedSymbols(hash) {  # L240
+    const entry = _symbolCache.get(hash);
+    if (entry) {
+        entry.ts = Date.now(); // touch for LRU
+        return entry.symbols;
+    }
+    return null;
+}
+
+function setCachedSymbols(hash, symbols) {  # L249
+    // Evict oldest if at capacity
+    if (_symbolCache.size >= SYMBOL_CACHE_MAX) {
+        let oldestKey = null, oldestTs = Infinity;
+        for (const [key, val] of _symbolCache) {
+            if (val.ts < oldestTs) {
+                oldestTs = val.ts;
+                oldestKey = key;
+            }
+        }
+        if (oldestKey) _symbolCache.delete(oldestKey);
+    }
+    _symbolCache.set(hash, { symbols, ts: Date.now() });
+}
+# ... [lines 263-295 omitted]
+export async function getSymbols(source, langName, options = {}) {  # L296
+    // Check cache first
+    const hash = sourceHash(langName + ':' + source);
+    const cached = getCachedSymbols(hash);
+    if (cached) {
+        return applyFilters(cached, options);
+    }
+
+    const language = await loadLanguage(langName);
+    if (!language) return null;
+
+    const query = await getCompiledQuery(langName);
+    if (!query) return null;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    // Use matches() to get grouped captures per pattern match.
+    // Each match contains both @name.definition.X and @definition.X captures.
+    const matches = query.matches(tree.rootNode);
+    const symbols = [];
+    const seen = new Set();
+
+    for (const match of matches) {
+        const { captures } = match;
+
+        // Find the name capture and the definition/reference body capture
+        let nameCapture = null;
+        let bodyCapture = null;
+
+        for (const cap of captures) {
+            if (cap.name.startsWith('name.')) {
+                nameCapture = cap;
+            } else if (cap.name.startsWith('definition.') || cap.name.startsWith('reference.')) {
+                bodyCapture = cap;
+            }
+        }
+
+        if (!nameCapture) continue;
+
+        const tag = nameCapture.name;
+        let kind, type;
+        if (tag.startsWith('name.definition.')) {
+            kind = 'def';
+            type = tag.slice('name.definition.'.length);
+        } else if (tag.startsWith('name.reference.')) {
+            kind = 'ref';
+            type = tag.slice('name.reference.'.length);
+        } else {
+            continue;
+        }
+
+        const name = nameCapture.node.text;
+        const line = nameCapture.node.startPosition.row + 1;
+        const column = nameCapture.node.startPosition.column;
+
+        // endLine comes from the body capture if available, otherwise from
+        // the name capture's own end (single-line symbol)
+        let endLine;
+        if (bodyCapture) {
+            endLine = bodyCapture.node.endPosition.row + 1;
+        } else {
+            endLine = nameCapture.node.endPosition.row + 1;
+        }
+
+        // Dedup by name:kind:line
+        const key = `${name}:${kind}:${line}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        symbols.push({ name, kind, type, line, endLine, column });
+    }
+
+    // Clean up parse tree and parser (query is cached, don't delete it)
+    tree.delete();
+    parser.delete();
+
+    // Sort by line number
+    symbols.sort((a, b) => a.line - b.line);
+
+    // Cache the full unfiltered result
+    setCachedSymbols(hash, symbols);
+
+    return applyFilters(symbols, options);
+}
+
+/**
+ * Apply optional filters to a symbol list.
+ */
+function applyFilters(symbols, options) {  # L386
+    if (!options.kindFilter && !options.nameFilter && !options.typeFilter && !options.excludeNames) {
+        return symbols;
+    }
+
+    return symbols.filter(sym => {
+        if (options.kindFilter && sym.kind !== options.kindFilter) return false;
+        if (options.typeFilter && sym.type !== options.typeFilter) return false;
+        if (options.nameFilter && !sym.name.toLowerCase().includes(options.nameFilter.toLowerCase())) return false;
+        if (options.excludeNames && options.excludeNames.includes(sym.name)) return false;
+        return true;
+    });
+}
+
+/**
+ * Get only definitions from source code.
+ * Convenience wrapper around getSymbols with kindFilter='def'.
+ */
+export async function getDefinitions(source, langName, options = {}) {  # L404
+    return getSymbols(source, langName, { ...options, kindFilter: 'def' });
+}
+
+const COMPRESSION_ANCHOR_RULES = {
+    javascript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    typescript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    tsx: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    python: {
+        return_statement: { kind: 'return', priority: 400 },
+        raise_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        elif_clause: { kind: 'if', priority: 310 },
+        for_statement: { kind: 'loop', priority: 260 },
+        while_statement: { kind: 'loop', priority: 250 },
+        try_statement: { kind: 'try', priority: 280 },
+        except_clause: { kind: 'catch', priority: 270 },
+        with_statement: { kind: 'with', priority: 220 },
+        await: { kind: 'await', priority: 180 },
+        call: { kind: 'call', priority: 140 },
+# ... [lines 463-465 omitted]
+function maybeAddAnchor(block, anchor) {  # L466
+    if (!block.anchors) block.anchors = [];
+
+    const existing = block.anchors.find(
+        item => item.startLine === anchor.startLine && item.endLine === anchor.endLine
+    );
+
+    if (existing) {
+        if (anchor.priority > existing.priority) {
+            existing.priority = anchor.priority;
+            existing.kind = anchor.kind;
+        }
+        return;
+    }
+
+    block.anchors.push(anchor);
+}
+
+function assignAnchorToInnermostBlock(blocks, startLine, endLine, kind, priority) {  # L484
+    let target = null;
+
+    for (const block of blocks) {
+        if (block.startLine > startLine || block.endLine < endLine) continue;
+        if (!target || (block.endLine - block.startLine) < (target.endLine - target.startLine)) {
+            target = block;
+        }
+    }
+
+    if (!target || startLine <= target.startLine) return;
+
+    maybeAddAnchor(target, { startLine, endLine, kind, priority });
+}
+
+function shouldCaptureAnchor(node, parent, rule) {  # L499
+    if (node.type === 'call_expression' && parent && (
+        parent.type === 'call_expression' ||
+        parent.type === 'await_expression' ||
+        parent.type === 'expression_statement'
+    )) {
+        return false;
+    }
+
+    if (node.type === 'call' && parent && parent.type === 'await') {
+        return false;
+    }
+
+    return !!rule;
+}
+
+export async function getCompressionStructure(source, langName) {  # L515
+    const defs = await getDefinitions(source, langName);
+    if (!defs || defs.length === 0) return defs;
+
+    const blocks = defs.map(d => ({
+        type: d.type,
+        name: d.name,
+        startLine: d.line - 1,
+        endLine: d.endLine - 1,
+        exported: false,
+        anchors: [],
+    }));
+
+    const rules = COMPRESSION_ANCHOR_RULES[langName];
+    if (!rules) return blocks;
+
+    const language = await loadLanguage(langName);
+    if (!language) return blocks;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        function walk(node, parent = null) {
+            const rule = rules[node.type];
+            if (shouldCaptureAnchor(node, parent, rule)) {
+                const startLine = node.startPosition.row;
+                const rawEndLine = node.endPosition.row;
+                const endLine = rawEndLine <= startLine + 1 ? rawEndLine : startLine;
+                assignAnchorToInnermostBlock(blocks, startLine, endLine, rule.kind, rule.priority);
+            }
+
+            for (let i = 0; i < node.childCount; i++) {
+                walk(node.child(i), node);
+            }
+        }
+
+        walk(tree.rootNode, null);
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
+
+    for (const block of blocks) {
+        if (block.anchors.length > 0) {
+            block.anchors.sort((a, b) => b.priority - a.priority || a.startLine - b.startLine);
+            block.anchors = block.anchors.slice(0, 16);
+        }
+    }
+
+    return blocks;
+}
+# ... [lines 568-575 omitted]
+export async function getSymbolSummary(source, langName) {  # L576
+    const symbols = await getSymbols(source, langName);
+    if (!symbols) return null;
+
+    const defs = {};
+    const refs = {};
+    let defTotal = 0, refTotal = 0;
+
+    for (const sym of symbols) {
+        if (sym.kind === 'def') {
+            defs[sym.type] = (defs[sym.type] || 0) + 1;
+            defTotal++;
+        } else {
+            refs[sym.type] = (refs[sym.type] || 0) + 1;
+            refTotal++;
+        }
+    }
+
+    return { defs, refs, defTotal, refTotal };
+}
+# ... [lines 596-601 omitted]
+export async function getSymbolSummaryString(source, langName) {  # L602
+    const summary = await getSymbolSummary(source, langName);
+    if (!summary || summary.defTotal === 0) return null;
+
+    const parts = [];
+    // Ordered by typical importance
+    const order = ['class', 'interface', 'type', 'enum', 'function', 'method', 'module',
+                   'key', 'section', 'selector', 'keyframes', 'media',
+                   'variable', 'constant', 'property', 'object', 'mixin', 'extension',
+                   'macro', 'resource', 'output', 'provider', 'local'];
+    const used = new Set();
+
+    for (const t of order) {
+        if (summary.defs[t]) {
+            const count = summary.defs[t];
+            const label = count === 1 ? t : pluralize(t);
+
+dist/core/toon_bridge.js
+// toon_bridge.js
+// Accepts a file path and budget (chars) via CLI args.
+// Runs tree-sitter to extract code structure, then calls toon's
+// --structured mode via subprocess, returning the compressed result.
+//
+// Usage: node toon_bridge.js <filepath> <budget_chars>
+
+import { readFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { getCompressionStructure, getLangForFile } from './tree-sitter.js';
+
+const inputPath = process.argv[2];
+const budget    = parseInt(process.argv[3], 10);
+
+if (!inputPath || isNaN(budget)) {
+    process.stderr.write('Usage: node toon_bridge.js <filepath> <budget_chars>\n');
+    process.exit(1);
+}
+
+const content = readFileSync(inputPath, 'utf8');
+
+if (content.length <= budget) {
+    process.stdout.write(content);
+    process.exit(0);
+}
+
+let structure = null;
+const langName = getLangForFile(inputPath);
+
+if (langName) {
+    try {
+        const defs = await getCompressionStructure(content, langName);
+        if (defs && defs.length > 0) {
+            structure = defs;
+        }
+    } catch (e) {
+
+dist/tools/write_file.js
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+import { randomBytes } from 'crypto';
+import { normalizeLineEndings } from '../core/lib.js';
+
+    # ... [lines 7-9 omitted]
+    const trim = (s) => s.trimEnd();  # L10
+# ... [lines 11-30 omitted]
+
+export function register(server, ctx) {  # L32
+    server.registerTool("write_file", {
+        title: "Write File",
+        description: "Create or overwrite a file. Auto-creates parent directories. Use 'append' to add instead of replace.",
+        inputSchema: {
+            path: z.string(),
+            content: z.string(),
+            createOnly: z.boolean().optional().default(false).describe("If true, fails when the file already exists."),
+            append: z.boolean().optional().default(false).describe("If true, appends content to the end of an existing file. Creates the file if it doesn't exist."),
+        },
+        annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
+    }, async (args) => {
+        const validPath = await ctx.validatePath(args.path);
+
+        const normalizedContent = normalizeLineEndings(args.content);
+
+        let existed = false;
+        try {
+            await fs.stat(validPath);
+            existed = true;
+        } catch { /* file doesn't exist */ }
+
+        if (args.createOnly && existed) {
+            throw new Error(
+                `File already exists. " ` +
+                `Use createOnly=false to overwrite, or use edit_file for targeted changes.`
+            );
+        }
+
+        const parentDir = path.dirname(validPath);
+        try {
+            await fs.mkdir(parentDir, { recursive: true });
+        } catch (err) {
+            if (err.code !== 'EEXIST') {
+                throw new Error(`Cannot create parent directory: ${err.message}`);
+            }
+        }
+
+        let finalContent = normalizedContent;
+        let resumedLines = 0;
+        if (args.append && existed) {
+            try {
+                const existing = await fs.readFile(validPath, 'utf-8');
+                const existingLines = existing.split('\n');
+                const incomingLines = normalizedContent.split('\n');
+
+                const tailLines = existingLines.slice(-500);
+                const overlap = findResumeOffset(tailLines, incomingLines);
+
+                let appendContent;
+                if (overlap > 0) {
+                    resumedLines = overlap;
+                    appendContent = incomingLines.slice(overlap).join('\n');
+                } else {
+                    appendContent = normalizedContent;
+                }
+
+                const separator = existing.endsWith('\n') ? '' : '\n';
+                finalContent = existing + separator + appendContent;
+            } catch (err) {
+                throw new Error(`Cannot read existing file for append: ${err.message}`);
+            }
+        }
+
+            # ... [lines 96-101 omitted]
+            if (tempStat.size !== expectedBytes) {
+                throw new Error('Write verification failed.');
+            # ... [lines 104-108 omitted]
+

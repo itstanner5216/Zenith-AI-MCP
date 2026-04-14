@@ -1,0 +1,947 @@
+Cross-project batch read review
+Generated: 2026-04-14T10:00:53.708Z
+
+Selected files:
+- /home/tanner/Projects/dcp-fork/lib/messages/inject.ts
+- /home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+- /home/tanner/Projects/oh-my-opencode-rebase/bin/oh-my-opencode.js
+- /home/tanner/Projects/Enhanced-Perplexica/src/components/Widgets/Weather.tsx
+
+============================================================
+FILE: /home/tanner/Projects/dcp-fork/lib/messages/inject.ts
+LANGUAGE: TypeScript
+RAW_CHARS: 13061
+TARGET_BUDGET: 9142
+FINAL_CHARS: 4109
+KEPT_PERCENT: 31.5%
+REDUCED_PERCENT: 68.5%
+HAS_OMISSION_MARKERS: false
+HAS_LINE_MARKERS: true
+
+--- COMPRESSED OUTPUT ---
+import type { SessionState, WithParts } from "../state"
+import type { Logger } from "../logger"
+import type { PluginConfig } from "../config"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
+import { formatMessageIdTag } from "../message-ids"
+import { renderNudge, renderCompressNudge } from "../prompts"
+import {
+    extractParameterKey,
+    createSyntheticTextPart,
+    createSyntheticToolPart,
+    appendMessageIdTagToToolOutput,
+    findLastToolPart,
+    isIgnoredUserMessage,
+    rejectsTextParts,
+} from "./utils"
+import { getFilePathsFromParameters, isProtected } from "../protected-file-patterns"
+import { getLastUserMessage, isMessageCompacted } from "../shared-utils"
+import { getCurrentTokenUsage } from "../strategies/utils"
+
+function parsePercentageString(value: string, total: number): number | undefined {  # L20
+    if (!value.endsWith("%")) return undefined
+    const percent = parseFloat(value.slice(0, -1))
+
+    if (isNaN(percent)) {
+        return undefined
+    }
+
+    const roundedPercent = Math.round(percent)
+    const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
+
+    return Math.round((clampedPercent / 100) * total)
+}
+
+// XML wrappers
+export const wrapPrunableTools = (content: string): string => {
+    return `<prunable-tools>
+The following tools have been invoked and are available for pruning. This list does not mandate immediate action. Consider your current goals and the resources you need before pruning valuable tool inputs or outputs. Consolidate your prunes for efficiency; it is rarely worth pruning a single tiny tool output. Keep the context free of noise.
+${content}
+</prunable-tools>`
+}
+
+export const wrapCompressContext = (messageCount: number): string => `<compress-context>
+Compress available. Conversation: ${messageCount} messages.
+Compress collapses completed task sequences or exploration phases into summaries.
+Uses ID boundaries [startId, endId, topic, summary].
+</compress-context>`
+
+export const wrapCooldownMessage = (flags: {
+    prune: boolean
+    distill: boolean
+    compress: boolean
+}): string => {
+    const enabledTools: string[] = []
+    if (flags.distill) enabledTools.push("distill")
+    if (flags.compress) enabledTools.push("compress")
+    if (flags.prune) enabledTools.push("prune")
+
+    let toolName: string
+    if (enabledTools.length === 0) {
+        toolName = "pruning tools"
+    } else if (enabledTools.length === 1) {
+        toolName = `${enabledTools[0]} tool`
+    } else {
+        const last = enabledTools.pop()
+        toolName = `${enabledTools.join(", ")} or ${last} tools`
+    }
+
+    return `<context-info>
+Context management was just performed. Do NOT use the ${toolName} again. A fresh list will be available after your next tool use.
+</context-info>`
+}
+
+const resolveContextLimit = (
+    config: PluginConfig,
+    state: SessionState,
+    providerId: string | undefined,
+    modelId: string | undefined,
+): number | undefined => {
+    const modelLimits = config.tools.settings.modelLimits
+    const contextLimit = config.tools.settings.contextLimit
+
+    if (modelLimits) {
+        const providerModelId =
+            providerId !== undefined && modelId !== undefined
+                ? `${providerId}/${modelId}`
+                : undefined
+        const limit = providerModelId !== undefined ? modelLimits[providerModelId] : undefined
+
+        if (limit !== undefined) {
+            if (typeof limit === "string" && limit.endsWith("%")) {
+                if (state.modelContextLimit === undefined) {
+                    return undefined
+                }
+                return parsePercentageString(limit, state.modelContextLimit)
+            }
+            return typeof limit === "number" ? limit : undefined
+        }
+    }
+
+    if (typeof contextLimit === "string") {
+        if (contextLimit.endsWith("%")) {
+            if (state.modelContextLimit === undefined) {
+                return undefined
+            }
+            return parsePercentageString(contextLimit, state.modelContextLimit)
+        }
+        return undefined
+    }
+
+    return contextLimit
+}
+
+const shouldInjectCompressNudge = (
+
+============================================================
+FILE: /home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+LANGUAGE: Python
+RAW_CHARS: 5528
+TARGET_BUDGET: 3869
+FINAL_CHARS: 3865
+KEPT_PERCENT: 69.9%
+REDUCED_PERCENT: 30.1%
+HAS_OMISSION_MARKERS: true
+HAS_LINE_MARKERS: true
+
+--- COMPRESSED OUTPUT ---
+"""Core data models for the retrieval pipeline."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+if TYPE_CHECKING:
+    from src.multimcp.mcp_proxy import ToolMapping
+
+
+@dataclass
+class RetrievalContext:  # L14
+    """Carries the signal for retrieval operations."""
+    session_id: str
+    query: str = ""
+    tool_call_history: list[str] = field(default_factory=list)
+    server_hint: Optional[str] = None
+    query_mode: Literal["env", "nl"] = "env"
+
+
+@dataclass
+class ScoredTool:  # L24
+    """A tool with its retrieval score and tier assignment."""
+    tool_key: str
+    tool_mapping: "ToolMapping"
+    score: float = 1.0
+    tier: Literal["full", "summary"] = "full"
+
+
+@dataclass
+class RetrievalConfig:  # L33
+    """Pipeline configuration with sensible defaults.
+
+    Phase 2 fields (shadow_mode, scorer, max_k, enable_routing_tool,
+    enable_telemetry, telemetry_poll_interval) all default to safe values
+    so existing configs (enabled=False) remain fully backward compatible.
+    """
+    # Existing fields — unchanged
+    enabled: bool = False
+    top_k: int = 15
+    full_description_count: int = 3
+    anchor_tools: list[str] = field(default_factory=list)
+    # Phase 2 additions
+    shadow_mode: bool = False
+    scorer: str = "bmxf"
+    max_k: int = 20
+    enable_routing_tool: bool = True
+    enable_telemetry: bool = True
+    telemetry_poll_interval: int = 30
+    # Phase 4: Rollout hardening
+    canary_percentage: float = 0.0        # 0.0-100.0; % of sessions routed to BMXF filtering
+    rollout_stage: str = "shadow"         # "shadow" | "canary" | "ga"
+
+
+# === Phase 2: Tool catalog types ===
+
+@dataclass
+class ToolDoc:  # L60
+    """Canonical retrieval document for a single tool.
+
+    Maps to ToolMapping: tool_key from _make_key(), fields from types.Tool.
+    retrieval_aliases is space-joined curated lexical synonyms populated by
+    BMXFRetriever._generate_aliases() — empty string when not yet assigned.
+    """
+    tool_key: str                   # server_name__tool_name (double underscore)
+    tool_name: str                  # tool.name (without server prefix)
+    namespace: str                  # server_name
+    description: str                # tool.description or ""
+    parameter_names: str            # space-joined keys from tool.inputSchema.properties
+    retrieval_aliases: str          # curated lexical aliases, space-joined
+
+
+@dataclass
+class ToolCatalogSnapshot:  # L76
+    """Immutable versioned index of all tools.
+
+    schema_hash is SHA-256 of sorted canonical tool docs (sorted by tool_key).
+    Stable for identical registry states; changes on any tool schema update.
+    """
+    version: str
+    schema_hash: str                # SHA-256 hex digest
+    built_at: float                 # time.time() at build
+    docs: list[ToolDoc] = field(default_factory=list)
+
+
+# === Phase 2: Telemetry types ===
+
+@dataclass
+class RootEvidence:  # L91
+    """Evidence derived from scanning a single MCP root."""
+    root_uri: str
+    root_name: Optional[str] = None
+    tokens: dict[str, float] = field(default_factory=dict)
+    features: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0
+    fingerprint_hash: str = ""
+    partial_scan: bool = False
+
+
+@dataclass
+class WorkspaceEvidence:  # L103
+    """Composition of all root evidence for this session."""
+    roots: list[RootEvidence] = field(default_factory=list)
+    workspace_confidence: float = 0.0
+    merged_tokens: dict[str, float] = field(default_factory=dict)
+    workspace_hash: str = ""
+
+
+# === Phase 2: Session routing state ===
+
+@dataclass
+class SessionRoutingState:  # L114
+    # ... [lines 115-128 omitted]
+    active_tool_ids: list[str] = field(default_factory=list)
+# ... [lines 130-134 omitted]
+
+
+# === Phase 2: Observability ===
+
+
+============================================================
+FILE: /home/tanner/Projects/oh-my-opencode-rebase/bin/oh-my-opencode.js
+LANGUAGE: JavaScript
+RAW_CHARS: 3477
+TARGET_BUDGET: 2433
+FINAL_CHARS: 2380
+KEPT_PERCENT: 68.4%
+REDUCED_PERCENT: 31.6%
+HAS_OMISSION_MARKERS: true
+HAS_LINE_MARKERS: true
+
+--- COMPRESSED OUTPUT ---
+#!/usr/bin/env node
+// bin/oh-my-opencode.js
+// Wrapper script that detects platform and spawns the correct binary
+
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { getPlatformPackageCandidates, getBinaryPath } from "./platform.js";
+
+const require = createRequire(import.meta.url);
+# ... [lines 11-15 omitted]
+function getLibcFamily() {  # L16
+  if (process.platform !== "linux") {
+    return undefined; // Not needed on non-Linux
+  }
+  
+  try {
+    return detectLibc.familySync();
+    return null;
+}
+
+# ... [lines 30-61 omitted]
+
+# ... [lines 63-72 omitted]
+
+function main() {  # L74
+  const { platform, arch } = process;
+  const libcFamily = getLibcFamily();
+  const avx2Supported = supportsAvx2();
+  
+  let packageCandidates;
+  try {
+    packageCandidates = getPlatformPackageCandidates({
+      platform,
+      arch,
+      libcFamily,
+      preferBaseline: avx2Supported === false,
+    });
+  } catch (error) {
+    console.error(`\noh-my-opencode: ${error.message}\n`);
+    process.exit(1);
+  }
+
+  const resolvedBinaries = packageCandidates
+    .map((pkg) => {
+      try {
+        return { pkg, binPath: require.resolve(getBinaryPath(pkg, platform)) };
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry !== null);
+
+  if (resolvedBinaries.length === 0) {
+    console.error(`\noh-my-opencode: Platform binary not installed.`);
+    console.error(`\nYour platform: ${platform}-${arch}${libcFamily === "musl" ? "-musl" : ""}`);
+    console.error(`Expected packages (in order): ${packageCandidates.join(", ")}`);
+    console.error(`\nTo fix, run:`);
+    console.error(`  npm install ${packageCandidates[0]}\n`);
+    process.exit(1);
+  }
+
+  for (let index = 0; index < resolvedBinaries.length; index += 1) {
+    const currentBinary = resolvedBinaries[index];
+    const hasFallback = index < resolvedBinaries.length - 1;
+    const result = spawnSync(currentBinary.binPath, process.argv.slice(2), {
+      stdio: "inherit",
+    });
+
+    if (result.error) {
+      if (hasFallback) {
+        continue;
+      }
+
+      console.error(`\noh-my-opencode: Failed to execute binary.`);
+      console.error(`Error: ${result.error.message}\n`);
+      process.exit(2);
+    }
+
+    if (result.signal === "SIGILL" && hasFallback) {
+      continue;
+    }
+
+    if (result.signal) {
+
+============================================================
+FILE: /home/tanner/Projects/Enhanced-Perplexica/src/components/Widgets/Weather.tsx
+LANGUAGE: TSX
+RAW_CHARS: 16320
+TARGET_BUDGET: 11424
+FINAL_CHARS: 5123
+KEPT_PERCENT: 31.4%
+REDUCED_PERCENT: 68.6%
+HAS_OMISSION_MARKERS: false
+HAS_LINE_MARKERS: true
+
+--- COMPRESSED OUTPUT ---
+'use client';
+
+import { getMeasurementUnit } from '@/lib/config/clientRegistry';
+import { Wind, Droplets, Gauge } from 'lucide-react';
+import { useMemo, useEffect, useState } from 'react';
+
+type WeatherWidgetProps = {  # L7
+  location: string;
+  current: {
+    time: string;
+    temperature_2m: number;
+    relative_humidity_2m: number;
+    apparent_temperature: number;
+    is_day: number;
+    precipitation: number;
+    weather_code: number;
+    wind_speed_10m: number;
+    wind_direction_10m: number;
+    wind_gusts_10m?: number;
+  };
+  daily: {
+    time: string[];
+    weather_code: number[];
+    temperature_2m_max: number[];
+    temperature_2m_min: number[];
+    precipitation_probability_max: number[];
+  };
+  timezone: string;
+};
+
+const getWeatherInfo = (code: number, isDay: boolean, isDarkMode: boolean) => {
+  const dayNight = isDay ? 'day' : 'night';
+
+  const weatherMap: Record<
+    number,
+    { icon: string; description: string; gradient: string }
+  > = {
+    0: {
+      icon: `clear-${dayNight}.svg`,
+      description: 'Clear',
+      gradient: isDarkMode
+        ? isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #E8F1FA, #7A9DBF 35%, #4A7BA8 60%, #2F5A88)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #5A6A7E, #3E4E63 40%, #2A3544 65%, #1A2230)'
+        : isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #DBEAFE 30%, #93C5FD 60%, #60A5FA)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #7B8694, #475569 45%, #334155 70%, #1E293B)',
+    },
+    1: {
+      icon: `clear-${dayNight}.svg`,
+      description: 'Mostly Clear',
+      gradient: isDarkMode
+        ? isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #E8F1FA, #7A9DBF 35%, #4A7BA8 60%, #2F5A88)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #5A6A7E, #3E4E63 40%, #2A3544 65%, #1A2230)'
+        : isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #DBEAFE 30%, #93C5FD 60%, #60A5FA)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #7B8694, #475569 45%, #334155 70%, #1E293B)',
+    },
+    2: {
+      icon: `cloudy-1-${dayNight}.svg`,
+      description: 'Partly Cloudy',
+      gradient: isDarkMode
+        ? isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #D4E1ED, #8BA3B8 35%, #617A93 60%, #426070)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #6B7583, #4A5563 40%, #3A4450 65%, #2A3340)'
+        : isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #E0F2FE 28%, #BFDBFE 58%, #93C5FD)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #8B99AB, #64748B 45%, #475569 70%, #334155)',
+    },
+    3: {
+      icon: `cloudy-1-${dayNight}.svg`,
+      description: 'Cloudy',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #B8C3CF, #758190 38%, #546270 65%, #3D4A58)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #F5F8FA, #CBD5E1 32%, #94A3B8 65%, #64748B)',
+    },
+    45: {
+      icon: `fog-${dayNight}.svg`,
+      description: 'Foggy',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #C5CDD8, #8892A0 38%, #697380 65%, #4F5A68)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #E2E8F0 30%, #CBD5E1 62%, #94A3B8)',
+    },
+    48: {
+      icon: `fog-${dayNight}.svg`,
+      description: 'Rime Fog',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #C5CDD8, #8892A0 38%, #697380 65%, #4F5A68)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #E2E8F0 30%, #CBD5E1 62%, #94A3B8)',
+    },
+    51: {
+      icon: `rainy-1-${dayNight}.svg`,
+      description: 'Light Drizzle',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #B8D4E5, #6FA4C5 35%, #4A85AC 60%, #356A8E)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #E5FBFF, #A5F3FC 28%, #67E8F9 60%, #22D3EE)',
+    },
+    53: {
+      icon: `rainy-1-${dayNight}.svg`,
+      description: 'Drizzle',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #B8D4E5, #6FA4C5 35%, #4A85AC 60%, #356A8E)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #E5FBFF, #A5F3FC 28%, #67E8F9 60%, #22D3EE)',
+    },
+    55: {
+      icon: `rainy-2-${dayNight}.svg`,
+      description: 'Heavy Drizzle',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #A5C5D8, #5E92B0 35%, #3F789D 60%, #2A5F82)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #D4F3FF, #7DD3FC 30%, #38BDF8 62%, #0EA5E9)',
+    },
+    61: {
+      icon: `rainy-2-${dayNight}.svg`,
+      description: 'Light Rain',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #A5C5D8, #5E92B0 35%, #3F789D 60%, #2A5F82)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #D4F3FF, #7DD3FC 30%, #38BDF8 62%, #0EA5E9)',
+    },
+    63: {
+      icon: `rainy-2-${dayNight}.svg`,
+      description: 'Rain',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #8DB3C8, #4D819F 38%, #326A87 65%, #215570)'
+
+============================================================
+BATCH read_multiple_files OUTPUT
+/home/tanner/Projects/dcp-fork/lib/messages/inject.ts
+import type { SessionState, WithParts } from "../state"
+import type { Logger } from "../logger"
+import type { PluginConfig } from "../config"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
+import { formatMessageIdTag } from "../message-ids"
+import { renderNudge, renderCompressNudge } from "../prompts"
+import {
+    extractParameterKey,
+    createSyntheticTextPart,
+    createSyntheticToolPart,
+    appendMessageIdTagToToolOutput,
+    findLastToolPart,
+    isIgnoredUserMessage,
+    rejectsTextParts,
+} from "./utils"
+import { getFilePathsFromParameters, isProtected } from "../protected-file-patterns"
+import { getLastUserMessage, isMessageCompacted } from "../shared-utils"
+import { getCurrentTokenUsage } from "../strategies/utils"
+
+function parsePercentageString(value: string, total: number): number | undefined {  # L20
+    if (!value.endsWith("%")) return undefined
+    const percent = parseFloat(value.slice(0, -1))
+
+    if (isNaN(percent)) {
+        return undefined
+    }
+
+    const roundedPercent = Math.round(percent)
+    const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
+
+    return Math.round((clampedPercent / 100) * total)
+}
+
+// XML wrappers
+export const wrapPrunableTools = (content: string): string => {
+    return `<prunable-tools>
+The following tools have been invoked and are available for pruning. This list does not mandate immediate action. Consider your current goals and the resources you need before pruning valuable tool inputs or outputs. Consolidate your prunes for efficiency; it is rarely worth pruning a single tiny tool output. Keep the context free of noise.
+${content}
+</prunable-tools>`
+}
+
+export const wrapCompressContext = (messageCount: number): string => `<compress-context>
+Compress available. Conversation: ${messageCount} messages.
+Compress collapses completed task sequences or exploration phases into summaries.
+Uses ID boundaries [startId, endId, topic, summary].
+</compress-context>`
+
+export const wrapCooldownMessage = (flags: {
+    prune: boolean
+    distill: boolean
+    compress: boolean
+}): string => {
+    const enabledTools: string[] = []
+    if (flags.distill) enabledTools.push("distill")
+    if (flags.compress) enabledTools.push("compress")
+    if (flags.prune) enabledTools.push("prune")
+
+    let toolName: string
+    if (enabledTools.length === 0) {
+        toolName = "pruning tools"
+    } else if (enabledTools.length === 1) {
+        toolName = `${enabledTools[0]} tool`
+    } else {
+        const last = enabledTools.pop()
+        toolName = `${enabledTools.join(", ")} or ${last} tools`
+    }
+
+    return `<context-info>
+Context management was just performed. Do NOT use the ${toolName} again. A fresh list will be available after your next tool use.
+</context-info>`
+}
+
+const resolveContextLimit = (
+    config: PluginConfig,
+    state: SessionState,
+    providerId: string | undefined,
+    modelId: string | undefined,
+): number | undefined => {
+    const modelLimits = config.tools.settings.modelLimits
+    const contextLimit = config.tools.settings.contextLimit
+
+    if (modelLimits) {
+        const providerModelId =
+            providerId !== undefined && modelId !== undefined
+                ? `${providerId}/${modelId}`
+                : undefined
+        const limit = providerModelId !== undefined ? modelLimits[providerModelId] : undefined
+
+        if (limit !== undefined) {
+            if (typeof limit === "string" && limit.endsWith("%")) {
+                if (state.modelContextLimit === undefined) {
+                    return undefined
+                }
+                return parsePercentageString(limit, state.modelContextLimit)
+            }
+            return typeof limit === "number" ? limit : undefined
+        }
+    }
+
+    if (typeof contextLimit === "string") {
+        if (contextLimit.endsWith("%")) {
+            if (state.modelContextLimit === undefined) {
+                return undefined
+            }
+            return parsePercentageString(contextLimit, state.modelContextLimit)
+        }
+        return undefined
+    }
+
+    return contextLimit
+
+/home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+"""Core data models for the retrieval pipeline."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+if TYPE_CHECKING:
+    from src.multimcp.mcp_proxy import ToolMapping
+
+
+@dataclass
+class RetrievalContext:  # L14
+    """Carries the signal for retrieval operations."""
+    session_id: str
+    query: str = ""
+    tool_call_history: list[str] = field(default_factory=list)
+    server_hint: Optional[str] = None
+    query_mode: Literal["env", "nl"] = "env"
+
+
+@dataclass
+class ScoredTool:  # L24
+    """A tool with its retrieval score and tier assignment."""
+    tool_key: str
+    tool_mapping: "ToolMapping"
+    score: float = 1.0
+    tier: Literal["full", "summary"] = "full"
+
+
+@dataclass
+class RetrievalConfig:  # L33
+    """Pipeline configuration with sensible defaults.
+
+    Phase 2 fields (shadow_mode, scorer, max_k, enable_routing_tool,
+    enable_telemetry, telemetry_poll_interval) all default to safe values
+    so existing configs (enabled=False) remain fully backward compatible.
+    """
+    # Existing fields — unchanged
+    enabled: bool = False
+    top_k: int = 15
+    full_description_count: int = 3
+    anchor_tools: list[str] = field(default_factory=list)
+    # Phase 2 additions
+    shadow_mode: bool = False
+    scorer: str = "bmxf"
+    max_k: int = 20
+    enable_routing_tool: bool = True
+    enable_telemetry: bool = True
+    telemetry_poll_interval: int = 30
+    # Phase 4: Rollout hardening
+    canary_percentage: float = 0.0        # 0.0-100.0; % of sessions routed to BMXF filtering
+    rollout_stage: str = "shadow"         # "shadow" | "canary" | "ga"
+
+
+# === Phase 2: Tool catalog types ===
+
+@dataclass
+class ToolDoc:  # L60
+    """Canonical retrieval document for a single tool.
+
+    Maps to ToolMapping: tool_key from _make_key(), fields from types.Tool.
+    retrieval_aliases is space-joined curated lexical synonyms populated by
+    BMXFRetriever._generate_aliases() — empty string when not yet assigned.
+    """
+    tool_key: str                   # server_name__tool_name (double underscore)
+    tool_name: str                  # tool.name (without server prefix)
+    namespace: str                  # server_name
+    description: str                # tool.description or ""
+    parameter_names: str            # space-joined keys from tool.inputSchema.properties
+    retrieval_aliases: str          # curated lexical aliases, space-joined
+
+
+@dataclass
+class ToolCatalogSnapshot:  # L76
+    """Immutable versioned index of all tools.
+
+    schema_hash is SHA-256 of sorted canonical tool docs (sorted by tool_key).
+    Stable for identical registry states; changes on any tool schema update.
+    """
+    version: str
+    schema_hash: str                # SHA-256 hex digest
+    built_at: float                 # time.time() at build
+    docs: list[ToolDoc] = field(default_factory=list)
+
+
+# === Phase 2: Telemetry types ===
+
+@dataclass
+class RootEvidence:  # L91
+    """Evidence derived from scanning a single MCP root."""
+    root_uri: str
+    root_name: Optional[str] = None
+    tokens: dict[str, float] = field(default_factory=dict)
+    features: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0
+    fingerprint_hash: str = ""
+    partial_scan: bool = False
+
+
+@dataclass
+class WorkspaceEvidence:  # L103
+    """Composition of all root evidence for this session."""
+    roots: list[RootEvidence] = field(default_factory=list)
+    workspace_confidence: float = 0.0
+    merged_tokens: dict[str, float] = field(default_factory=dict)
+    workspace_hash: str = ""
+
+
+# === Phase 2: Session routing state ===
+
+@dataclass
+class SessionRoutingState:  # L114
+    # ... [lines 115-134 omitted]
+
+
+# === Phase 2: Observability ===
+
+@dataclass
+
+
+/home/tanner/Projects/oh-my-opencode-rebase/bin/oh-my-opencode.js
+#!/usr/bin/env node
+// bin/oh-my-opencode.js
+// Wrapper script that detects platform and spawns the correct binary
+
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { getPlatformPackageCandidates, getBinaryPath } from "./platform.js";
+
+const require = createRequire(import.meta.url);
+# ... [lines 11-15 omitted]
+function getLibcFamily() {  # L16
+  if (process.platform !== "linux") {
+    return undefined; // Not needed on non-Linux
+  }
+# ... [lines 20-28 omitted]
+
+# ... [lines 30-61 omitted]
+
+# ... [lines 63-72 omitted]
+
+function main() {  # L74
+  const { platform, arch } = process;
+  const libcFamily = getLibcFamily();
+  const avx2Supported = supportsAvx2();
+  
+  let packageCandidates;
+  try {
+    packageCandidates = getPlatformPackageCandidates({
+      platform,
+      arch,
+      libcFamily,
+      preferBaseline: avx2Supported === false,
+    });
+  } catch (error) {
+    console.error(`\noh-my-opencode: ${error.message}\n`);
+    process.exit(1);
+  }
+
+  const resolvedBinaries = packageCandidates
+    .map((pkg) => {
+      try {
+        return { pkg, binPath: require.resolve(getBinaryPath(pkg, platform)) };
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry !== null);
+
+  if (resolvedBinaries.length === 0) {
+    console.error(`\noh-my-opencode: Platform binary not installed.`);
+    console.error(`\nYour platform: ${platform}-${arch}${libcFamily === "musl" ? "-musl" : ""}`);
+    console.error(`Expected packages (in order): ${packageCandidates.join(", ")}`);
+    console.error(`\nTo fix, run:`);
+    console.error(`  npm install ${packageCandidates[0]}\n`);
+    process.exit(1);
+  }
+
+  for (let index = 0; index < resolvedBinaries.length; index += 1) {
+    const currentBinary = resolvedBinaries[index];
+    const hasFallback = index < resolvedBinaries.length - 1;
+    const result = spawnSync(currentBinary.binPath, process.argv.slice(2), {
+      stdio: "inherit",
+    });
+
+    if (result.error) {
+      if (hasFallback) {
+        continue;
+      }
+
+      console.error(`\noh-my-opencode: Failed to execute binary.`);
+      console.error(`Error: ${result.error.message}\n`);
+      process.exit(2);
+    }
+
+    if (result.signal === "SIGILL" && hasFallback) {
+      continue;
+    }
+
+    if (result.signal) {
+
+/home/tanner/Projects/Enhanced-Perplexica/src/components/Widgets/Weather.tsx
+'use client';
+
+import { getMeasurementUnit } from '@/lib/config/clientRegistry';
+import { Wind, Droplets, Gauge } from 'lucide-react';
+import { useMemo, useEffect, useState } from 'react';
+
+type WeatherWidgetProps = {  # L7
+  location: string;
+  current: {
+    time: string;
+    temperature_2m: number;
+    relative_humidity_2m: number;
+    apparent_temperature: number;
+    is_day: number;
+    precipitation: number;
+    weather_code: number;
+    wind_speed_10m: number;
+    wind_direction_10m: number;
+    wind_gusts_10m?: number;
+  };
+  daily: {
+    time: string[];
+    weather_code: number[];
+    temperature_2m_max: number[];
+    temperature_2m_min: number[];
+    precipitation_probability_max: number[];
+  };
+  timezone: string;
+};
+
+const getWeatherInfo = (code: number, isDay: boolean, isDarkMode: boolean) => {
+  const dayNight = isDay ? 'day' : 'night';
+
+  const weatherMap: Record<
+    number,
+    { icon: string; description: string; gradient: string }
+  > = {
+    0: {
+      icon: `clear-${dayNight}.svg`,
+      description: 'Clear',
+      gradient: isDarkMode
+        ? isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #E8F1FA, #7A9DBF 35%, #4A7BA8 60%, #2F5A88)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #5A6A7E, #3E4E63 40%, #2A3544 65%, #1A2230)'
+        : isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #DBEAFE 30%, #93C5FD 60%, #60A5FA)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #7B8694, #475569 45%, #334155 70%, #1E293B)',
+    },
+    1: {
+      icon: `clear-${dayNight}.svg`,
+      description: 'Mostly Clear',
+      gradient: isDarkMode
+        ? isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #E8F1FA, #7A9DBF 35%, #4A7BA8 60%, #2F5A88)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #5A6A7E, #3E4E63 40%, #2A3544 65%, #1A2230)'
+        : isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #DBEAFE 30%, #93C5FD 60%, #60A5FA)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #7B8694, #475569 45%, #334155 70%, #1E293B)',
+    },
+    2: {
+      icon: `cloudy-1-${dayNight}.svg`,
+      description: 'Partly Cloudy',
+      gradient: isDarkMode
+        ? isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #D4E1ED, #8BA3B8 35%, #617A93 60%, #426070)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #6B7583, #4A5563 40%, #3A4450 65%, #2A3340)'
+        : isDay
+          ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #E0F2FE 28%, #BFDBFE 58%, #93C5FD)'
+          : 'radial-gradient(ellipse 150% 100% at 50% 100%, #8B99AB, #64748B 45%, #475569 70%, #334155)',
+    },
+    3: {
+      icon: `cloudy-1-${dayNight}.svg`,
+      description: 'Cloudy',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #B8C3CF, #758190 38%, #546270 65%, #3D4A58)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #F5F8FA, #CBD5E1 32%, #94A3B8 65%, #64748B)',
+    },
+    45: {
+      icon: `fog-${dayNight}.svg`,
+      description: 'Foggy',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #C5CDD8, #8892A0 38%, #697380 65%, #4F5A68)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #E2E8F0 30%, #CBD5E1 62%, #94A3B8)',
+    },
+    48: {
+      icon: `fog-${dayNight}.svg`,
+      description: 'Rime Fog',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #C5CDD8, #8892A0 38%, #697380 65%, #4F5A68)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #FFFFFF, #E2E8F0 30%, #CBD5E1 62%, #94A3B8)',
+    },
+    51: {
+      icon: `rainy-1-${dayNight}.svg`,
+      description: 'Light Drizzle',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #B8D4E5, #6FA4C5 35%, #4A85AC 60%, #356A8E)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #E5FBFF, #A5F3FC 28%, #67E8F9 60%, #22D3EE)',
+    },
+    53: {
+      icon: `rainy-1-${dayNight}.svg`,
+      description: 'Drizzle',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #B8D4E5, #6FA4C5 35%, #4A85AC 60%, #356A8E)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #E5FBFF, #A5F3FC 28%, #67E8F9 60%, #22D3EE)',
+    },
+    55: {
+      icon: `rainy-2-${dayNight}.svg`,
+      description: 'Heavy Drizzle',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #A5C5D8, #5E92B0 35%, #3F789D 60%, #2A5F82)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #D4F3FF, #7DD3FC 30%, #38BDF8 62%, #0EA5E9)',
+    },
+    61: {
+      icon: `rainy-2-${dayNight}.svg`,
+      description: 'Light Rain',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #A5C5D8, #5E92B0 35%, #3F789D 60%, #2A5F82)'
+        : 'radial-gradient(ellipse 150% 100% at 50% 100%, #D4F3FF, #7DD3FC 30%, #38BDF8 62%, #0EA5E9)',
+    },
+    63: {
+      icon: `rainy-2-${dayNight}.svg`,
+      description: 'Rain',
+      gradient: isDarkMode
+        ? 'radial-gradient(ellipse 150% 100% at 50% 100%, #8DB3C8, #4D819F 38%, #326A87 65%, #215570)'

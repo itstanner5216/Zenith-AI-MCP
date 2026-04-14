@@ -7,10 +7,17 @@ import {
     ripgrepAvailable, ripgrepSearch, ripgrepFindFiles,
     bm25RankResults, bm25PreFilterFiles,
     CHAR_BUDGET, RANK_THRESHOLD,
-} from '../shared.js';
+} from '../core/shared.js';
 import {
     isSupported, getLangForFile, getSymbols, getDefinitions,
-} from '../tree-sitter.js';
+} from '../core/tree-sitter.js';
+
+// Smaller budget for content-search results (match snippets, not full files).
+// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
+const SEARCH_CHAR_BUDGET = (() => {
+    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
+    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
+})();
 
 export function register(server, ctx) {
     server.registerTool("search_files", {
@@ -310,14 +317,14 @@ export function register(server, ctx) {
 
                     if (rawLines.length > RANK_THRESHOLD) {
                         const { ranked } = bm25RankResults(
-                            rawLines, args.contentQuery, CHAR_BUDGET
+                            rawLines, args.contentQuery, SEARCH_CHAR_BUDGET
                         );
                         outputLines = ranked;
                     } else {
                         outputLines = [];
                         let charCount = 0;
                         for (const line of rawLines) {
-                            if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                            if (charCount + line.length + 1 > SEARCH_CHAR_BUDGET) break;
                             outputLines.push(line);
                             charCount += line.length + 1;
                         }
@@ -400,14 +407,14 @@ export function register(server, ctx) {
         // Apply BM25 post-filter on JS fallback too if over threshold
         let finalOutput;
         if (mode !== 'files' && results.length > RANK_THRESHOLD && args.contentQuery) {
-            const { ranked } = bm25RankResults(results, args.contentQuery, CHAR_BUDGET);
+            const { ranked } = bm25RankResults(results, args.contentQuery, SEARCH_CHAR_BUDGET);
             finalOutput = ranked;
         } else {
             // Truncate to char budget
             finalOutput = [];
             let charCount = 0;
             for (const line of results) {
-                if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                if (charCount + line.length + 1 > SEARCH_CHAR_BUDGET) break;
                 finalOutput.push(line);
                 charCount += line.length + 1;
             }

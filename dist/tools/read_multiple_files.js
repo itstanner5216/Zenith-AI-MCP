@@ -1,12 +1,8 @@
 import { z } from "zod";
 import fs from "fs/promises";
-import { CHAR_BUDGET } from '../shared.js';
-
-function countLines(str) {
-    if (!str) return 0;
-    const n = (str.match(/\n/g) || []).length;
-    return str.endsWith('\n') ? n : n + 1;
-}
+import path from "path";
+import { CHAR_BUDGET } from '../core/shared.js';
+import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
 
 // Simple concurrency limiter
 async function parallelMap(items, fn, concurrency = 8) {
@@ -35,6 +31,7 @@ export function register(server, ctx) {
                 .max(50)
                 .describe("File paths to read."),
             maxCharsPerFile: z.number().optional().describe("Max characters per file."),
+            compression: z.boolean().optional().default(true).describe("Compression is on by default. Set false to turn it off."),
             showLineNumbers: z.boolean().optional().default(false).describe("Prefix each line with its line number."),
         },
         annotations: { readOnlyHint: true }
@@ -93,30 +90,50 @@ export function register(server, ctx) {
 
         // Phase 3: Read files in parallel with budget enforcement
         const results = await parallelMap(fileInfos, async (fileInfo) => {
+            const fileLabel = `- ${path.basename(fileInfo.validPath || fileInfo.requestedPath)}`;
+
             if (fileInfo.error) {
-                return `## ${fileInfo.requestedPath} ##\nERROR: ${fileInfo.error}`;
+                return `${fileLabel}\nERROR: ${fileInfo.error}`;
             }
 
             const budget = perFileBudget || fileInfo.budget || Math.floor(totalBudget / fileCount);
+            const entryPrefix = `${fileLabel}\n`;
 
             try {
-                let content;
-                const byteLimit = budget * 4;
-                const fd = await fs.open(fileInfo.validPath, 'r');
-                try {
-                    const buf = Buffer.allocUnsafe(byteLimit);
-                    const { bytesRead } = await fd.read(buf, 0, byteLimit, 0);
-                    content = buf.slice(0, bytesRead).toString('utf8');
-                } finally {
-                    await fd.close();
-                }
-                let truncated = false;
+                let content = null;
+                let effectiveBudget = budget;
 
-                if (content.length > budget) {
-                    let cutoff = content.lastIndexOf('\n', budget);
-                    content = cutoff > 0 ? content.slice(0, cutoff) : content.slice(0, budget);
-                    truncated = true;
+                if (args.compression !== false && !args.showLineNumbers) {
+                    content = await fs.readFile(fileInfo.validPath, 'utf8');
+                    const totalEntryBudget = computeCompressionBudget(content.length, budget);
+                    const contentBudget = Math.max(0, totalEntryBudget - entryPrefix.length);
+                    const compressed = await compressTextFile(
+                        fileInfo.validPath,
+                        content,
+                        contentBudget,
+                    );
+                    if (compressed !== null) {
+                        return `${entryPrefix}${compressed.text}`;
+                    }
+
+                    effectiveBudget = contentBudget;
                 }
+
+                if (content === null) {
+                    const byteLimit = budget * 4;
+                    const fd = await fs.open(fileInfo.validPath, 'r');
+                    try {
+                        const buf = Buffer.allocUnsafe(byteLimit);
+                        const { bytesRead } = await fd.read(buf, 0, byteLimit, 0);
+                        content = buf.slice(0, bytesRead).toString('utf8');
+                    } finally {
+                        await fd.close();
+                    }
+                }
+
+                const truncatedResult = truncateToBudget(content, effectiveBudget);
+                content = truncatedResult.text;
+                const truncated = truncatedResult.truncated;
 
                 if (args.showLineNumbers) {
                     const lines = content.split('\n');
@@ -124,18 +141,22 @@ export function register(server, ctx) {
                     content = lines.map((line, i) => `${i + 1}:${line}`).join('\n');
                 }
 
+                if (args.compression !== false && !args.showLineNumbers) {
+                    return `${entryPrefix}${content}`;
+                }
+
                 return truncated
-                    ? `## ${fileInfo.requestedPath} ##\n${content}\n## truncated ##`
-                    : `## ${fileInfo.requestedPath} ##\n${content}`;
+                    ? `${entryPrefix}${content}\n[truncated]`
+                    : `${entryPrefix}${content}`;
             } catch (error) {
-                return `## ${fileInfo.requestedPath} ##\nERROR: ${error.message || error}`;
+                return `${fileLabel}\nERROR: ${error.message || error}`;
             }
         });
 
-        const text = results.join('\n');
+        const text = results.join('\n\n');
 
         const finalText = text.length > CHAR_BUDGET
-            ? text.slice(0, CHAR_BUDGET) + '\n## truncated ##'
+            ? text.slice(0, CHAR_BUDGET) + '\n[truncated]'
             : text;
 
         return {

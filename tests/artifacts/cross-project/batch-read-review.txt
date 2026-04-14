@@ -1,0 +1,2070 @@
+Cross-repo batch read review
+
+Batch tool: read_multiple_files (compression default on)
+Root: /home/tanner/Projects
+
+Files:
+- Enhanced-Perplexica/src/lib/utils.ts
+- search-pipeline/pipeline/query_expansion.py
+- ProjectPulse/ProjectPulse/src/commands/delegation-read.ts
+- dcp-fork/lib/messages/inject.ts
+- agent-hive-main/packages/pantheon-core/src/services/taskService.ts
+
+====================================================================================================
+FULL BATCH OUTPUT
+====================================================================================================
+
+Enhanced-Perplexica/src/lib/utils.ts
+import clsx, { ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
+export const cn = (...classes: ClassValue[]) => twMerge(clsx(...classes));
+
+export const formatTimeDifference = (
+  date1: Date | string,
+  date2: Date | string,
+): string => {
+  date1 = new Date(date1);
+  date2 = new Date(date2);
+
+  const diffInSeconds = Math.floor(
+    Math.abs(date2.getTime() - date1.getTime()) / 1000,
+  );
+
+  if (diffInSeconds < 60)
+    return `${diffInSeconds} second${diffInSeconds !== 1 ? 's' : ''}`;
+  else if (diffInSeconds < 3600)
+    return `${Math.floor(diffInSeconds / 60)} minute${Math.floor(diffInSeconds / 60) !== 1 ? 's' : ''}`;
+        # ... [7 lines omitted]
+
+search-pipeline/pipeline/query_expansion.py
+from __future__ import annotations
+
+import json
+
+import httpx
+
+from .config import settings
+
+
+async def expand_queries(query: str, num_variants: int = 5) -> list[str]:  # L10
+    """Expand a query into diverse search variants for deep research."""
+    variants = await _llm_expand(query, num_variants)
+
+    # Ensure original query is first, deduplicate while preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for q in [query, *variants]:
+        normalized = q.strip()
+        if normalized and normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            result.append(normalized)
+    return result
+
+
+async def _llm_expand(query: str, num_variants: int) -> list[str]:  # L25
+    """Generate query variants using LiteLLM."""
+    url = settings.litellm_base_url + "/v1/chat/completions"
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if settings.litellm_api_key:
+        headers["Authorization"] = f"Bearer {settings.litellm_api_key}"
+    # ... [lines 32-38 omitted]
+    extra_system = settings.system_prompt.strip()
+    # ... [lines 40-42 omitted]
+    user_template = settings.user_query.strip()
+    user_content = user_template.format(query=query) if user_template else query
+    # ... [lines 45-53 omitted]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+
+
+ProjectPulse/ProjectPulse/src/commands/delegation-read.ts
+/**
+ * `delegation-read` command — Retrieve a delegation result.
+ *
+ * Usage:
+ *   projectpulse delegation-read <id>
+ *   projectpulse delegation-read swift-amber-falcon --wait
+ *
+ * Returns the delegation result or status if still running.
+ */
+
+import { checkStatus, readResult, ok, err } from '../lib/delegation';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface ReadOptions {  # L17
+    /** Wait for completion (blocking) */
+    wait?: boolean;
+    /** Maximum wait time in seconds (default: 900) */
+    waitTimeout?: number;
+    /** Poll interval in milliseconds (default: 2000) */
+    pollInterval?: number;
+}
+# ... [lines 25-36 omitted]
+export async function delegationRead(  # L37
+    id: string,
+    options: ReadOptions = {}
+): Promise<string> {
+    const { wait = false, waitTimeout = 900, pollInterval = 2000 } = options;
+
+    if (!id || id.trim().length === 0) {
+        return JSON.stringify(err('Delegation ID is required'));
+    }
+
+    // Check current status
+    const status = await checkStatus(id);
+
+    if (!status.ok) {
+        return JSON.stringify(status);
+    }
+
+    // If complete (or error/timeout), return result
+    if (status.data?.result) {
+        return JSON.stringify(ok({
+            id,
+            status: status.data.status,
+            result: status.data.result.result,
+    # ... [lines 60-66 omitted]
+    if (!wait) {
+        return JSON.stringify(ok({
+    # ... [lines 69-75 omitted]
+    const deadline = Date.now() + waitTimeout * 1000;
+
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, pollInterval));
+
+        const result = await readResult(id);
+        if (result) {
+            return JSON.stringify(ok({
+    # ... [lines 84-93 omitted]
+    return JSON.stringify(err(`Timeout waiting for delegation: ${id}`));
+    # ... [27 lines omitted]
+
+// ============================================================================
+// CLI Entry Point
+// ============================================================================
+
+# ... [lines 101-116 omitted]
+
+async function main(): Promise<void> {  # L118
+    const args = process.argv.slice(2);
+
+    if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+        printUsage();
+        process.exit(0);
+    }
+
+    // Parse arguments
+    let id = '';
+    let wait = false;
+    let waitTimeout = 900;
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+
+        if (arg === '--wait') {
+            wait = true;
+        } else if (arg === '--timeout' && args[i + 1]) {
+            waitTimeout = parseInt(args[++i], 10);
+        } else if (!arg.startsWith('-')) {
+            id = arg;
+        }
+    }
+
+    if (!id) {
+        console.error('Error: Delegation ID is required');
+        printUsage();
+        process.exit(1);
+    }
+
+    const output = await delegationRead(id, { wait, waitTimeout });
+    console.log(output);
+}
+
+// Run if executed directly
+
+dcp-fork/lib/messages/inject.ts
+import type { SessionState, WithParts } from "../state"
+import type { Logger } from "../logger"
+import type { PluginConfig } from "../config"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
+import { formatMessageIdTag } from "../message-ids"
+import { renderNudge, renderCompressNudge } from "../prompts"
+import {
+    extractParameterKey,
+    createSyntheticTextPart,
+    createSyntheticToolPart,
+    appendMessageIdTagToToolOutput,
+    findLastToolPart,
+    isIgnoredUserMessage,
+    rejectsTextParts,
+} from "./utils"
+import { getFilePathsFromParameters, isProtected } from "../protected-file-patterns"
+import { getLastUserMessage, isMessageCompacted } from "../shared-utils"
+import { getCurrentTokenUsage } from "../strategies/utils"
+
+function parsePercentageString(value: string, total: number): number | undefined {  # L20
+    if (!value.endsWith("%")) return undefined
+    const percent = parseFloat(value.slice(0, -1))
+
+    if (isNaN(percent)) {
+        return undefined
+    }
+
+    const roundedPercent = Math.round(percent)
+    const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
+
+    return Math.round((clampedPercent / 100) * total)
+}
+
+// XML wrappers
+export const wrapPrunableTools = (content: string): string => {
+    return `<prunable-tools>
+The following tools have been invoked and are available for pruning. This list does not mandate immediate action. Consider your current goals and the resources you need before pruning valuable tool inputs or outputs. Consolidate your prunes for efficiency; it is rarely worth pruning a single tiny tool output. Keep the context free of noise.
+${content}
+</prunable-tools>`
+}
+
+export const wrapCompressContext = (messageCount: number): string => `<compress-context>
+Compress available. Conversation: ${messageCount} messages.
+Compress collapses completed task sequences or exploration phases into summaries.
+Uses ID boundaries [startId, endId, topic, summary].
+</compress-context>`
+
+export const wrapCooldownMessage = (flags: {
+    prune: boolean
+    distill: boolean
+    compress: boolean
+}): string => {
+    const enabledTools: string[] = []
+    if (flags.distill) enabledTools.push("distill")
+    if (flags.compress) enabledTools.push("compress")
+    if (flags.prune) enabledTools.push("prune")
+
+    let toolName: string
+    if (enabledTools.length === 0) {
+        toolName = "pruning tools"
+    } else if (enabledTools.length === 1) {
+        toolName = `${enabledTools[0]} tool`
+    } else {
+        const last = enabledTools.pop()
+        toolName = `${enabledTools.join(", ")} or ${last} tools`
+    }
+
+    return `<context-info>
+Context management was just performed. Do NOT use the ${toolName} again. A fresh list will be available after your next tool use.
+</context-info>`
+}
+
+const resolveContextLimit = (
+    config: PluginConfig,
+    state: SessionState,
+    providerId: string | undefined,
+    modelId: string | undefined,
+): number | undefined => {
+    const modelLimits = config.tools.settings.modelLimits
+    const contextLimit = config.tools.settings.contextLimit
+
+    if (modelLimits) {
+        const providerModelId =
+            providerId !== undefined && modelId !== undefined
+                ? `${providerId}/${modelId}`
+                : undefined
+        const limit = providerModelId !== undefined ? modelLimits[providerModelId] : undefined
+
+        if (limit !== undefined) {
+            if (typeof limit === "string" && limit.endsWith("%")) {
+                if (state.modelContextLimit === undefined) {
+                    return undefined
+                }
+                return parsePercentageString(limit, state.modelContextLimit)
+            }
+            return typeof limit === "number" ? limit : undefined
+        }
+    }
+
+    if (typeof contextLimit === "string") {
+        if (contextLimit.endsWith("%")) {
+            if (state.modelContextLimit === undefined) {
+                return undefined
+            }
+            return parsePercentageString(contextLimit, state.modelContextLimit)
+        }
+        return undefined
+    }
+
+    return contextLimit
+
+agent-hive-main/packages/pantheon-core/src/services/taskService.ts
+import * as fs from 'fs';
+import {
+  getTasksPath,
+  getTaskPath,
+  getTaskStatusPath,
+  getTaskReportPath,
+  getTaskSpecPath,
+  getSubtasksPath,
+  getSubtaskPath,
+  getSubtaskStatusPath,
+  getSubtaskSpecPath,
+  getSubtaskReportPath,
+  getPlanPath,
+  ensureDir,
+  readJson,
+  writeJson,
+  writeJsonAtomic,
+  acquireLockSync,
+  patchJsonLockedSync,
+  deepMerge,
+  readText,
+  writeText,
+  fileExists,
+  LockOptions,
+} from '../utils/paths.js';
+import { TaskStatus, TaskStatusType, TaskOrigin, TasksSyncResult, TaskInfo, Subtask, SubtaskType, SubtaskStatus, WorkerSession } from '../types.js';
+
+/** Current schema version for TaskStatus */
+export const TASK_STATUS_SCHEMA_VERSION = 1;
+
+/** Fields that can be updated by background workers without clobbering completion-owned fields */
+export interface BackgroundPatchFields {  # L32
+  idempotencyKey?: string;
+  workerSession?: Partial<WorkerSession>;
+}
+
+/** Fields owned by the completion flow (not to be touched by background patches) */
+export interface CompletionFields {  # L38
+  status?: TaskStatusType;
+  summary?: string;
+  completedAt?: string;
+}
+
+interface ParsedTask {  # L44
+  folder: string;
+  order: number;
+  name: string;
+  description: string;
+  /** Raw dependency numbers parsed from plan. null = not specified (use implicit), [] = explicit none */
+  dependsOnNumbers: number[] | null;
+}
+
+export class TaskService {  # L53
+  constructor(private projectRoot: string) {}
+
+  sync(featureName: string): TasksSyncResult {
+    const planPath = getPlanPath(this.projectRoot, featureName);
+    const planContent = readText(planPath);
+    
+    if (!planContent) {
+      throw new Error(`No plan.md found for feature '${featureName}'`);
+    }
+
+    const planTasks = this.parseTasksFromPlan(planContent);
+    
+    // Validate dependency graph before proceeding
+    this.validateDependencyGraph(planTasks, featureName);
+    
+    const existingTasks = this.list(featureName);
+    
+    const result: TasksSyncResult = {
+      created: [],
+      removed: [],
+      kept: [],
+      manual: [],
+    };
+
+    const existingByName = new Map(existingTasks.map(t => [t.folder, t]));
+
+    for (const existing of existingTasks) {
+      if (existing.origin === 'manual') {
+        result.manual.push(existing.folder);
+        continue;
+      }
+
+      if (existing.status === 'done' || existing.status === 'in_progress') {
+        result.kept.push(existing.folder);
+        continue;
+      }
+
+      if (existing.status === 'cancelled') {
+        this.deleteTask(featureName, existing.folder);
+        result.removed.push(existing.folder);
+        continue;
+      }
+
+      const stillInPlan = planTasks.some(p => p.folder === existing.folder);
+      if (!stillInPlan) {
+        this.deleteTask(featureName, existing.folder);
+        result.removed.push(existing.folder);
+      } else {
+        result.kept.push(existing.folder);
+      }
+    }
+
+    for (const planTask of planTasks) {
+      if (!existingByName.has(planTask.folder)) {
+        this.createFromPlan(featureName, planTask, planTasks, planContent);
+        result.created.push(planTask.folder);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Create a manual task with auto-incrementing index.
+   * Folder format: "01-task-name", "02-task-name", etc.
+   * Index ensures alphabetical sort = chronological order.
+   */
+  create(featureName: string, name: string, order?: number): string {  # L121
+    const tasksPath = getTasksPath(this.projectRoot, featureName);
+    const existingFolders = this.listFolders(featureName);
+    
+    // Auto-increment: finds max existing index + 1
+    const nextOrder = order ?? this.getNextOrder(existingFolders);
+    // Zero-pad to 2 digits for correct alphabetical sorting (01, 02, ... 99)
+    const folder = `${String(nextOrder).padStart(2, '0')}-${name}`;
+    const taskPath = getTaskPath(this.projectRoot, featureName, folder);
+
+    ensureDir(taskPath);
+
+    const status: TaskStatus = {
+      status: 'pending',
+      origin: 'manual',
+      planTitle: name,
+    };
+    writeJson(getTaskStatusPath(this.projectRoot, featureName, folder), status);
+
+    return folder;
+  }
+
+  private createFromPlan(featureName: string, task: ParsedTask, allTasks: ParsedTask[], planContent: string): void {
+    const taskPath = getTaskPath(this.projectRoot, featureName, task.folder);
+    ensureDir(taskPath);
+
+    // Resolve dependencies: numbers -> folder names
+    const dependsOn = this.resolveDependencies(task, allTasks);
+
+    const status: TaskStatus = {
+      status: 'pending',
+      origin: 'plan',
+      planTitle: task.name,
+      dependsOn,
+    };
+    writeJson(getTaskStatusPath(this.projectRoot, featureName, task.folder), status);
+
+    const specContent = this.buildSpecContent({
+      featureName,
+      task,
+      dependsOn,
+      allTasks,
+      planContent,
+    });
+
+    writeText(getTaskSpecPath(this.projectRoot, featureName, task.folder), specContent);
+  }
+
+  buildSpecContent(params: {
+    featureName: string;
+    task: { folder: string; name: string; order: number; description?: string };
+    dependsOn: string[];
+    allTasks: Array<{ folder: string; name: string; order: number }>;
+    planContent?: string | null;
+    contextFiles?: Array<{ name: string; content: string }>;
+    completedTasks?: Array<{ name: string; summary: string }>;
+  }): string {
+    const { featureName, task, dependsOn, allTasks, planContent, contextFiles = [], completedTasks = [] } = params;
+
+    const getTaskType = (planSection: string | null, taskName: string): string | null => {
+      if (!planSection) {
+        return null;
+      }
+
+      const fileTypeMatches = Array.from(planSection.matchAll(/-\s*(Create|Modify|Test):/gi)).map(
+        match => match[1].toLowerCase()
+      );
+      const fileTypes = new Set(fileTypeMatches);
+
+      if (fileTypes.size === 0) {
+        return taskName.toLowerCase().includes('test') ? 'testing' : null;
+      }
+
+      if (fileTypes.size === 1) {
+        const onlyType = Array.from(fileTypes)[0];
+        if (onlyType === 'create') return 'greenfield';
+        if (onlyType === 'test') return 'testing';
+      }
+
+      if (fileTypes.has('modify')) {
+        return 'modification';
+      }
+
+      return null;
+    };
+
+    const specLines: string[] = [
+      `# Task: ${task.folder}`,
+      '',
+      `## Feature: ${featureName}`,
+      '',
+      '## Dependencies',
+      '',
+    ];
+
+    if (dependsOn.length > 0) {
+      for (const dep of dependsOn) {
+        const depTask = allTasks.find(t => t.folder === dep);
+        if (depTask) {
+          specLines.push(`- **${depTask.order}. ${depTask.name}** (${dep})`);
+        } else {
+          specLines.push(`- ${dep}`);
+        }
+      }
+    } else {
+      specLines.push('_None_');
+    }
+
+    specLines.push('', '## Plan Section', '');
+
+    const planSection = this.extractPlanSection(planContent ?? null, task);
+    if (planSection) {
+      specLines.push(planSection.trim());
+    } else {
+      specLines.push('_No plan section available._');
+    }
+
+    specLines.push('');
+
+    const taskType = getTaskType(planSection, task.name);
+    if (taskType) {
+      specLines.push('## Task Type', '', taskType, '');
+    }
+
+    if (contextFiles.length > 0) {
+      const contextCompiled = contextFiles
+        .map(f => `## ${f.name}\n\n${f.content}`)
+        .join('\n\n---\n\n');
+      specLines.push('## Context', '', contextCompiled, '');
+    }
+
+    if (completedTasks.length > 0) {
+      const completedLines = completedTasks.map(t => `- ${t.name}: ${t.summary}`);
+      specLines.push('## Completed Tasks', '', ...completedLines, '');
+    }
+
+    return specLines.join('\n');
+  }
+
+  private extractPlanSection(planContent: string | null, task: { name: string; order: number; folder: string }): string | null {
+    if (!planContent) return null;
+
+    const escapedTitle = task.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const titleRegex = new RegExp(`###\\s*\\d+\\.\\s*${escapedTitle}[\\s\\S]*?(?=###|$)`, 'i');
+    let taskMatch = planContent.match(titleRegex);
+
+    if (!taskMatch && task.order > 0) {
+      const orderRegex = new RegExp(`###\\s*${task.order}\\.\\s*[^\\n]+[\\s\\S]*?(?=###|$)`, 'i');
+      taskMatch = planContent.match(orderRegex);
+    }
+
+    return taskMatch ? taskMatch[0].trim() : null;
+  }
+
+  /**
+   * Resolve dependency numbers to folder names.
+   * - If dependsOnNumbers is null (not specified), apply implicit sequential default (N-1 for N > 1).
+   * - If dependsOnNumbers is [] (explicit "none"), return empty array.
+   * - Otherwise, map numbers to corresponding task folders.
+   */
+  private resolveDependencies(task: ParsedTask, allTasks: ParsedTask[]): string[] {
+    // Explicit "none" - no dependencies
+    if (task.dependsOnNumbers !== null && task.dependsOnNumbers.length === 0) {
+      return [];
+    }
+
+    // Explicit dependency numbers provided
+    if (task.dependsOnNumbers !== null) {
+      return task.dependsOnNumbers
+        .map(num => allTasks.find(t => t.order === num)?.folder)
+        .filter((folder): folder is string => folder !== undefined);
+    }
+
+    // Implicit sequential default: depend on previous task (N-1)
+    if (task.order === 1) {
+      return [];
+    }
+
+    const previousTask = allTasks.find(t => t.order === task.order - 1);
+    return previousTask ? [previousTask.folder] : [];
+  }
+
+  /**
+   * Validate the dependency graph for errors before creating tasks.
+   * Throws descriptive errors pointing the operator to fix plan.md.
+   * 
+   * Checks for:
+   * - Unknown task numbers in dependencies
+   * - Self-dependencies
+   * - Cycles (using DFS topological sort)
+   */
+  private validateDependencyGraph(tasks: ParsedTask[], featureName: string): void {
+    const taskNumbers = new Set(tasks.map(t => t.order));
+    
+    // Validate each task's dependencies
+    for (const task of tasks) {
+      if (task.dependsOnNumbers === null) {
+        // Implicit dependencies - no validation needed
+        continue;
+      }
+      
+      for (const depNum of task.dependsOnNumbers) {
+        // Check for self-dependency
+        if (depNum === task.order) {
+          throw new Error(
+            `Invalid dependency graph in plan.md: Self-dependency detected for task ${task.order} ("${task.name}"). ` +
+            `A task cannot depend on itself. Please fix the "Depends on:" line in plan.md.`
+          );
+        }
+        
+        // Check for unknown task number
+        if (!taskNumbers.has(depNum)) {
+          throw new Error(
+            `Invalid dependency graph in plan.md: Unknown task number ${depNum} referenced in dependencies for task ${task.order} ("${task.name}"). ` +
+            `Available task numbers are: ${Array.from(taskNumbers).sort((a, b) => a - b).join(', ')}. ` +
+            `Please fix the "Depends on:" line in plan.md.`
+          );
+        }
+      }
+    }
+    
+    // Check for cycles using DFS
+    this.detectCycles(tasks);
+  }
+
+  /**
+   * Detect cycles in the dependency graph using DFS.
+   * Throws a descriptive error if a cycle is found.
+   */
+  private detectCycles(tasks: ParsedTask[]): void {
+    // Build adjacency list: task order -> [dependency orders]
+    const taskByOrder = new Map(tasks.map(t => [t.order, t]));
+    
+    // Build dependency graph with resolved implicit dependencies
+    const getDependencies = (task: ParsedTask): number[] => {
+      if (task.dependsOnNumbers !== null) {
+        return task.dependsOnNumbers;
+      }
+      // Implicit sequential dependency
+      if (task.order === 1) {
+        return [];
+      }
+      return [task.order - 1];
+    };
+    
+    // Track visited state: 0 = unvisited, 1 = in current path, 2 = fully processed
+    const visited = new Map<number, number>();
+    const path: number[] = [];
+    
+    const dfs = (taskOrder: number): void => {
+      const state = visited.get(taskOrder);
+      
+      if (state === 2) {
+        // Already fully processed, no cycle through here
+        return;
+      }
+      
+      if (state === 1) {
+        // Found a cycle! Build the cycle path for the error message
+        const cycleStart = path.indexOf(taskOrder);
+        const cyclePath = [...path.slice(cycleStart), taskOrder];
+        const cycleDesc = cyclePath.join(' -> ');
+        
+        throw new Error(
+          `Invalid dependency graph in plan.md: Cycle detected in task dependencies: ${cycleDesc}. ` +
+          `Tasks cannot have circular dependencies. Please fix the "Depends on:" lines in plan.md.`
+        );
+      }
+      
+      // Mark as in current path
+      visited.set(taskOrder, 1);
+      path.push(taskOrder);
+      
+      const task = taskByOrder.get(taskOrder);
+      if (task) {
+        const deps = getDependencies(task);
+        for (const depOrder of deps) {
+          dfs(depOrder);
+        }
+      }
+      
+      // Mark as fully processed
+      path.pop();
+      visited.set(taskOrder, 2);
+    };
+    
+    // Run DFS from each node
+    for (const task of tasks) {
+      if (!visited.has(task.order)) {
+        dfs(task.order);
+      }
+    }
+  }
+
+  writeSpec(featureName: string, taskFolder: string, content: string): string {
+    const specPath = getTaskSpecPath(this.projectRoot, featureName, taskFolder);
+    writeText(specPath, content);
+    return specPath;
+  }
+
+  /**
+   * Update task status with locked atomic write.
+   * Uses file locking to prevent race conditions between concurrent updates.
+   * 
+   * @param featureName - Feature name
+   * @param taskFolder - Task folder name
+   * @param updates - Fields to update (status, summary, baseCommit)
+   * @param lockOptions - Optional lock configuration
+   * @returns Updated TaskStatus
+   */
+  update(  # L431
+    featureName: string,
+    taskFolder: string,
+    updates: Partial<Pick<TaskStatus, 'status' | 'summary' | 'baseCommit'>>,
+    lockOptions?: LockOptions
+  ): TaskStatus {
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+
+    // Guard before lock acquisition to avoid creating missing task folders
+    // via lock-file parent directory creation on error paths.
+    if (!fileExists(statusPath)) {
+      throw new Error(`Task '${taskFolder}' not found`);
+    }
+
+    const release = acquireLockSync(statusPath, lockOptions);
+
+    try {
+      const current = readJson<TaskStatus>(statusPath);
+      if (!current) {
+        throw new Error(`Task '${taskFolder}' not found`);
+      }
+
+      const updated: TaskStatus = {
+        ...current,
+        ...updates,
+        schemaVersion: TASK_STATUS_SCHEMA_VERSION,
+      };
+
+      if (updates.status === 'in_progress' && !current.startedAt) {
+        updated.startedAt = new Date().toISOString();
+      }
+      if (updates.status === 'done' && !current.completedAt) {
+        updated.completedAt = new Date().toISOString();
+      }
+
+      // Lock-first read-modify-write to avoid TOCTOU races.
+      writeJsonAtomic(statusPath, updated);
+      return updated;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Patch only background-owned fields without clobbering completion-owned fields.
+   * Safe for concurrent use by background workers.
+   * 
+   * Uses deep merge for workerSession to allow partial updates like:
+   * - patchBackgroundFields(..., { workerSession: { lastHeartbeatAt: '...' } })
+   *   will update only lastHeartbeatAt, preserving other workerSession fields.
+   * 
+   * @param featureName - Feature name
+   * @param taskFolder - Task folder name
+   * @param patch - Background-owned fields to update
+   * @param lockOptions - Optional lock configuration
+   * @returns Updated TaskStatus
+   */
+  patchBackgroundFields(
+    featureName: string,
+    taskFolder: string,
+    patch: BackgroundPatchFields,
+    lockOptions?: LockOptions
+  ): TaskStatus {
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+    
+    // Build the patch object, only including fields that are defined
+    const safePatch: Partial<TaskStatus> = {
+      schemaVersion: TASK_STATUS_SCHEMA_VERSION,
+    };
+    
+    if (patch.idempotencyKey !== undefined) {
+      safePatch.idempotencyKey = patch.idempotencyKey;
+    }
+    
+    if (patch.workerSession !== undefined) {
+      safePatch.workerSession = patch.workerSession as WorkerSession;
+    }
+    
+    // Use patchJsonLockedSync which does deep merge
+    return patchJsonLockedSync<TaskStatus>(statusPath, safePatch, lockOptions);
+  }
+
+  /**
+   * Get raw TaskStatus including all fields (for internal use or debugging).
+   */
+  getRawStatus(featureName: string, taskFolder: string): TaskStatus | null {
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+    return readJson<TaskStatus>(statusPath);
+  }
+
+  get(featureName: string, taskFolder: string): TaskInfo | null {  # L521
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+    const status = readJson<TaskStatus>(statusPath);
+    
+    if (!status) return null;
+
+    return {
+      folder: taskFolder,
+      name: taskFolder.replace(/^\d+-/, ''),
+      status: status.status,
+      origin: status.origin,
+      planTitle: status.planTitle,
+      summary: status.summary,
+    };
+  }
+
+  list(featureName: string): TaskInfo[] {
+    const folders = this.listFolders(featureName);
+    return folders
+      .map(folder => this.get(featureName, folder))
+      .filter((t): t is TaskInfo => t !== null);
+  }
+
+  writeReport(featureName: string, taskFolder: string, report: string): string {
+    const reportPath = getTaskReportPath(this.projectRoot, featureName, taskFolder);
+    writeText(reportPath, report);
+    return reportPath;
+  }
+
+  private listFolders(featureName: string): string[] {
+    const tasksPath = getTasksPath(this.projectRoot, featureName);
+    if (!fileExists(tasksPath)) return [];
+
+    return fs.readdirSync(tasksPath, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name)
+      .sort();
+  }
+
+  private deleteTask(featureName: string, taskFolder: string): void {
+    const taskPath = getTaskPath(this.projectRoot, featureName, taskFolder);
+    if (fileExists(taskPath)) {
+      fs.rmSync(taskPath, { recursive: true });
+    }
+  }
+
+  private getNextOrder(existingFolders: string[]): number {
+    if (existingFolders.length === 0) return 1;
+    
+    const orders = existingFolders
+      .map(f => parseInt(f.split('-')[0], 10))
+      .filter(n => !isNaN(n));
+    
+    return Math.max(...orders, 0) + 1;
+  }
+
+  private parseTasksFromPlan(content: string): ParsedTask[] {
+    const tasks: ParsedTask[] = [];
+    const lines = content.split('\n');
+    
+    let currentTask: ParsedTask | null = null;
+    let descriptionLines: string[] = [];
+    
+    // Regex to match "Depends on:" or "**Depends on**:" with optional markdown
+    // Strips markdown formatting (**, *, etc.) and captures the value
+    const dependsOnRegex = /^\s*\*{0,2}Depends\s+on\*{0,2}\s*:\s*(.+)$/i;
+    
+    for (const line of lines) {
+      // Check for task header: ### N. Task Name
+      const taskMatch = line.match(/^###\s+(\d+)\.\s+(.+)$/);
+      
+      if (taskMatch) {
+        // Save previous task if exists
+        if (currentTask) {
+          currentTask.description = descriptionLines.join('\n').trim();
+          tasks.push(currentTask);
+        }
+        
+        const order = parseInt(taskMatch[1], 10);
+        const rawName = taskMatch[2].trim();
+
+====================================================================================================
+Enhanced-Perplexica/src/lib/utils.ts
+====================================================================================================
+RAW_LEN: 1060
+BATCH_SECTION_LEN: 717
+KEEP_RATIO: 0.676
+REDUCTION: 0.324
+MODEL_UNDERSTANDS_FILE: true
+WHY: signature and meaningful body/control-flow lines survived
+
+BATCH SECTION
+Enhanced-Perplexica/src/lib/utils.ts
+import clsx, { ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
+export const cn = (...classes: ClassValue[]) => twMerge(clsx(...classes));
+
+export const formatTimeDifference = (
+  date1: Date | string,
+  date2: Date | string,
+): string => {
+  date1 = new Date(date1);
+  date2 = new Date(date2);
+
+  const diffInSeconds = Math.floor(
+    Math.abs(date2.getTime() - date1.getTime()) / 1000,
+  );
+
+  if (diffInSeconds < 60)
+    return `${diffInSeconds} second${diffInSeconds !== 1 ? 's' : ''}`;
+  else if (diffInSeconds < 3600)
+    return `${Math.floor(diffInSeconds / 60)} minute${Math.floor(diffInSeconds / 60) !== 1 ? 's' : ''}`;
+        # ... [7 lines omitted]
+
+RAW PREVIEW (first 1200 chars)
+import clsx, { ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
+export const cn = (...classes: ClassValue[]) => twMerge(clsx(...classes));
+
+export const formatTimeDifference = (
+  date1: Date | string,
+  date2: Date | string,
+): string => {
+  date1 = new Date(date1);
+  date2 = new Date(date2);
+
+  const diffInSeconds = Math.floor(
+    Math.abs(date2.getTime() - date1.getTime()) / 1000,
+  );
+
+  if (diffInSeconds < 60)
+    return `${diffInSeconds} second${diffInSeconds !== 1 ? 's' : ''}`;
+  else if (diffInSeconds < 3600)
+    return `${Math.floor(diffInSeconds / 60)} minute${Math.floor(diffInSeconds / 60) !== 1 ? 's' : ''}`;
+  else if (diffInSeconds < 86400)
+    return `${Math.floor(diffInSeconds / 3600)} hour${Math.floor(diffInSeconds / 3600) !== 1 ? 's' : ''}`;
+  else if (diffInSeconds < 31536000)
+    return `${Math.floor(diffInSeconds / 86400)} day${Math.floor(diffInSeconds / 86400) !== 1 ? 's' : ''}`;
+  else
+    return `${Math.floor(diffInSeconds / 31536000)} year${Math.floor(diffInSeconds / 31536000) !== 1 ? 's' : ''}`;
+};
+
+
+====================================================================================================
+search-pipeline/pipeline/query_expansion.py
+====================================================================================================
+RAW_LEN: 2187
+BATCH_SECTION_LEN: 1486
+KEEP_RATIO: 0.679
+REDUCTION: 0.321
+MODEL_UNDERSTANDS_FILE: false
+WHY: too little body logic survived to trust a model summary
+
+BATCH SECTION
+search-pipeline/pipeline/query_expansion.py
+from __future__ import annotations
+
+import json
+
+import httpx
+
+from .config import settings
+
+
+async def expand_queries(query: str, num_variants: int = 5) -> list[str]:  # L10
+    """Expand a query into diverse search variants for deep research."""
+    variants = await _llm_expand(query, num_variants)
+
+    # Ensure original query is first, deduplicate while preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for q in [query, *variants]:
+        normalized = q.strip()
+        if normalized and normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            result.append(normalized)
+    return result
+
+
+async def _llm_expand(query: str, num_variants: int) -> list[str]:  # L25
+    """Generate query variants using LiteLLM."""
+    url = settings.litellm_base_url + "/v1/chat/completions"
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if settings.litellm_api_key:
+        headers["Authorization"] = f"Bearer {settings.litellm_api_key}"
+    # ... [lines 32-38 omitted]
+    extra_system = settings.system_prompt.strip()
+    # ... [lines 40-42 omitted]
+    user_template = settings.user_query.strip()
+    user_content = user_template.format(query=query) if user_template else query
+    # ... [lines 45-53 omitted]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+
+
+RAW PREVIEW (first 1200 chars)
+from __future__ import annotations
+
+import json
+
+import httpx
+
+from .config import settings
+
+
+async def expand_queries(query: str, num_variants: int = 5) -> list[str]:
+    """Expand a query into diverse search variants for deep research."""
+    variants = await _llm_expand(query, num_variants)
+
+    # Ensure original query is first, deduplicate while preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for q in [query, *variants]:
+        normalized = q.strip()
+        if normalized and normalized.lower() not in seen:
+            seen.add(normalized.lower())
+            result.append(normalized)
+    return result
+
+
+async def _llm_expand(query: str, num_variants: int) -> list[str]:
+    """Generate query variants using LiteLLM."""
+    url = settings.litellm_base_url + "/v1/chat/completions"
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if settings.litellm_api_key:
+        headers["Authorization"] = f"Bearer {settings.litellm_api_key}"
+
+    # The N-variants line is always first — it reflects the live DEEP_QUERY_VARIANTS value.
+    # Everything below it comes from QUERY_EXPANSION_SYSTEM in .env.
+    dynamic_header = (
+        f"Produce exa
+
+====================================================================================================
+ProjectPulse/ProjectPulse/src/commands/delegation-read.ts
+====================================================================================================
+RAW_LEN: 4451
+BATCH_SECTION_LEN: 3111
+KEEP_RATIO: 0.699
+REDUCTION: 0.301
+MODEL_UNDERSTANDS_FILE: true
+WHY: signature and meaningful body/control-flow lines survived
+
+BATCH SECTION
+ProjectPulse/ProjectPulse/src/commands/delegation-read.ts
+/**
+ * `delegation-read` command — Retrieve a delegation result.
+ *
+ * Usage:
+ *   projectpulse delegation-read <id>
+ *   projectpulse delegation-read swift-amber-falcon --wait
+ *
+ * Returns the delegation result or status if still running.
+ */
+
+import { checkStatus, readResult, ok, err } from '../lib/delegation';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface ReadOptions {  # L17
+    /** Wait for completion (blocking) */
+    wait?: boolean;
+    /** Maximum wait time in seconds (default: 900) */
+    waitTimeout?: number;
+    /** Poll interval in milliseconds (default: 2000) */
+    pollInterval?: number;
+}
+# ... [lines 25-36 omitted]
+export async function delegationRead(  # L37
+    id: string,
+    options: ReadOptions = {}
+): Promise<string> {
+    const { wait = false, waitTimeout = 900, pollInterval = 2000 } = options;
+
+    if (!id || id.trim().length === 0) {
+        return JSON.stringify(err('Delegation ID is required'));
+    }
+
+    // Check current status
+    const status = await checkStatus(id);
+
+    if (!status.ok) {
+        return JSON.stringify(status);
+    }
+
+    // If complete (or error/timeout), return result
+    if (status.data?.result) {
+        return JSON.stringify(ok({
+            id,
+            status: status.data.status,
+            result: status.data.result.result,
+    # ... [lines 60-66 omitted]
+    if (!wait) {
+        return JSON.stringify(ok({
+    # ... [lines 69-75 omitted]
+    const deadline = Date.now() + waitTimeout * 1000;
+
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, pollInterval));
+
+        const result = await readResult(id);
+        if (result) {
+            return JSON.stringify(ok({
+    # ... [lines 84-93 omitted]
+    return JSON.stringify(err(`Timeout waiting for delegation: ${id}`));
+    # ... [27 lines omitted]
+
+// ============================================================================
+// CLI Entry Point
+// ============================================================================
+
+# ... [lines 101-116 omitted]
+
+async function main(): Promise<void> {  # L118
+    const args = process.argv.slice(2);
+
+    if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+        printUsage();
+        process.exit(0);
+    }
+
+    // Parse arguments
+    let id = '';
+    let wait = false;
+    let waitTimeout = 900;
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+
+        if (arg === '--wait') {
+            wait = true;
+        } else if (arg === '--timeout' && args[i + 1]) {
+            waitTimeout = parseInt(args[++i], 10);
+        } else if (!arg.startsWith('-')) {
+            id = arg;
+        }
+    }
+
+    if (!id) {
+        console.error('Error: Delegation ID is required');
+        printUsage();
+        process.exit(1);
+    }
+
+    const output = await delegationRead(id, { wait, waitTimeout });
+    console.log(output);
+}
+
+// Run if executed directly
+
+RAW PREVIEW (first 1200 chars)
+/**
+ * `delegation-read` command — Retrieve a delegation result.
+ *
+ * Usage:
+ *   projectpulse delegation-read <id>
+ *   projectpulse delegation-read swift-amber-falcon --wait
+ *
+ * Returns the delegation result or status if still running.
+ */
+
+import { checkStatus, readResult, ok, err } from '../lib/delegation';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface ReadOptions {
+    /** Wait for completion (blocking) */
+    wait?: boolean;
+    /** Maximum wait time in seconds (default: 900) */
+    waitTimeout?: number;
+    /** Poll interval in milliseconds (default: 2000) */
+    pollInterval?: number;
+}
+
+// ============================================================================
+// Main Function
+// ============================================================================
+
+/**
+ * Read a delegation result.
+ *
+ * @param id - Delegation ID
+ * @param options - Read options
+ * @returns JSON envelope with result or status
+ */
+export async function delegationRead(
+    id: string,
+    options: ReadOptions = {}
+): Promise<string> {
+    const { wait = 
+
+====================================================================================================
+dcp-fork/lib/messages/inject.ts
+====================================================================================================
+RAW_LEN: 13061
+BATCH_SECTION_LEN: 4102
+KEEP_RATIO: 0.314
+REDUCTION: 0.686
+MODEL_UNDERSTANDS_FILE: true
+WHY: signature and meaningful body/control-flow lines survived
+
+BATCH SECTION
+dcp-fork/lib/messages/inject.ts
+import type { SessionState, WithParts } from "../state"
+import type { Logger } from "../logger"
+import type { PluginConfig } from "../config"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
+import { formatMessageIdTag } from "../message-ids"
+import { renderNudge, renderCompressNudge } from "../prompts"
+import {
+    extractParameterKey,
+    createSyntheticTextPart,
+    createSyntheticToolPart,
+    appendMessageIdTagToToolOutput,
+    findLastToolPart,
+    isIgnoredUserMessage,
+    rejectsTextParts,
+} from "./utils"
+import { getFilePathsFromParameters, isProtected } from "../protected-file-patterns"
+import { getLastUserMessage, isMessageCompacted } from "../shared-utils"
+import { getCurrentTokenUsage } from "../strategies/utils"
+
+function parsePercentageString(value: string, total: number): number | undefined {  # L20
+    if (!value.endsWith("%")) return undefined
+    const percent = parseFloat(value.slice(0, -1))
+
+    if (isNaN(percent)) {
+        return undefined
+    }
+
+    const roundedPercent = Math.round(percent)
+    const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
+
+    return Math.round((clampedPercent / 100) * total)
+}
+
+// XML wrappers
+export const wrapPrunableTools = (content: string): string => {
+    return `<prunable-tools>
+The following tools have been invoked and are available for pruning. This list does not mandate immediate action. Consider your current goals and the resources you need before pruning valuable tool inputs or outputs. Consolidate your prunes for efficiency; it is rarely worth pruning a single tiny tool output. Keep the context free of noise.
+${content}
+</prunable-tools>`
+}
+
+export const wrapCompressContext = (messageCount: number): string => `<compress-context>
+Compress available. Conversation: ${messageCount} messages.
+Compress collapses completed task sequences or exploration phases into summaries.
+Uses ID boundaries [startId, endId, topic, summary].
+</compress-context>`
+
+export const wrapCooldownMessage = (flags: {
+    prune: boolean
+    distill: boolean
+    compress: boolean
+}): string => {
+    const enabledTools: string[] = []
+    if (flags.distill) enabledTools.push("distill")
+    if (flags.compress) enabledTools.push("compress")
+    if (flags.prune) enabledTools.push("prune")
+
+    let toolName: string
+    if (enabledTools.length === 0) {
+        toolName = "pruning tools"
+    } else if (enabledTools.length === 1) {
+        toolName = `${enabledTools[0]} tool`
+    } else {
+        const last = enabledTools.pop()
+        toolName = `${enabledTools.join(", ")} or ${last} tools`
+    }
+
+    return `<context-info>
+Context management was just performed. Do NOT use the ${toolName} again. A fresh list will be available after your next tool use.
+</context-info>`
+}
+
+const resolveContextLimit = (
+    config: PluginConfig,
+    state: SessionState,
+    providerId: string | undefined,
+    modelId: string | undefined,
+): number | undefined => {
+    const modelLimits = config.tools.settings.modelLimits
+    const contextLimit = config.tools.settings.contextLimit
+
+    if (modelLimits) {
+        const providerModelId =
+            providerId !== undefined && modelId !== undefined
+                ? `${providerId}/${modelId}`
+                : undefined
+        const limit = providerModelId !== undefined ? modelLimits[providerModelId] : undefined
+
+        if (limit !== undefined) {
+            if (typeof limit === "string" && limit.endsWith("%")) {
+                if (state.modelContextLimit === undefined) {
+                    return undefined
+                }
+                return parsePercentageString(limit, state.modelContextLimit)
+            }
+            return typeof limit === "number" ? limit : undefined
+        }
+    }
+
+    if (typeof contextLimit === "string") {
+        if (contextLimit.endsWith("%")) {
+            if (state.modelContextLimit === undefined) {
+                return undefined
+            }
+            return parsePercentageString(contextLimit, state.modelContextLimit)
+        }
+        return undefined
+    }
+
+    return contextLimit
+
+RAW PREVIEW (first 1200 chars)
+import type { SessionState, WithParts } from "../state"
+import type { Logger } from "../logger"
+import type { PluginConfig } from "../config"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
+import { formatMessageIdTag } from "../message-ids"
+import { renderNudge, renderCompressNudge } from "../prompts"
+import {
+    extractParameterKey,
+    createSyntheticTextPart,
+    createSyntheticToolPart,
+    appendMessageIdTagToToolOutput,
+    findLastToolPart,
+    isIgnoredUserMessage,
+    rejectsTextParts,
+} from "./utils"
+import { getFilePathsFromParameters, isProtected } from "../protected-file-patterns"
+import { getLastUserMessage, isMessageCompacted } from "../shared-utils"
+import { getCurrentTokenUsage } from "../strategies/utils"
+
+function parsePercentageString(value: string, total: number): number | undefined {
+    if (!value.endsWith("%")) return undefined
+    const percent = parseFloat(value.slice(0, -1))
+
+    if (isNaN(percent)) {
+        return undefined
+    }
+
+    const roundedPercent = Math.round(percent)
+    const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
+
+    return Math.round((clampedPercent / 100) * total)
+}
+
+// XML wrappers
+export const wrapPrunable
+
+====================================================================================================
+agent-hive-main/packages/pantheon-core/src/services/taskService.ts
+====================================================================================================
+RAW_LEN: 27713
+BATCH_SECTION_LEN: 19302
+KEEP_RATIO: 0.696
+REDUCTION: 0.304
+MODEL_UNDERSTANDS_FILE: true
+WHY: signature and meaningful body/control-flow lines survived
+
+BATCH SECTION
+agent-hive-main/packages/pantheon-core/src/services/taskService.ts
+import * as fs from 'fs';
+import {
+  getTasksPath,
+  getTaskPath,
+  getTaskStatusPath,
+  getTaskReportPath,
+  getTaskSpecPath,
+  getSubtasksPath,
+  getSubtaskPath,
+  getSubtaskStatusPath,
+  getSubtaskSpecPath,
+  getSubtaskReportPath,
+  getPlanPath,
+  ensureDir,
+  readJson,
+  writeJson,
+  writeJsonAtomic,
+  acquireLockSync,
+  patchJsonLockedSync,
+  deepMerge,
+  readText,
+  writeText,
+  fileExists,
+  LockOptions,
+} from '../utils/paths.js';
+import { TaskStatus, TaskStatusType, TaskOrigin, TasksSyncResult, TaskInfo, Subtask, SubtaskType, SubtaskStatus, WorkerSession } from '../types.js';
+
+/** Current schema version for TaskStatus */
+export const TASK_STATUS_SCHEMA_VERSION = 1;
+
+/** Fields that can be updated by background workers without clobbering completion-owned fields */
+export interface BackgroundPatchFields {  # L32
+  idempotencyKey?: string;
+  workerSession?: Partial<WorkerSession>;
+}
+
+/** Fields owned by the completion flow (not to be touched by background patches) */
+export interface CompletionFields {  # L38
+  status?: TaskStatusType;
+  summary?: string;
+  completedAt?: string;
+}
+
+interface ParsedTask {  # L44
+  folder: string;
+  order: number;
+  name: string;
+  description: string;
+  /** Raw dependency numbers parsed from plan. null = not specified (use implicit), [] = explicit none */
+  dependsOnNumbers: number[] | null;
+}
+
+export class TaskService {  # L53
+  constructor(private projectRoot: string) {}
+
+  sync(featureName: string): TasksSyncResult {
+    const planPath = getPlanPath(this.projectRoot, featureName);
+    const planContent = readText(planPath);
+    
+    if (!planContent) {
+      throw new Error(`No plan.md found for feature '${featureName}'`);
+    }
+
+    const planTasks = this.parseTasksFromPlan(planContent);
+    
+    // Validate dependency graph before proceeding
+    this.validateDependencyGraph(planTasks, featureName);
+    
+    const existingTasks = this.list(featureName);
+    
+    const result: TasksSyncResult = {
+      created: [],
+      removed: [],
+      kept: [],
+      manual: [],
+    };
+
+    const existingByName = new Map(existingTasks.map(t => [t.folder, t]));
+
+    for (const existing of existingTasks) {
+      if (existing.origin === 'manual') {
+        result.manual.push(existing.folder);
+        continue;
+      }
+
+      if (existing.status === 'done' || existing.status === 'in_progress') {
+        result.kept.push(existing.folder);
+        continue;
+      }
+
+      if (existing.status === 'cancelled') {
+        this.deleteTask(featureName, existing.folder);
+        result.removed.push(existing.folder);
+        continue;
+      }
+
+      const stillInPlan = planTasks.some(p => p.folder === existing.folder);
+      if (!stillInPlan) {
+        this.deleteTask(featureName, existing.folder);
+        result.removed.push(existing.folder);
+      } else {
+        result.kept.push(existing.folder);
+      }
+    }
+
+    for (const planTask of planTasks) {
+      if (!existingByName.has(planTask.folder)) {
+        this.createFromPlan(featureName, planTask, planTasks, planContent);
+        result.created.push(planTask.folder);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Create a manual task with auto-incrementing index.
+   * Folder format: "01-task-name", "02-task-name", etc.
+   * Index ensures alphabetical sort = chronological order.
+   */
+  create(featureName: string, name: string, order?: number): string {  # L121
+    const tasksPath = getTasksPath(this.projectRoot, featureName);
+    const existingFolders = this.listFolders(featureName);
+    
+    // Auto-increment: finds max existing index + 1
+    const nextOrder = order ?? this.getNextOrder(existingFolders);
+    // Zero-pad to 2 digits for correct alphabetical sorting (01, 02, ... 99)
+    const folder = `${String(nextOrder).padStart(2, '0')}-${name}`;
+    const taskPath = getTaskPath(this.projectRoot, featureName, folder);
+
+    ensureDir(taskPath);
+
+    const status: TaskStatus = {
+      status: 'pending',
+      origin: 'manual',
+      planTitle: name,
+    };
+    writeJson(getTaskStatusPath(this.projectRoot, featureName, folder), status);
+
+    return folder;
+  }
+
+  private createFromPlan(featureName: string, task: ParsedTask, allTasks: ParsedTask[], planContent: string): void {
+    const taskPath = getTaskPath(this.projectRoot, featureName, task.folder);
+    ensureDir(taskPath);
+
+    // Resolve dependencies: numbers -> folder names
+    const dependsOn = this.resolveDependencies(task, allTasks);
+
+    const status: TaskStatus = {
+      status: 'pending',
+      origin: 'plan',
+      planTitle: task.name,
+      dependsOn,
+    };
+    writeJson(getTaskStatusPath(this.projectRoot, featureName, task.folder), status);
+
+    const specContent = this.buildSpecContent({
+      featureName,
+      task,
+      dependsOn,
+      allTasks,
+      planContent,
+    });
+
+    writeText(getTaskSpecPath(this.projectRoot, featureName, task.folder), specContent);
+  }
+
+  buildSpecContent(params: {
+    featureName: string;
+    task: { folder: string; name: string; order: number; description?: string };
+    dependsOn: string[];
+    allTasks: Array<{ folder: string; name: string; order: number }>;
+    planContent?: string | null;
+    contextFiles?: Array<{ name: string; content: string }>;
+    completedTasks?: Array<{ name: string; summary: string }>;
+  }): string {
+    const { featureName, task, dependsOn, allTasks, planContent, contextFiles = [], completedTasks = [] } = params;
+
+    const getTaskType = (planSection: string | null, taskName: string): string | null => {
+      if (!planSection) {
+        return null;
+      }
+
+      const fileTypeMatches = Array.from(planSection.matchAll(/-\s*(Create|Modify|Test):/gi)).map(
+        match => match[1].toLowerCase()
+      );
+      const fileTypes = new Set(fileTypeMatches);
+
+      if (fileTypes.size === 0) {
+        return taskName.toLowerCase().includes('test') ? 'testing' : null;
+      }
+
+      if (fileTypes.size === 1) {
+        const onlyType = Array.from(fileTypes)[0];
+        if (onlyType === 'create') return 'greenfield';
+        if (onlyType === 'test') return 'testing';
+      }
+
+      if (fileTypes.has('modify')) {
+        return 'modification';
+      }
+
+      return null;
+    };
+
+    const specLines: string[] = [
+      `# Task: ${task.folder}`,
+      '',
+      `## Feature: ${featureName}`,
+      '',
+      '## Dependencies',
+      '',
+    ];
+
+    if (dependsOn.length > 0) {
+      for (const dep of dependsOn) {
+        const depTask = allTasks.find(t => t.folder === dep);
+        if (depTask) {
+          specLines.push(`- **${depTask.order}. ${depTask.name}** (${dep})`);
+        } else {
+          specLines.push(`- ${dep}`);
+        }
+      }
+    } else {
+      specLines.push('_None_');
+    }
+
+    specLines.push('', '## Plan Section', '');
+
+    const planSection = this.extractPlanSection(planContent ?? null, task);
+    if (planSection) {
+      specLines.push(planSection.trim());
+    } else {
+      specLines.push('_No plan section available._');
+    }
+
+    specLines.push('');
+
+    const taskType = getTaskType(planSection, task.name);
+    if (taskType) {
+      specLines.push('## Task Type', '', taskType, '');
+    }
+
+    if (contextFiles.length > 0) {
+      const contextCompiled = contextFiles
+        .map(f => `## ${f.name}\n\n${f.content}`)
+        .join('\n\n---\n\n');
+      specLines.push('## Context', '', contextCompiled, '');
+    }
+
+    if (completedTasks.length > 0) {
+      const completedLines = completedTasks.map(t => `- ${t.name}: ${t.summary}`);
+      specLines.push('## Completed Tasks', '', ...completedLines, '');
+    }
+
+    return specLines.join('\n');
+  }
+
+  private extractPlanSection(planContent: string | null, task: { name: string; order: number; folder: string }): string | null {
+    if (!planContent) return null;
+
+    const escapedTitle = task.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const titleRegex = new RegExp(`###\\s*\\d+\\.\\s*${escapedTitle}[\\s\\S]*?(?=###|$)`, 'i');
+    let taskMatch = planContent.match(titleRegex);
+
+    if (!taskMatch && task.order > 0) {
+      const orderRegex = new RegExp(`###\\s*${task.order}\\.\\s*[^\\n]+[\\s\\S]*?(?=###|$)`, 'i');
+      taskMatch = planContent.match(orderRegex);
+    }
+
+    return taskMatch ? taskMatch[0].trim() : null;
+  }
+
+  /**
+   * Resolve dependency numbers to folder names.
+   * - If dependsOnNumbers is null (not specified), apply implicit sequential default (N-1 for N > 1).
+   * - If dependsOnNumbers is [] (explicit "none"), return empty array.
+   * - Otherwise, map numbers to corresponding task folders.
+   */
+  private resolveDependencies(task: ParsedTask, allTasks: ParsedTask[]): string[] {
+    // Explicit "none" - no dependencies
+    if (task.dependsOnNumbers !== null && task.dependsOnNumbers.length === 0) {
+      return [];
+    }
+
+    // Explicit dependency numbers provided
+    if (task.dependsOnNumbers !== null) {
+      return task.dependsOnNumbers
+        .map(num => allTasks.find(t => t.order === num)?.folder)
+        .filter((folder): folder is string => folder !== undefined);
+    }
+
+    // Implicit sequential default: depend on previous task (N-1)
+    if (task.order === 1) {
+      return [];
+    }
+
+    const previousTask = allTasks.find(t => t.order === task.order - 1);
+    return previousTask ? [previousTask.folder] : [];
+  }
+
+  /**
+   * Validate the dependency graph for errors before creating tasks.
+   * Throws descriptive errors pointing the operator to fix plan.md.
+   * 
+   * Checks for:
+   * - Unknown task numbers in dependencies
+   * - Self-dependencies
+   * - Cycles (using DFS topological sort)
+   */
+  private validateDependencyGraph(tasks: ParsedTask[], featureName: string): void {
+    const taskNumbers = new Set(tasks.map(t => t.order));
+    
+    // Validate each task's dependencies
+    for (const task of tasks) {
+      if (task.dependsOnNumbers === null) {
+        // Implicit dependencies - no validation needed
+        continue;
+      }
+      
+      for (const depNum of task.dependsOnNumbers) {
+        // Check for self-dependency
+        if (depNum === task.order) {
+          throw new Error(
+            `Invalid dependency graph in plan.md: Self-dependency detected for task ${task.order} ("${task.name}"). ` +
+            `A task cannot depend on itself. Please fix the "Depends on:" line in plan.md.`
+          );
+        }
+        
+        // Check for unknown task number
+        if (!taskNumbers.has(depNum)) {
+          throw new Error(
+            `Invalid dependency graph in plan.md: Unknown task number ${depNum} referenced in dependencies for task ${task.order} ("${task.name}"). ` +
+            `Available task numbers are: ${Array.from(taskNumbers).sort((a, b) => a - b).join(', ')}. ` +
+            `Please fix the "Depends on:" line in plan.md.`
+          );
+        }
+      }
+    }
+    
+    // Check for cycles using DFS
+    this.detectCycles(tasks);
+  }
+
+  /**
+   * Detect cycles in the dependency graph using DFS.
+   * Throws a descriptive error if a cycle is found.
+   */
+  private detectCycles(tasks: ParsedTask[]): void {
+    // Build adjacency list: task order -> [dependency orders]
+    const taskByOrder = new Map(tasks.map(t => [t.order, t]));
+    
+    // Build dependency graph with resolved implicit dependencies
+    const getDependencies = (task: ParsedTask): number[] => {
+      if (task.dependsOnNumbers !== null) {
+        return task.dependsOnNumbers;
+      }
+      // Implicit sequential dependency
+      if (task.order === 1) {
+        return [];
+      }
+      return [task.order - 1];
+    };
+    
+    // Track visited state: 0 = unvisited, 1 = in current path, 2 = fully processed
+    const visited = new Map<number, number>();
+    const path: number[] = [];
+    
+    const dfs = (taskOrder: number): void => {
+      const state = visited.get(taskOrder);
+      
+      if (state === 2) {
+        // Already fully processed, no cycle through here
+        return;
+      }
+      
+      if (state === 1) {
+        // Found a cycle! Build the cycle path for the error message
+        const cycleStart = path.indexOf(taskOrder);
+        const cyclePath = [...path.slice(cycleStart), taskOrder];
+        const cycleDesc = cyclePath.join(' -> ');
+        
+        throw new Error(
+          `Invalid dependency graph in plan.md: Cycle detected in task dependencies: ${cycleDesc}. ` +
+          `Tasks cannot have circular dependencies. Please fix the "Depends on:" lines in plan.md.`
+        );
+      }
+      
+      // Mark as in current path
+      visited.set(taskOrder, 1);
+      path.push(taskOrder);
+      
+      const task = taskByOrder.get(taskOrder);
+      if (task) {
+        const deps = getDependencies(task);
+        for (const depOrder of deps) {
+          dfs(depOrder);
+        }
+      }
+      
+      // Mark as fully processed
+      path.pop();
+      visited.set(taskOrder, 2);
+    };
+    
+    // Run DFS from each node
+    for (const task of tasks) {
+      if (!visited.has(task.order)) {
+        dfs(task.order);
+      }
+    }
+  }
+
+  writeSpec(featureName: string, taskFolder: string, content: string): string {
+    const specPath = getTaskSpecPath(this.projectRoot, featureName, taskFolder);
+    writeText(specPath, content);
+    return specPath;
+  }
+
+  /**
+   * Update task status with locked atomic write.
+   * Uses file locking to prevent race conditions between concurrent updates.
+   * 
+   * @param featureName - Feature name
+   * @param taskFolder - Task folder name
+   * @param updates - Fields to update (status, summary, baseCommit)
+   * @param lockOptions - Optional lock configuration
+   * @returns Updated TaskStatus
+   */
+  update(  # L431
+    featureName: string,
+    taskFolder: string,
+    updates: Partial<Pick<TaskStatus, 'status' | 'summary' | 'baseCommit'>>,
+    lockOptions?: LockOptions
+  ): TaskStatus {
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+
+    // Guard before lock acquisition to avoid creating missing task folders
+    // via lock-file parent directory creation on error paths.
+    if (!fileExists(statusPath)) {
+      throw new Error(`Task '${taskFolder}' not found`);
+    }
+
+    const release = acquireLockSync(statusPath, lockOptions);
+
+    try {
+      const current = readJson<TaskStatus>(statusPath);
+      if (!current) {
+        throw new Error(`Task '${taskFolder}' not found`);
+      }
+
+      const updated: TaskStatus = {
+        ...current,
+        ...updates,
+        schemaVersion: TASK_STATUS_SCHEMA_VERSION,
+      };
+
+      if (updates.status === 'in_progress' && !current.startedAt) {
+        updated.startedAt = new Date().toISOString();
+      }
+      if (updates.status === 'done' && !current.completedAt) {
+        updated.completedAt = new Date().toISOString();
+      }
+
+      // Lock-first read-modify-write to avoid TOCTOU races.
+      writeJsonAtomic(statusPath, updated);
+      return updated;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Patch only background-owned fields without clobbering completion-owned fields.
+   * Safe for concurrent use by background workers.
+   * 
+   * Uses deep merge for workerSession to allow partial updates like:
+   * - patchBackgroundFields(..., { workerSession: { lastHeartbeatAt: '...' } })
+   *   will update only lastHeartbeatAt, preserving other workerSession fields.
+   * 
+   * @param featureName - Feature name
+   * @param taskFolder - Task folder name
+   * @param patch - Background-owned fields to update
+   * @param lockOptions - Optional lock configuration
+   * @returns Updated TaskStatus
+   */
+  patchBackgroundFields(
+    featureName: string,
+    taskFolder: string,
+    patch: BackgroundPatchFields,
+    lockOptions?: LockOptions
+  ): TaskStatus {
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+    
+    // Build the patch object, only including fields that are defined
+    const safePatch: Partial<TaskStatus> = {
+      schemaVersion: TASK_STATUS_SCHEMA_VERSION,
+    };
+    
+    if (patch.idempotencyKey !== undefined) {
+      safePatch.idempotencyKey = patch.idempotencyKey;
+    }
+    
+    if (patch.workerSession !== undefined) {
+      safePatch.workerSession = patch.workerSession as WorkerSession;
+    }
+    
+    // Use patchJsonLockedSync which does deep merge
+    return patchJsonLockedSync<TaskStatus>(statusPath, safePatch, lockOptions);
+  }
+
+  /**
+   * Get raw TaskStatus including all fields (for internal use or debugging).
+   */
+  getRawStatus(featureName: string, taskFolder: string): TaskStatus | null {
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+    return readJson<TaskStatus>(statusPath);
+  }
+
+  get(featureName: string, taskFolder: string): TaskInfo | null {  # L521
+    const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
+    const status = readJson<TaskStatus>(statusPath);
+    
+    if (!status) return null;
+
+    return {
+      folder: taskFolder,
+      name: taskFolder.replace(/^\d+-/, ''),
+      status: status.status,
+      origin: status.origin,
+      planTitle: status.planTitle,
+      summary: status.summary,
+    };
+  }
+
+  list(featureName: string): TaskInfo[] {
+    const folders = this.listFolders(featureName);
+    return folders
+      .map(folder => this.get(featureName, folder))
+      .filter((t): t is TaskInfo => t !== null);
+  }
+
+  writeReport(featureName: string, taskFolder: string, report: string): string {
+    const reportPath = getTaskReportPath(this.projectRoot, featureName, taskFolder);
+    writeText(reportPath, report);
+    return reportPath;
+  }
+
+  private listFolders(featureName: string): string[] {
+    const tasksPath = getTasksPath(this.projectRoot, featureName);
+    if (!fileExists(tasksPath)) return [];
+
+    return fs.readdirSync(tasksPath, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name)
+      .sort();
+  }
+
+  private deleteTask(featureName: string, taskFolder: string): void {
+    const taskPath = getTaskPath(this.projectRoot, featureName, taskFolder);
+    if (fileExists(taskPath)) {
+      fs.rmSync(taskPath, { recursive: true });
+    }
+  }
+
+  private getNextOrder(existingFolders: string[]): number {
+    if (existingFolders.length === 0) return 1;
+    
+    const orders = existingFolders
+      .map(f => parseInt(f.split('-')[0], 10))
+      .filter(n => !isNaN(n));
+    
+    return Math.max(...orders, 0) + 1;
+  }
+
+  private parseTasksFromPlan(content: string): ParsedTask[] {
+    const tasks: ParsedTask[] = [];
+    const lines = content.split('\n');
+    
+    let currentTask: ParsedTask | null = null;
+    let descriptionLines: string[] = [];
+    
+    // Regex to match "Depends on:" or "**Depends on**:" with optional markdown
+    // Strips markdown formatting (**, *, etc.) and captures the value
+    const dependsOnRegex = /^\s*\*{0,2}Depends\s+on\*{0,2}\s*:\s*(.+)$/i;
+    
+    for (const line of lines) {
+      // Check for task header: ### N. Task Name
+      const taskMatch = line.match(/^###\s+(\d+)\.\s+(.+)$/);
+      
+      if (taskMatch) {
+        // Save previous task if exists
+        if (currentTask) {
+          currentTask.description = descriptionLines.join('\n').trim();
+          tasks.push(currentTask);
+        }
+        
+        const order = parseInt(taskMatch[1], 10);
+        const rawName = taskMatch[2].trim();
+
+RAW PREVIEW (first 1200 chars)
+import * as fs from 'fs';
+import {
+  getTasksPath,
+  getTaskPath,
+  getTaskStatusPath,
+  getTaskReportPath,
+  getTaskSpecPath,
+  getSubtasksPath,
+  getSubtaskPath,
+  getSubtaskStatusPath,
+  getSubtaskSpecPath,
+  getSubtaskReportPath,
+  getPlanPath,
+  ensureDir,
+  readJson,
+  writeJson,
+  writeJsonAtomic,
+  acquireLockSync,
+  patchJsonLockedSync,
+  deepMerge,
+  readText,
+  writeText,
+  fileExists,
+  LockOptions,
+} from '../utils/paths.js';
+import { TaskStatus, TaskStatusType, TaskOrigin, TasksSyncResult, TaskInfo, Subtask, SubtaskType, SubtaskStatus, WorkerSession } from '../types.js';
+
+/** Current schema version for TaskStatus */
+export const TASK_STATUS_SCHEMA_VERSION = 1;
+
+/** Fields that can be updated by background workers without clobbering completion-owned fields */
+export interface BackgroundPatchFields {
+  idempotencyKey?: string;
+  workerSession?: Partial<WorkerSession>;
+}
+
+/** Fields owned by the completion flow (not to be touched by background patches) */
+export interface CompletionFields {
+  status?: TaskStatusType;
+  summary?: string;
+  completedAt?: string;
+}
+
+interface ParsedTask {
+  folder: string;
+  order: number;
+  name: string;
+  description: string;
+  /** Raw de
+
+====================================================================================================
+SUMMARY
+====================================================================================================
+
+Enhanced-Perplexica/src/lib/utils.ts
+  raw=1060 compressed=717 keep_ratio=0.676 reduction=0.324
+  understands=true :: signature and meaningful body/control-flow lines survived
+
+search-pipeline/pipeline/query_expansion.py
+  raw=2187 compressed=1486 keep_ratio=0.679 reduction=0.321
+  understands=false :: too little body logic survived to trust a model summary
+
+ProjectPulse/ProjectPulse/src/commands/delegation-read.ts
+  raw=4451 compressed=3111 keep_ratio=0.699 reduction=0.301
+  understands=true :: signature and meaningful body/control-flow lines survived
+
+dcp-fork/lib/messages/inject.ts
+  raw=13061 compressed=4102 keep_ratio=0.314 reduction=0.686
+  understands=true :: signature and meaningful body/control-flow lines survived
+
+agent-hive-main/packages/pantheon-core/src/services/taskService.ts
+  raw=27713 compressed=19302 keep_ratio=0.696 reduction=0.304
+  understands=true :: signature and meaningful body/control-flow lines survived
+

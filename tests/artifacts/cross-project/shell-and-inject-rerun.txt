@@ -1,0 +1,350 @@
+Shell and inject rerun
+Generated: 2026-04-14T10:42:20.237Z
+
+============================================================
+FILE: /home/tanner/Projects/Zenith-AI/.claude/hooks/context-inject.sh
+RAW_CHARS: 4843
+TARGET_BUDGET: 3390
+FINAL_CHARS: 1902
+KEPT_PERCENT: 39.3%
+REDUCED_PERCENT: 60.7%
+HAS_OMISSION_MARKERS: false
+HAS_LINE_MARKERS: true
+
+--- COMPRESSED OUTPUT ---
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+# Hook: UserPromptSubmit — Obsidianite Design DNA Injection
+# CLI:  Claude Code
+# ═══════════════════════════════════════════════════════════════
+# Reads the user's prompt from stdin JSON, scans for UI keywords.
+# If detected AND cooldown has elapsed: injects verbatim Design DNA.
+# If no match or cooldown active: exits silently.
+#
+# stdin: { "prompt": "...", "session_id": "...", ... }
+# stdout → injected into Claude's context
+# stderr → shown to human only
+
+INPUT=$(cat)  # L14
+
+json_field_or_empty() {  # L16
+  local input="$1"
+  local filter="$2"
+
+  printf '%s' "$input" | jq -r "$filter" 2>/dev/null || printf ''
+}
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)  # L23
+RUNTIME_DIR="$SCRIPT_DIR/.runtime"  # L24
+COOLDOWN_FILE="$RUNTIME_DIR/obsidianite-dna-cooldown"  # L25
+
+PROMPT=$(json_field_or_empty "$INPUT" '.prompt // ""')  # L27
+
+if [[ -z "$PROMPT" ]]; then
+  exit 0
+fi
+
+# Keyword gate — only inject when user is talking about UI work
+if ! echo "$PROMPT" | grep -qiE 'depth|layer|color|colour|glow|theme|design|component|view|layout|style|css|tailwind|border|shadow|gradient|opacity|hover|animation|accent|neon|bg-depth|token|ui|card|panel|modal|button|input|badge|tab|icon|typography|font|polish|migrate'; then
+  exit 0
+fi
+
+# Cooldown — don't re-inject within 600 seconds (10 minutes)
+NOW=$(date +%s)  # L39
+
+mkdir -p "$RUNTIME_DIR" 2>/dev/null || true
+
+if [[ -f "$COOLDOWN_FILE" ]]; then
+  LAST=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)  # L44
+  ELAPSED=$((NOW - LAST))  # L45
+  if [[ $ELAPSED -lt 600 ]]; then
+    echo "DNA cooldown: ${ELAPSED}s / 600s elapsed — skipping injection" >&2
+    exit 0
+  fi
+fi
+
+printf '%s\n' "$NOW" > "$COOLDOWN_FILE" 2>/dev/null || true
+echo "💎 Design DNA injected (next eligible in 10 min)" >&2
+
+# ── Verbatim Design DNA ────────────────────────────────────────
+
+============================================================
+FILE: /home/tanner/Projects/dcp-fork/lib/messages/inject.ts
+RAW_CHARS: 13061
+TARGET_BUDGET: 9142
+FINAL_CHARS: 9127
+KEPT_PERCENT: 69.9%
+REDUCED_PERCENT: 30.1%
+HAS_OMISSION_MARKERS: true
+HAS_LINE_MARKERS: true
+
+--- COMPRESSED OUTPUT ---
+import type { SessionState, WithParts } from "../state"
+import type { Logger } from "../logger"
+import type { PluginConfig } from "../config"
+import type { UserMessage } from "@opencode-ai/sdk/v2"
+import { formatMessageIdTag } from "../message-ids"
+import { renderNudge, renderCompressNudge } from "../prompts"
+import {
+    extractParameterKey,
+    createSyntheticTextPart,
+    createSyntheticToolPart,
+    appendMessageIdTagToToolOutput,
+    findLastToolPart,
+    isIgnoredUserMessage,
+    rejectsTextParts,
+} from "./utils"
+import { getFilePathsFromParameters, isProtected } from "../protected-file-patterns"
+import { getLastUserMessage, isMessageCompacted } from "../shared-utils"
+import { getCurrentTokenUsage } from "../strategies/utils"
+
+function parsePercentageString(value: string, total: number): number | undefined {  # L20
+    if (!value.endsWith("%")) return undefined
+    const percent = parseFloat(value.slice(0, -1))
+
+    if (isNaN(percent)) {
+        return undefined
+    }
+
+    const roundedPercent = Math.round(percent)
+    const clampedPercent = Math.max(0, Math.min(100, roundedPercent))
+
+    return Math.round((clampedPercent / 100) * total)
+}
+
+// XML wrappers
+export const wrapPrunableTools = (content: string): string => {  # L35
+    return `<prunable-tools>
+The following tools have been invoked and are available for pruning. This list does not mandate immediate action. Consider your current goals and the resources you need before pruning valuable tool inputs or outputs. Consolidate your prunes for efficiency; it is rarely worth pruning a single tiny tool output. Keep the context free of noise.
+${content}
+</prunable-tools>`
+}
+
+export const wrapCompressContext = (messageCount: number): string => `<compress-context>  # L42
+Compress available. Conversation: ${messageCount} messages.
+Compress collapses completed task sequences or exploration phases into summaries.
+Uses ID boundaries [startId, endId, topic, summary].
+</compress-context>`
+
+export const wrapCooldownMessage = (flags: {  # L48
+    prune: boolean
+    distill: boolean
+    compress: boolean
+}): string => {
+    const enabledTools: string[] = []
+    if (flags.distill) enabledTools.push("distill")
+    if (flags.compress) enabledTools.push("compress")
+    if (flags.prune) enabledTools.push("prune")
+
+    let toolName: string
+    if (enabledTools.length === 0) {
+        toolName = "pruning tools"
+    } else if (enabledTools.length === 1) {
+        toolName = `${enabledTools[0]} tool`
+    } else {
+        const last = enabledTools.pop()
+        toolName = `${enabledTools.join(", ")} or ${last} tools`
+    }
+
+    return `<context-info>
+Context management was just performed. Do NOT use the ${toolName} again. A fresh list will be available after your next tool use.
+</context-info>`
+}
+
+const resolveContextLimit = (  # L73
+    config: PluginConfig,
+    state: SessionState,
+    providerId: string | undefined,
+    modelId: string | undefined,
+): number | undefined => {
+    const modelLimits = config.tools.settings.modelLimits
+    const contextLimit = config.tools.settings.contextLimit
+
+    if (modelLimits) {
+        const providerModelId =
+            providerId !== undefined && modelId !== undefined
+                ? `${providerId}/${modelId}`
+                : undefined
+        const limit = providerModelId !== undefined ? modelLimits[providerModelId] : undefined
+
+        if (limit !== undefined) {
+            if (typeof limit === "string" && limit.endsWith("%")) {
+                if (state.modelContextLimit === undefined) {
+                    return undefined
+                }
+                return parsePercentageString(limit, state.modelContextLimit)
+            }
+            return typeof limit === "number" ? limit : undefined
+        }
+    }
+
+    if (typeof contextLimit === "string") {
+        if (contextLimit.endsWith("%")) {
+            if (state.modelContextLimit === undefined) {
+                return undefined
+            }
+            return parsePercentageString(contextLimit, state.modelContextLimit)
+        }
+        return undefined
+    }
+
+    return contextLimit
+}
+
+const shouldInjectCompressNudge = (  # L113
+    config: PluginConfig,
+    state: SessionState,
+    messages: WithParts[],
+    providerId: string | undefined,
+    modelId: string | undefined,
+): boolean => {
+    if (config.tools.compress.permission === "deny") {
+        return false
+    }
+
+    const lastAssistant = messages.findLast((msg) => msg.info.role === "assistant")
+    if (lastAssistant) {
+        const parts = Array.isArray(lastAssistant.parts) ? lastAssistant.parts : []
+        const hasDcpTool = parts.some(
+            (part) =>
+                part.type === "tool" &&
+                part.state.status === "completed" &&
+                (part.tool === "compress" || part.tool === "prune" || part.tool === "distill"),
+        )
+        if (hasDcpTool) {
+            return false
+        }
+    }
+
+    const contextLimit = resolveContextLimit(config, state, providerId, modelId)
+    if (contextLimit === undefined) {
+        return false
+    }
+
+    const currentTokens = getCurrentTokenUsage(messages)
+    return currentTokens > contextLimit
+}
+
+const getNudgeString = (config: PluginConfig): string => {  # L147
+    const flags = {
+        prune: config.tools.prune.permission !== "deny",
+        distill: config.tools.distill.permission !== "deny",
+        compress: config.tools.compress.permission !== "deny",
+        manual: false,
+    }
+
+    if (!flags.prune && !flags.distill && !flags.compress) {
+        return ""
+    }
+
+    return renderNudge(flags)
+}
+
+const getCooldownMessage = (config: PluginConfig): string => {  # L162
+    return wrapCooldownMessage({
+        prune: config.tools.prune.permission !== "deny",
+        distill: config.tools.distill.permission !== "deny",
+        compress: config.tools.compress.permission !== "deny",
+    })
+}
+
+const buildCompressContext = (state: SessionState, messages: WithParts[]): string => {  # L170
+    const messageCount = messages.filter((msg) => !isMessageCompacted(state, msg)).length
+    return wrapCompressContext(messageCount)
+}
+
+export const buildPrunableToolsList = (  # L175
+    state: SessionState,
+    config: PluginConfig,
+    logger: Logger,
+): string => {
+    const lines: string[] = []
+    const toolIdList = state.toolIdList
+
+    state.toolParameters.forEach((toolParameterEntry, toolCallId) => {
+        if (state.prune.tools.has(toolCallId)) {
+            return
+        }
+
+        const allProtectedTools = config.tools.settings.protectedTools
+        if (allProtectedTools.includes(toolParameterEntry.tool)) {
+            return
+        }
+
+        const filePaths = getFilePathsFromParameters(
+            toolParameterEntry.tool,
+            toolParameterEntry.parameters,
+        )
+        if (isProtected(filePaths, config.protectedFilePatterns)) {
+            return
+        }
+
+        const numericId = toolIdList.indexOf(toolCallId)
+        if (numericId === -1) {
+            logger.warn(`Tool in cache but not in toolIdList - possible stale entry`, {
+                toolCallId,
+                tool: toolParameterEntry.tool,
+            })
+            return
+        }
+        const paramKey = extractParameterKey(toolParameterEntry.tool, toolParameterEntry.parameters)
+        const description = paramKey
+            ? `${toolParameterEntry.tool}, ${paramKey}`
+            : toolParameterEntry.tool
+        const tokenSuffix =
+            toolParameterEntry.tokenCount !== undefined
+                ? ` (~${toolParameterEntry.tokenCount} tokens)`
+                : ""
+        lines.push(`${numericId}: ${description}${tokenSuffix}`)
+        logger.debug(
+            `Prunable tool found - ID: ${numericId}, Tool: ${toolParameterEntry.tool}, Call ID: ${toolCallId}`,
+        )
+    })
+
+    if (lines.length === 0) {
+        return ""
+    }
+
+    return wrapPrunableTools(lines.join("\n"))
+}
+
+export const insertPruneToolContext = (  # L230
+    state: SessionState,
+    config: PluginConfig,
+    logger: Logger,
+    messages: WithParts[],
+): void => {
+    if (state.manualMode || state.pendingManualTrigger) {
+        return
+    }
+
+    const pruneEnabled = config.tools.prune.permission !== "deny"
+    const distillEnabled = config.tools.distill.permission !== "deny"
+    const compressEnabled = config.tools.compress.permission !== "deny"
+
+    if (!pruneEnabled && !distillEnabled && !compressEnabled) {
+        return
+    }
+
+    const pruneOrDistillEnabled = pruneEnabled || distillEnabled
+    # ... [lines 249-257 omitted]
+    if (state.lastToolPrune) {
+        # ... [lines 259-261 omitted]
+        if (pruneOrDistillEnabled) {
+            if (prunableToolsList) {
+        # ... [lines 265-269 omitted]
+        if (compressEnabled) {
+        # ... [lines 271-275 omitted]
+        if (shouldInjectCompressNudge(config, state, messages, providerId, modelId)) {
+        } else if (
+    # ... [lines 280-287 omitted]
+    if (contentParts.length === 0) {
+        return
+    # ... [lines 290-293 omitted]
+    if (!lastUserMessage) {
+        return
+    # ... [lines 296-301 omitted]
+    if (!lastNonIgnoredMessage) {
+        return
+
+

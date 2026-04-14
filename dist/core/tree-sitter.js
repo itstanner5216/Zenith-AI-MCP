@@ -20,7 +20,7 @@
 // Parsed symbols are cached by source hash (LRU, 100 entries).
 // ---------------------------------------------------------------------------
 
-import { Parser } from 'web-tree-sitter';
+import { Parser, Language, Query } from 'web-tree-sitter';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -33,9 +33,9 @@ const __dirname = path.dirname(__filename);
 // Paths
 // ---------------------------------------------------------------------------
 
-const GRAMMARS_DIR = path.join(__dirname, 'grammars', 'grammars');
-const QUERIES_DIR  = path.join(__dirname, 'grammars', 'queries');
-const TS_WASM_PATH = path.join(__dirname, 'grammars', 'tree-sitter.wasm');
+const GRAMMARS_DIR = path.join(__dirname, '..', 'grammars', 'grammars');
+const QUERIES_DIR  = path.join(__dirname, '..', 'grammars', 'queries');
+const TS_WASM_PATH = path.join(__dirname, '..', 'grammars', 'tree-sitter.wasm');
 
 // ---------------------------------------------------------------------------
 // Extension → language mapping
@@ -168,7 +168,7 @@ async function loadLanguage(langName) {
     }
 
     try {
-        const language = await Parser.Language.load(wasmPath);
+        const language = await Language.load(wasmPath);
         _languageCache.set(langName, language);
         return language;
     } catch (err) {
@@ -219,7 +219,7 @@ async function getCompiledQuery(langName) {
     }
 
     try {
-        const query = language.query(queryString);
+        const query = new Query(language, queryString);
         _compiledQueryCache.set(langName, query);
         return query;
     } catch (err) {
@@ -403,6 +403,167 @@ function applyFilters(symbols, options) {
  */
 export async function getDefinitions(source, langName, options = {}) {
     return getSymbols(source, langName, { ...options, kindFilter: 'def' });
+}
+
+const COMPRESSION_ANCHOR_RULES = {
+    javascript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    typescript: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    tsx: {
+        return_statement: { kind: 'return', priority: 400 },
+        throw_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        switch_statement: { kind: 'switch', priority: 300 },
+        for_statement: { kind: 'loop', priority: 260 },
+        for_in_statement: { kind: 'loop', priority: 250 },
+        while_statement: { kind: 'loop', priority: 250 },
+        do_statement: { kind: 'loop', priority: 240 },
+        try_statement: { kind: 'try', priority: 280 },
+        catch_clause: { kind: 'catch', priority: 270 },
+        await_expression: { kind: 'await', priority: 180 },
+        call_expression: { kind: 'call', priority: 140 },
+    },
+    python: {
+        return_statement: { kind: 'return', priority: 400 },
+        raise_statement: { kind: 'throw', priority: 380 },
+        if_statement: { kind: 'if', priority: 320 },
+        elif_clause: { kind: 'if', priority: 310 },
+        for_statement: { kind: 'loop', priority: 260 },
+        while_statement: { kind: 'loop', priority: 250 },
+        try_statement: { kind: 'try', priority: 280 },
+        except_clause: { kind: 'catch', priority: 270 },
+        with_statement: { kind: 'with', priority: 220 },
+        await: { kind: 'await', priority: 180 },
+        call: { kind: 'call', priority: 140 },
+    },
+};
+
+function maybeAddAnchor(block, anchor) {
+    if (!block.anchors) block.anchors = [];
+
+    const existing = block.anchors.find(
+        item => item.startLine === anchor.startLine && item.endLine === anchor.endLine
+    );
+
+    if (existing) {
+        if (anchor.priority > existing.priority) {
+            existing.priority = anchor.priority;
+            existing.kind = anchor.kind;
+        }
+        return;
+    }
+
+    block.anchors.push(anchor);
+}
+
+function assignAnchorToInnermostBlock(blocks, startLine, endLine, kind, priority) {
+    let target = null;
+
+    for (const block of blocks) {
+        if (block.startLine > startLine || block.endLine < endLine) continue;
+        if (!target || (block.endLine - block.startLine) < (target.endLine - target.startLine)) {
+            target = block;
+        }
+    }
+
+    if (!target || startLine <= target.startLine) return;
+
+    maybeAddAnchor(target, { startLine, endLine, kind, priority });
+}
+
+function shouldCaptureAnchor(node, parent, rule) {
+    if (node.type === 'call_expression' && parent && (
+        parent.type === 'call_expression' ||
+        parent.type === 'await_expression' ||
+        parent.type === 'expression_statement'
+    )) {
+        return false;
+    }
+
+    if (node.type === 'call' && parent && parent.type === 'await') {
+        return false;
+    }
+
+    return !!rule;
+}
+
+export async function getCompressionStructure(source, langName) {
+    const defs = await getDefinitions(source, langName);
+    if (!defs || defs.length === 0) return defs;
+
+    const blocks = defs.map(d => ({
+        type: d.type,
+        name: d.name,
+        startLine: d.line - 1,
+        endLine: d.endLine - 1,
+        exported: false,
+        anchors: [],
+    }));
+
+    const rules = COMPRESSION_ANCHOR_RULES[langName];
+    if (!rules) return blocks;
+
+    const language = await loadLanguage(langName);
+    if (!language) return blocks;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        function walk(node, parent = null) {
+            const rule = rules[node.type];
+            if (shouldCaptureAnchor(node, parent, rule)) {
+                const startLine = node.startPosition.row;
+                const rawEndLine = node.endPosition.row;
+                const endLine = rawEndLine <= startLine + 1 ? rawEndLine : startLine;
+                assignAnchorToInnermostBlock(blocks, startLine, endLine, rule.kind, rule.priority);
+            }
+
+            for (let i = 0; i < node.childCount; i++) {
+                walk(node.child(i), node);
+            }
+        }
+
+        walk(tree.rootNode, null);
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
+
+    for (const block of blocks) {
+        if (block.anchors.length > 0) {
+            block.anchors.sort((a, b) => b.priority - a.priority || a.startLine - b.startLine);
+            block.anchors = block.anchors.slice(0, 16);
+        }
+    }
+
+    return blocks;
 }
 
 /**

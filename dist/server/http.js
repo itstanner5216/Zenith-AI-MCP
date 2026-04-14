@@ -3,7 +3,7 @@
 // http-server.js — Native HTTP entrypoint for MCP Streamable HTTP + legacy SSE
 //
 // Usage:
-//   node dist/http-server.js [allowed-directory ...] [--port=3100] [--host=0.0.0.0]
+//   node dist/server/http.js [allowed-directory ...] [--port=3100] [--host=0.0.0.0]
 //
 // Supports:
 //   POST /mcp          — Streamable HTTP (initialize + messages)
@@ -19,14 +19,14 @@ import express from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { createFilesystemContext } from './lib.js';
+import { createFilesystemContext } from '../core/lib.js';
 import {
     createFilesystemServer,
     attachRootsHandlers,
     resolveInitialAllowedDirectories,
     validateDirectories,
-} from './index.js';
-import { ripgrepAvailable } from './shared.js';
+} from '../core/server.js';
+import { ripgrepAvailable } from '../core/shared.js';
 
 // ---------------------------------------------------------------------------
 // Parse CLI args

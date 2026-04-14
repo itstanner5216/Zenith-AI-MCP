@@ -1,6 +1,6 @@
 import { z } from "zod";
 import path from "path";
-import { readFileAsBase64Stream } from '../shared.js';
+import { readFileAsBase64Stream } from '../core/shared.js';
 
 const MIME_TYPES = {
     ".png": "image/png",

@@ -13,19 +13,19 @@
   },
   "type": "module",
   "bin": {
-    "zenith-mcp": "dist/index.js",
-    "zenith-mcp-http": "dist/http-server.js"
+    "zenith-mcp": "dist/cli/stdio.js",
+    "zenith-mcp-http": "dist/server/http.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "shx chmod +x dist/*.js",
+    "build": "shx chmod +x dist/cli/*.js dist/server/*.js",
     "prepare": "npm run build",
     "watch": "node -e \"console.log('Zenith-MCP uses a dist-only layout right now; no TypeScript watch step is configured.')\"",
     "test": "vitest run --coverage",
-    "start": "node dist/index.js",
-    "start:http": "node dist/http-server.js"
+    "start": "node dist/cli/stdio.js",
+    "start:http": "node dist/server/http.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
-import { formatSize } from '../lib.js';
+import { formatSize } from '../core/lib.js';
 
 const CAP = 250;
 

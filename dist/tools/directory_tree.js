@@ -2,8 +2,8 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
-import { DEFAULT_EXCLUDES } from '../shared.js';
-import { isSupported, getFileSymbolSummary, getFileSymbols } from '../tree-sitter.js';
+import { DEFAULT_EXCLUDES } from '../core/shared.js';
+import { isSupported, getFileSymbolSummary, getFileSymbols } from '../core/tree-sitter.js';
 
 export function register(server, ctx) {
     server.registerTool("directory_tree", {

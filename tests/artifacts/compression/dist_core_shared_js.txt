@@ -1,0 +1,697 @@
+FILE: dist/core/shared.js
+RAW_CHARS: 18667
+TARGET_70_PERCENT_BUDGET: 13066
+BRIDGE_CHARS: 13046
+FINAL_TOOL_CHARS: 13046
+BRIDGE_ACCEPTED: true
+FINAL_MODE: tree-sitter structured output accepted
+BRIDGE_HAS_STRUCTURED_MARKERS: true
+FINAL_HAS_STRUCTURED_MARKERS: true
+FINAL_LOOKS_HARD_CUT: true
+
+=== FINAL TOOL OUTPUT ===
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
+    }
+    return 400_000;
+})();
+export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
+
+export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
+    'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export const SENSITIVE_PATTERNS = (process.env.SENSITIVE_PATTERNS ||
+    '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export function isSensitive(filePath) {  # L53
+    const rel = path.relative(os.homedir(), filePath);
+    return SENSITIVE_PATTERNS.some(pat =>
+        minimatch(rel, pat, { dot: true, nocase: true }) ||
+        minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BM.X-T Engine — entropy-weighted TAAT search, zero deps
+// ---------------------------------------------------------------------------
+
+const WORD_RE = /[a-z0-9_]+/g;
+
+export class BM25Index {  # L67
+    constructor(k1 = 1.2, b = 0.75, beta = 0.6) {
+        this.k1 = k1;
+        this.b = b;
+        this.beta = beta;
+        this._postingLists = new Map(); // term -> Map<docId, tf>
+        this._docLengths = new Map();   // docId -> tokenCount
+        this._avgDocLength = 0;
+        this._idfCache = new Map();     // term -> idf
+        this._termEntropy = new Map();  // term -> normalized entropy [0,1]
+        this._termTotalFreqs = new Map(); // term -> total tf across corpus
+        this._totalDocs = 0;
+    }
+
+    static tokenize(text) {
+        if (!text) return [];
+        const tokens = text.toLowerCase().match(WORD_RE);
+        if (!tokens) return [];
+        return tokens.filter(t => t.length > 1 || t === 'a' || t === 'i');
+    }
+
+    /**
+     * Build index from array of { id: string, text: string }.
+     */
+    build(docs) {  # L91
+        this._postingLists.clear();
+        this._docLengths.clear();
+        this._idfCache.clear();
+        this._termEntropy.clear();
+        this._termTotalFreqs.clear();
+
+        let totalLength = 0;
+
+        // Pass 1: tokenize, build inverted index
+        for (const doc of docs) {
+            if (!doc.id) continue;
+            const tokens = BM25Index.tokenize(doc.text);
+            this._docLengths.set(doc.id, tokens.length);
+            totalLength += tokens.length;
+
+            const tfMap = new Map();
+            for (const token of tokens) {
+                tfMap.set(token, (tfMap.get(token) || 0) + 1);
+            }
+
+            for (const [term, count] of tfMap) {
+                if (!this._postingLists.has(term)) {
+                    this._postingLists.set(term, new Map());
+                }
+                this._postingLists.get(term).set(doc.id, count);
+                this._termTotalFreqs.set(term, (this._termTotalFreqs.get(term) || 0) + count);
+            }
+        }
+
+        this._totalDocs = this._docLengths.size;
+        if (this._totalDocs === 0) return;
+        this._avgDocLength = totalLength / this._totalDocs;
+
+        // Pass 2: IDF
+        for (const [term, posting] of this._postingLists) {
+            const df = posting.size;
+            this._idfCache.set(term, Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1));
+        }
+
+        // Pass 3: per-term entropy
+        for (const [term, posting] of this._postingLists) {
+            const totalTf = this._termTotalFreqs.get(term);
+            const nDocs = posting.size;
+            if (totalTf === 0 || nDocs <= 1) {
+                this._termEntropy.set(term, 0);
+                continue;
+            }
+            let entropy = 0;
+            for (const tf of posting.values()) {
+                const p = tf / totalTf;
+                entropy -= p * Math.log(p);
+            }
+            const maxEntropy = Math.log(nDocs);
+            this._termEntropy.set(term, maxEntropy > 0 ? entropy / maxEntropy : 0);
+        }
+    }
+
+    /**
+     * TAAT search with entropy-weighted scoring and sigmoid TF saturation.
+     * Returns array of { id, score } sorted desc, scores normalized to [0, 1].
+     */
+    search(query, topK = 200) {  # L153
+        if (this._totalDocs === 0 || !query) return [];
+
+        const queryTokens = BM25Index.tokenize(query);
+        if (queryTokens.length === 0) return [];
+
+        // Count query term frequencies
+        const qtfMap = new Map();
+        for (const t of queryTokens) qtfMap.set(t, (qtfMap.get(t) || 0) + 1);
+
+        // Pre-compute per-term weights and max_possible
+        const termWeights = new Map();
+        let maxPossible = 0;
+
+        for (const [term, qtf] of qtfMap) {
+            if (!this._postingLists.has(term)) continue;
+            const idf = this._idfCache.get(term) || 0;
+            const entropy = this._termEntropy.get(term) || 0;
+            const weight = idf * (1 + this.beta * (1 - entropy));
+            termWeights.set(term, weight);
+            maxPossible += weight * qtf;
+        }
+
+        if (maxPossible === 0) return [];
+
+        // TAAT: accumulate scores by traversing postings
+        const { k1, b, _avgDocLength: avgdl } = this;
+        const scores = new Map();
+
+        for (const [term, qtf] of qtfMap) {
+            const weight = termWeights.get(term);
+            if (weight === undefined) continue;
+            const w = weight * qtf;
+            const posting = this._postingLists.get(term);
+
+            for (const [docId, tf] of posting) {
+                const dl = this._docLengths.get(docId);
+                const K = k1 * (1 - b + b * (dl / avgdl));
+                // Sigmoid TF saturation
+                const tfComponent = 1 / (1 + Math.exp(-k1 * (tf - K / 2) / K));
+                scores.set(docId, (scores.get(docId) || 0) + w * tfComponent);
+            }
+        }
+
+        if (scores.size === 0) return [];
+
+        // Normalize to [0, 1]
+        const invMax = 1 / maxPossible;
+        const sorted = [...scores.entries()]
+            .map(([id, s]) => ({ id, score: s * invMax }))
+            .sort((a, b) => b.score - a.score);
+
+        return sorted.slice(0, topK);
+    }
+}
+# ... [lines 208-219 omitted]
+export function bm25RankResults(lines, query, charBudget = CHAR_BUDGET) {  # L220
+    const index = new BM25Index();
+    const docs = lines.map((line, i) => ({ id: String(i), text: line }));
+    index.build(docs);
+
+    const ranked = index.search(query, lines.length);
+    const result = [];
+    let charCount = 0;
+
+    for (const { id } of ranked) {
+        const line = lines[Number(id)];
+        if (charCount + line.length + 1 > charBudget) break;
+        result.push(line);
+        charCount += line.length + 1; // +1 for newline
+    }
+
+    return { ranked: result, totalCount: lines.length };
+}
+# ... [lines 238-247 omitted]
+export async function bm25PreFilterFiles(rootPath, query, topK = 50, excludePatterns = []) {  # L248
+    const docs = [];
+    const MAX_FILE_SIZE = 512 * 1024; // 512KB max per file for indexing
+    const MAX_FILES = 5000;           // cap to prevent runaway on huge repos
+
+    const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+    const allExcludes = [...excludePatterns, ...defaultExcludeGlobs];
+
+    // Text extensions for BM25 content indexing
+    const textExts = new Set([
+        '.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs',
+        '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp',
+        '.cs', '.php', '.vue', '.svelte', '.html', '.css', '.scss',
+        '.less', '.json', '.yaml', '.yml', '.toml', '.xml', '.md',
+        '.txt', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat',
+        '.sql', '.graphql', '.proto', '.tf', '.hcl', '.lua',
+        '.ex', '.exs', '.erl', '.hs', '.ml', '.clj', '.r',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt',
+        '.env.example', '.gitignore', '.editorconfig',
+    ]);
+
+    // Use ripgrep for file discovery when available — automatically respects
+    // .gitignore, .ignore, and .rgignore files, eliminating noise from build
+    // artifacts, vendored code, and test fixtures that projects exclude.
+    const hasRg = await ripgrepAvailable();
+    let filePaths = [];
+
+    if (hasRg) {
+        const rgFiles = await ripgrepFindFiles(rootPath, {
+            maxResults: MAX_FILES,
+            excludePatterns: allExcludes,
+        });
+        if (rgFiles && rgFiles.length > 0) {
+            filePaths = rgFiles;
+        }
+    }
+
+    // JS fallback — manual walk (no .gitignore awareness)
+    if (filePaths.length === 0) {
+        async function walk(dir) {
+            if (filePaths.length >= MAX_FILES) return;
+            let entries;
+            try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                if (filePaths.length >= MAX_FILES) return;
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.relative(rootPath, fullPath);
+
+                if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                const excluded = allExcludes.some(pat =>
+                    minimatch(rel, pat, { dot: true }) ||
+                    minimatch(rel, pat.replace(/^\*\*\//, ''), { dot: true })
+                );
+                if (excluded) continue;
+                if (isSensitive(fullPath)) continue;
+
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile()) {
+                    filePaths.push(fullPath);
+                }
+            }
+        }
+        await walk(rootPath);
+    }
+
+    // Index text files with BM25
+    for (const fullPath of filePaths) {
+        if (docs.length >= MAX_FILES) break;
+        const ext = path.extname(fullPath).toLowerCase();
+        const nameLC = path.basename(fullPath).toLowerCase();
+        const isText = textExts.has(ext) ||
+            nameLC === 'dockerfile' || nameLC === 'makefile' ||
+            nameLC === 'cmakelists.txt' || nameLC === 'gemfile' ||
+            nameLC === 'rakefile' || nameLC === 'justfile' ||
+            nameLC.startsWith('.') && !nameLC.includes('.');
+
+        if (!isText) continue;
+
+        try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > MAX_FILE_SIZE || stat.size === 0) continue;
+
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const rel = path.relative(rootPath, fullPath);
+            const pathTokens = rel.replace(/[/\\]/g, ' ').replace(/\./g, ' ');
+            const boostedText = `${pathTokens} ${pathTokens} ${pathTokens} ${content.slice(0, 8192)}`;
+            docs.push({ id: fullPath, text: boostedText });
+        } catch { /* skip unreadable */ }
+    }
+
+    if (docs.length === 0) return [];
+    # ... [lines 340-343 omitted]
+    return results.map(r => r.id);
+    # ... [9 lines omitted]
+
+// ---------------------------------------------------------------------------
+// Ripgrep
+
+=== DIRECT TOON BRIDGE OUTPUT ===
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET env var for models with different limits.
+export const CHAR_BUDGET = (() => {
+    const env = process.env.CHAR_BUDGET;
+    if (env) {
+        const trimmed = env.trim();
+        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
+        }
+    }
+    return 400_000;
+})();
+export const RANK_THRESHOLD = 50;   // BM25 only kicks in above this count
+
+export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
+    'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export const SENSITIVE_PATTERNS = (process.env.SENSITIVE_PATTERNS ||
+    '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
+).split(',').map(p => p.trim()).filter(Boolean);
+
+export function isSensitive(filePath) {  # L53
+    const rel = path.relative(os.homedir(), filePath);
+    return SENSITIVE_PATTERNS.some(pat =>
+        minimatch(rel, pat, { dot: true, nocase: true }) ||
+        minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BM.X-T Engine — entropy-weighted TAAT search, zero deps
+// ---------------------------------------------------------------------------
+
+const WORD_RE = /[a-z0-9_]+/g;
+
+export class BM25Index {  # L67
+    constructor(k1 = 1.2, b = 0.75, beta = 0.6) {
+        this.k1 = k1;
+        this.b = b;
+        this.beta = beta;
+        this._postingLists = new Map(); // term -> Map<docId, tf>
+        this._docLengths = new Map();   // docId -> tokenCount
+        this._avgDocLength = 0;
+        this._idfCache = new Map();     // term -> idf
+        this._termEntropy = new Map();  // term -> normalized entropy [0,1]
+        this._termTotalFreqs = new Map(); // term -> total tf across corpus
+        this._totalDocs = 0;
+    }
+
+    static tokenize(text) {
+        if (!text) return [];
+        const tokens = text.toLowerCase().match(WORD_RE);
+        if (!tokens) return [];
+        return tokens.filter(t => t.length > 1 || t === 'a' || t === 'i');
+    }
+
+    /**
+     * Build index from array of { id: string, text: string }.
+     */
+    build(docs) {  # L91
+        this._postingLists.clear();
+        this._docLengths.clear();
+        this._idfCache.clear();
+        this._termEntropy.clear();
+        this._termTotalFreqs.clear();
+
+        let totalLength = 0;
+
+        // Pass 1: tokenize, build inverted index
+        for (const doc of docs) {
+            if (!doc.id) continue;
+            const tokens = BM25Index.tokenize(doc.text);
+            this._docLengths.set(doc.id, tokens.length);
+            totalLength += tokens.length;
+
+            const tfMap = new Map();
+            for (const token of tokens) {
+                tfMap.set(token, (tfMap.get(token) || 0) + 1);
+            }
+
+            for (const [term, count] of tfMap) {
+                if (!this._postingLists.has(term)) {
+                    this._postingLists.set(term, new Map());
+                }
+                this._postingLists.get(term).set(doc.id, count);
+                this._termTotalFreqs.set(term, (this._termTotalFreqs.get(term) || 0) + count);
+            }
+        }
+
+        this._totalDocs = this._docLengths.size;
+        if (this._totalDocs === 0) return;
+        this._avgDocLength = totalLength / this._totalDocs;
+
+        // Pass 2: IDF
+        for (const [term, posting] of this._postingLists) {
+            const df = posting.size;
+            this._idfCache.set(term, Math.log((this._totalDocs - df + 0.5) / (df + 0.5) + 1));
+        }
+
+        // Pass 3: per-term entropy
+        for (const [term, posting] of this._postingLists) {
+            const totalTf = this._termTotalFreqs.get(term);
+            const nDocs = posting.size;
+            if (totalTf === 0 || nDocs <= 1) {
+                this._termEntropy.set(term, 0);
+                continue;
+            }
+            let entropy = 0;
+            for (const tf of posting.values()) {
+                const p = tf / totalTf;
+                entropy -= p * Math.log(p);
+            }
+            const maxEntropy = Math.log(nDocs);
+            this._termEntropy.set(term, maxEntropy > 0 ? entropy / maxEntropy : 0);
+        }
+    }
+
+    /**
+     * TAAT search with entropy-weighted scoring and sigmoid TF saturation.
+     * Returns array of { id, score } sorted desc, scores normalized to [0, 1].
+     */
+    search(query, topK = 200) {  # L153
+        if (this._totalDocs === 0 || !query) return [];
+
+        const queryTokens = BM25Index.tokenize(query);
+        if (queryTokens.length === 0) return [];
+
+        // Count query term frequencies
+        const qtfMap = new Map();
+        for (const t of queryTokens) qtfMap.set(t, (qtfMap.get(t) || 0) + 1);
+
+        // Pre-compute per-term weights and max_possible
+        const termWeights = new Map();
+        let maxPossible = 0;
+
+        for (const [term, qtf] of qtfMap) {
+            if (!this._postingLists.has(term)) continue;
+            const idf = this._idfCache.get(term) || 0;
+            const entropy = this._termEntropy.get(term) || 0;
+            const weight = idf * (1 + this.beta * (1 - entropy));
+            termWeights.set(term, weight);
+            maxPossible += weight * qtf;
+        }
+
+        if (maxPossible === 0) return [];
+
+        // TAAT: accumulate scores by traversing postings
+        const { k1, b, _avgDocLength: avgdl } = this;
+        const scores = new Map();
+
+        for (const [term, qtf] of qtfMap) {
+            const weight = termWeights.get(term);
+            if (weight === undefined) continue;
+            const w = weight * qtf;
+            const posting = this._postingLists.get(term);
+
+            for (const [docId, tf] of posting) {
+                const dl = this._docLengths.get(docId);
+                const K = k1 * (1 - b + b * (dl / avgdl));
+                // Sigmoid TF saturation
+                const tfComponent = 1 / (1 + Math.exp(-k1 * (tf - K / 2) / K));
+                scores.set(docId, (scores.get(docId) || 0) + w * tfComponent);
+            }
+        }
+
+        if (scores.size === 0) return [];
+
+        // Normalize to [0, 1]
+        const invMax = 1 / maxPossible;
+        const sorted = [...scores.entries()]
+            .map(([id, s]) => ({ id, score: s * invMax }))
+            .sort((a, b) => b.score - a.score);
+
+        return sorted.slice(0, topK);
+    }
+}
+# ... [lines 208-219 omitted]
+export function bm25RankResults(lines, query, charBudget = CHAR_BUDGET) {  # L220
+    const index = new BM25Index();
+    const docs = lines.map((line, i) => ({ id: String(i), text: line }));
+    index.build(docs);
+
+    const ranked = index.search(query, lines.length);
+    const result = [];
+    let charCount = 0;
+
+    for (const { id } of ranked) {
+        const line = lines[Number(id)];
+        if (charCount + line.length + 1 > charBudget) break;
+        result.push(line);
+        charCount += line.length + 1; // +1 for newline
+    }
+
+    return { ranked: result, totalCount: lines.length };
+}
+# ... [lines 238-247 omitted]
+export async function bm25PreFilterFiles(rootPath, query, topK = 50, excludePatterns = []) {  # L248
+    const docs = [];
+    const MAX_FILE_SIZE = 512 * 1024; // 512KB max per file for indexing
+    const MAX_FILES = 5000;           // cap to prevent runaway on huge repos
+
+    const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+    const allExcludes = [...excludePatterns, ...defaultExcludeGlobs];
+
+    // Text extensions for BM25 content indexing
+    const textExts = new Set([
+        '.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs',
+        '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp',
+        '.cs', '.php', '.vue', '.svelte', '.html', '.css', '.scss',
+        '.less', '.json', '.yaml', '.yml', '.toml', '.xml', '.md',
+        '.txt', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat',
+        '.sql', '.graphql', '.proto', '.tf', '.hcl', '.lua',
+        '.ex', '.exs', '.erl', '.hs', '.ml', '.clj', '.r',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt',
+        '.env.example', '.gitignore', '.editorconfig',
+    ]);
+
+    // Use ripgrep for file discovery when available — automatically respects
+    // .gitignore, .ignore, and .rgignore files, eliminating noise from build
+    // artifacts, vendored code, and test fixtures that projects exclude.
+    const hasRg = await ripgrepAvailable();
+    let filePaths = [];
+
+    if (hasRg) {
+        const rgFiles = await ripgrepFindFiles(rootPath, {
+            maxResults: MAX_FILES,
+            excludePatterns: allExcludes,
+        });
+        if (rgFiles && rgFiles.length > 0) {
+            filePaths = rgFiles;
+        }
+    }
+
+    // JS fallback — manual walk (no .gitignore awareness)
+    if (filePaths.length === 0) {
+        async function walk(dir) {
+            if (filePaths.length >= MAX_FILES) return;
+            let entries;
+            try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                if (filePaths.length >= MAX_FILES) return;
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.relative(rootPath, fullPath);
+
+                if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                const excluded = allExcludes.some(pat =>
+                    minimatch(rel, pat, { dot: true }) ||
+                    minimatch(rel, pat.replace(/^\*\*\//, ''), { dot: true })
+                );
+                if (excluded) continue;
+                if (isSensitive(fullPath)) continue;
+
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile()) {
+                    filePaths.push(fullPath);
+                }
+            }
+        }
+        await walk(rootPath);
+    }
+
+    // Index text files with BM25
+    for (const fullPath of filePaths) {
+        if (docs.length >= MAX_FILES) break;
+        const ext = path.extname(fullPath).toLowerCase();
+        const nameLC = path.basename(fullPath).toLowerCase();
+        const isText = textExts.has(ext) ||
+            nameLC === 'dockerfile' || nameLC === 'makefile' ||
+            nameLC === 'cmakelists.txt' || nameLC === 'gemfile' ||
+            nameLC === 'rakefile' || nameLC === 'justfile' ||
+            nameLC.startsWith('.') && !nameLC.includes('.');
+
+        if (!isText) continue;
+
+        try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > MAX_FILE_SIZE || stat.size === 0) continue;
+
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const rel = path.relative(rootPath, fullPath);
+            const pathTokens = rel.replace(/[/\\]/g, ' ').replace(/\./g, ' ');
+            const boostedText = `${pathTokens} ${pathTokens} ${pathTokens} ${content.slice(0, 8192)}`;
+            docs.push({ id: fullPath, text: boostedText });
+        } catch { /* skip unreadable */ }
+    }
+
+    if (docs.length === 0) return [];
+    # ... [lines 340-343 omitted]
+    return results.map(r => r.id);
+    # ... [9 lines omitted]
+
+// ---------------------------------------------------------------------------
+// Ripgrep
+
+=== RAW PREVIEW (first 1500 chars) ===
+// ---------------------------------------------------------------------------
+// shared.js — Updated shared module
+//
+// Changes from original:
+//   1. Added inline BM25 engine (BM25Index class) — zero external deps,
+//      ~120 lines. TAAT posting-list architecture, Lucene-variant IDF
+//      (always non-negative), code-aware tokenizer (/[a-z0-9_]+/).
+//   2. Added buildFileCorpus() helper for pre-filter mode — uses ripgrep
+//      for file discovery (respects .gitignore automatically), falls back
+//      to manual walk. Builds BM25 docs from file content.
+//   3. Added rankResults() helper for post-filter mode — takes raw ripgrep
+//      result lines and returns BM25-ranked slice within a char budget.
+//   4. Existing ripgrepSearch / ripgrepFindFiles / isSensitive untouched
+//      except minor robustness improvements.
+// ---------------------------------------------------------------------------
+
+import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { constants as fsConstants } from "fs";
+import { spawn } from "child_process";
+import path from "path";
+import os from "os";
+import { minimatch } from "minimatch";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Dynamic char budget — right-sizes to the model's actual context capacity.
+// Defaults to 400k (safe margin under Claude's 500k limit).
+// Override via CHAR_BUDGET en
