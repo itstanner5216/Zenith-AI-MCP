@@ -8,13 +8,13 @@ const CAP = 250;
 export function register(server, ctx) {
     server.registerTool("list_directory", {
         title: "List Directory",
-        description: "List files and directories. Directories have trailing /. Use depth > 1 for recursive (max 10). Use listAllowed=true to list allowed directories instead.",
+        description: "List files and directories. Directories have trailing /.",
         inputSchema: {
             path: z.string().optional(),
-            depth: z.number().optional().default(1).describe("Recursion depth. 1 = current dir only, 2+ = recurse. Max 10."),
+            depth: z.number().optional().default(1).describe("Recursion depth. Max 10."),
             includeSizes: z.boolean().optional().default(false).describe("Show file sizes."),
-            sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort by name or size. Only effective with includeSizes."),
-            listAllowed: z.boolean().optional().default(false).describe("Return allowed directories instead of listing a path.")
+            sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort order. Requires includeSizes."),
+            listAllowed: z.boolean().optional().default(false).describe("List allowed directories instead.")
         },
         annotations: { readOnlyHint: true }
     }, async (args) => {

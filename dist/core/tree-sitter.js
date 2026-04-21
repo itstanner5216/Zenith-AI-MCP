@@ -807,3 +807,76 @@ export async function checkSyntaxErrors(source, langName) {
         parser.delete();
     }
 }
+
+/**
+ * Compute a structural fingerprint for a range of source lines.
+ * Returns an ordered array of AST node types for all nodes whose start row
+ * falls within [startLine-1, endLine-1].
+ *
+ * @param {string} source    - full source code
+ * @param {string} langName  - tree-sitter language name
+ * @param {number} startLine - 1-based start line
+ * @param {number} endLine   - 1-based end line
+ * @returns {Promise<string[]>}
+ */
+export async function getStructuralFingerprint(source, langName, startLine, endLine) {
+    const language = await loadLanguage(langName);
+    if (!language) return [];
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        const nodeTypes = [];
+        const startRow = startLine - 1;
+        const endRow = endLine - 1;
+
+        function walk(node) {
+            if (node.startPosition.row >= startRow && node.startPosition.row <= endRow) {
+                nodeTypes.push(node.type);
+            }
+            for (let i = 0; i < node.childCount; i++) {
+                walk(node.child(i));
+            }
+        }
+
+        walk(tree.rootNode);
+        return nodeTypes;
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
+}
+
+/**
+ * Compute Jaccard similarity between two structural fingerprints using 3-grams.
+ * Returns a score from 0.0 to 1.0.
+ *
+ * @param {string[]} fingerprintA
+ * @param {string[]} fingerprintB
+ * @returns {number}
+ */
+export function computeStructuralSimilarity(fingerprintA, fingerprintB) {
+    function buildNgrams(arr, n) {
+        const set = new Set();
+        for (let i = 0; i <= arr.length - n; i++) {
+            set.add(arr.slice(i, i + n).join('\x00'));
+        }
+        return set;
+    }
+
+    const gramsA = buildNgrams(fingerprintA, 3);
+    const gramsB = buildNgrams(fingerprintB, 3);
+
+    if (gramsA.size === 0 && gramsB.size === 0) return 1.0;
+    if (gramsA.size === 0 || gramsB.size === 0) return 0.0;
+
+    let intersection = 0;
+    for (const g of gramsA) {
+        if (gramsB.has(g)) intersection++;
+    }
+
+    const union = gramsA.size + gramsB.size - intersection;
+    return union === 0 ? 0.0 : intersection / union;
+}

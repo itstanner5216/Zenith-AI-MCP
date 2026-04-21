@@ -69,3 +69,14 @@
 (pair
   key: (property_identifier) @name.definition.method
   value: [(arrow_function) (function_expression)] @definition.method)
+
+(
+  (call_expression
+    function: (identifier) @name.reference.call) @reference.call
+  (#not-match? @name.reference.call "^(require)$")
+)
+
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name.reference.call)
+  arguments: (_) @reference.call)

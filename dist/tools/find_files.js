@@ -14,23 +14,13 @@ export function register(server, ctx) {
         description: "Find files by name glob, path substring, extension, or symbol definition.",
         inputSchema: {
             path: z.string().describe("Root directory to search in"),
-            namePattern: z.string().optional().describe("Glob for filename, e.g. '*.ts', 'Button*.tsx', 'index.js'. Matches filename only, not full path."),
-            pathContains: z.string().optional().describe("Substring that must appear anywhere in the full file path, e.g. 'components/Button', 'src/utils', 'auth'."),
-            extensions: z.array(z.string()).optional().describe(
-                "Filter by file extensions, e.g. ['.ts', '.tsx']. Dot prefix required."
-            ),
-            relevanceQuery: z.string().optional().describe(
-                "Rank results by path relevance, e.g. 'authentication middleware'. " +
-                "Queries under 3 characters are too short to affect ordering."
-            ),
+            namePattern: z.string().optional().describe("Glob for filename. Matches name only."),
+            pathContains: z.string().optional().describe("Substring match on full path."),
+            extensions: z.array(z.string()).optional().describe("Filter by extensions, e.g. ['.ts']. Dot required."),
+            relevanceQuery: z.string().optional().describe("Rank results by path relevance."),
             maxResults: z.number().optional().default(100),
-            includeMetadata: z.boolean().optional().default(false).describe("Include file size and modified date per result."),
-            definesSymbol: z.string().optional().describe(
-                "Find files that define a specific symbol (function, class, method, interface, etc.). " +
-                "The symbol must be a definition, not just a reference. " +
-                "Supports dot-qualified names like 'MyClass.sendMessage'. " +
-                "Can be combined with namePattern/pathContains/extensions to narrow the search scope."
-            ),
+            includeMetadata: z.boolean().optional().default(false).describe("Include size and modified date."),
+            definesSymbol: z.string().optional().describe("Find files defining a symbol. Dot-qualified supported."),
         },
         annotations: { readOnlyHint: true }
     }, async (args) => {

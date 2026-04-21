@@ -12,8 +12,8 @@ export function register(server, ctx) {
         inputSchema: {
             path: z.string(),
             excludePatterns: z.array(z.string()).optional().default([]),
-            showSymbols: z.boolean().optional().default(false).describe("Add symbol summary string to each supported file (e.g. '3 functions, 1 class')."),
-            showSymbolNames: z.boolean().optional().default(false).describe("Add full list of definition names to each supported file. Implies showSymbols. More detailed but larger output.")
+            showSymbols: z.boolean().optional().default(false).describe("Show symbol counts per file."),
+            showSymbolNames: z.boolean().optional().default(false).describe("Show symbol names per file. Implies showSymbols.")
         },
         annotations: { readOnlyHint: true }
     }, async (args) => {
