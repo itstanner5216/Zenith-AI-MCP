@@ -20,32 +20,8 @@ export function register(server, ctx) {
         let standardReadContent = null;
         let standardReadBudget = maxChars;
 
-        // Validate parameter combinations
-        if ((args.head && args.tail) || (args.tail && args.offset !== undefined) || (args.head && args.tail && args.offset !== undefined)) {
-            throw new Error("Cannot combine tail with head or offset. Use offset+head for windowed reads, or tail alone.");
-        }
-
-        if (args.grep && (args.head || args.tail || args.offset !== undefined)) {
-            throw new Error("Cannot combine 'grep' with head/tail/offset.");
-        }
-
-        const hasWindowMode = args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0);
-        if (hasWindowMode && (args.grep || args.head || args.tail || args.offset !== undefined)) {
-            throw new Error("Cannot combine aroundLine/ranges with grep/head/tail/offset. ");
-        }
-
-        const hasSymbolMode = args.symbol !== undefined;
-        if (hasSymbolMode && (args.grep || args.head || args.tail || args.offset !== undefined || hasWindowMode)) {
-            throw new Error("Cannot combine 'symbol' with grep/head/tail/offset/aroundLine/ranges. ");
-        }
-
-        if (args.compression && (hasSymbolMode || args.grep || args.head || args.tail ||
-                typeof args.offset === 'number' || hasWindowMode || args.showLineNumbers)) {
-            throw new Error("'compression' is only valid on plain full-file reads. Cannot combine with symbol/grep/head/tail/offset/aroundLine/ranges/showLineNumbers.");
-        }
-
         // ---- SYMBOL MODE ----
-        if (hasSymbolMode) {
+        if (args.mode === "symbol") {
             const langName = getLangForFile(validPath);
             if (!langName) {
                 throw new Error('Unsupported file type.');
@@ -86,11 +62,11 @@ export function register(server, ctx) {
         }
 
         // ---- GREP MODE ----
-        if (args.grep) {
-            const grepPattern = new RegExp(args.grep, args.grepIgnoreCase !== false ? 'i' : '');
-            const invertMatch = args.grepInvert ?? false;
-            const beforeCount = Math.min(Math.max(0, args.grepBefore ?? 0), 20);
-            const afterCount = Math.min(Math.max(0, args.grepAfter ?? 0), 30);
+        if (args.mode === "grep") {
+            const grepPattern = new RegExp(args.grep, 'i');
+            const grepContext = Math.min(Math.max(0, args.grepContext ?? 0), 30);
+            const beforeCount = grepContext;
+            const afterCount = grepContext;
             const hasContext = beforeCount > 0 || afterCount > 0;
 
             const outputEntries = [];
@@ -127,8 +103,7 @@ export function register(server, ctx) {
 
                 rl.on('line', (line) => {
                     totalLines++;
-                    const rawMatch = grepPattern.test(line);
-                    const isMatch = invertMatch ? !rawMatch : rawMatch;
+                    const isMatch = grepPattern.test(line);
 
                     if (isMatch) {
                         if (hasContext) {
@@ -164,7 +139,7 @@ export function register(server, ctx) {
         }
 
         // ---- WINDOW MODE ----
-        if (hasWindowMode) {
+        if (args.mode === "window") {
             const windows = [];
             if (args.aroundLine !== undefined) {
                 const windowRadius = args.context ?? 30;
@@ -232,7 +207,7 @@ export function register(server, ctx) {
                 stream.on('error', reject);
             });
 
-            const text = (budgetExhausted ? '## truncated ##\n' : '') + outputLines.join('\n');
+            const text = (budgetExhausted ? '[truncated]\n' : '') + outputLines.join('\n');
             return {
                 content: [{ type: "text", text }],
             };
@@ -295,10 +270,10 @@ export function register(server, ctx) {
 
         let metaHeader = '';
         if (truncated && !args.compression) {
-            metaHeader = `## truncated — offset=${meta.truncatedAt} ##\n`;
+            metaHeader = `[truncated offset=${meta.truncatedAt}]\n`;
         }
         if (!truncated && meta.hasMore && !args.compression) {
-            metaHeader = `## offset=${args.offset + meta.linesReturned} ##\n`;
+            metaHeader = `[offset=${args.offset + meta.linesReturned}]\n`;
         }
 
         const text = metaHeader + content;
@@ -309,27 +284,44 @@ export function register(server, ctx) {
 
     server.registerTool("read_text_file", {
         title: "Read Text File",
-        description: "Read a text file. Supports head/tail/offset, grep with context, aroundLine windows, line ranges, and symbol lookup.",
-        inputSchema: {
-            path: z.string(),
-            tail: z.number().optional().describe("Last N lines."),
-            head: z.number().optional().describe("First N lines."),
-            offset: z.number().optional().describe("Start line (0-based). Combine with head."),
-            grep: z.string().optional().describe("Regex to match lines."),
-            grepIgnoreCase: z.boolean().optional().default(true),
-            grepBefore: z.number().optional().default(0).describe("Context lines before match. Max 20."),
-            grepAfter: z.number().optional().default(0).describe("Context lines after match. Max 30."),
-            grepInvert: z.boolean().optional().default(false).describe("Return non-matching lines."),
-            showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
-            maxChars: z.number().optional().default(50000).describe("Max characters (up to 400000)."),
-            aroundLine: z.number().optional().describe("Center a window on this line."),
-            context: z.number().optional().default(30).describe("Window size for aroundLine."),
-            ranges: z.array(z.object({ startLine: z.number(), endLine: z.number() })).optional().describe("Explicit line ranges to return."),
-            symbol: z.string().optional().describe("Read a symbol by name. Dot-qualified for methods."),
-            expandLines: z.number().optional().default(0).describe("Extra context around symbol. Max 50."),
-            nearLine: z.number().optional().describe("Disambiguate multiple symbol matches."),
-            compression: z.boolean().optional().default(false).describe("Compression is off by default. Set true to turn it on for a full-file read."),
-        },
+        description: "Read a text file by lines, grep, window, or symbol.",
+        inputSchema: z.discriminatedUnion("mode", [
+            z.object({
+                mode: z.literal("standard"),
+                path: z.string().describe("File to read."),
+                maxChars: z.number().optional().default(50000).describe("Max characters returned. Up to 400000."),
+                head: z.number().optional().describe("First N lines."),
+                tail: z.number().optional().describe("Last N lines."),
+                offset: z.number().optional().describe("Start line (0-based). Combine with head."),
+                showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
+                compression: z.boolean().optional().default(false).describe("Compress whitespace in returned content."),
+            }),
+            z.object({
+                mode: z.literal("grep"),
+                path: z.string().describe("File to read."),
+                maxChars: z.number().optional().default(50000).describe("Max characters returned. Up to 400000."),
+                grep: z.string().describe("Regex to match lines. Case-insensitive."),
+                grepContext: z.number().optional().default(0).describe("Context lines before and after each match. Max 30."),
+                showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
+            }),
+            z.object({
+                mode: z.literal("window"),
+                path: z.string().describe("File to read."),
+                maxChars: z.number().optional().default(50000).describe("Max characters returned. Up to 400000."),
+                aroundLine: z.number().optional().describe("Center a window on this line."),
+                context: z.number().optional().default(30).describe("Window radius for aroundLine."),
+                ranges: z.array(z.object({ startLine: z.number(), endLine: z.number() })).optional().describe("Explicit line ranges to return."),
+                showLineNumbers: z.boolean().optional().default(false).describe("Prefix lines with numbers."),
+            }),
+            z.object({
+                mode: z.literal("symbol"),
+                path: z.string().describe("File to read."),
+                maxChars: z.number().optional().default(50000).describe("Max characters returned. Up to 400000."),
+                symbol: z.string().describe("Symbol name. Dot-qualified for methods."),
+                nearLine: z.number().optional().describe("Disambiguate multiple symbol matches."),
+                expandLines: z.number().optional().default(0).describe("Extra context around symbol. Max 50."),
+            }),
+        ]),
         annotations: { readOnlyHint: true }
     }, handler);
 }

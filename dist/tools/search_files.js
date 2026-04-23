@@ -9,7 +9,7 @@ import {
     CHAR_BUDGET, RANK_THRESHOLD,
 } from '../core/shared.js';
 import {
-    isSupported, getLangForFile, getSymbols, getDefinitions,
+    isSupported, getLangForFile, getDefinitions,
     getStructuralFingerprint, computeStructuralSimilarity,
 } from '../core/tree-sitter.js';
 import { findRepoRoot, getDb, indexDirectory } from '../core/symbol-index.js';
@@ -21,45 +21,85 @@ const SEARCH_CHAR_BUDGET = (() => {
     return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
 })();
 
+const DEFAULT_EXCLUDE_GLOBS = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+
 export function register(server, ctx) {
     server.registerTool("search_files", {
         title: "Search Files",
-        description: "Search file contents, find files by glob, search symbols, or list symbols in a directory.",
-        inputSchema: {
-            path: z.string(),
-            pattern: z.string().optional().describe("Glob pattern to match filenames/paths, e.g. '**/*.ts'"),
-            contentQuery: z.string().optional().describe("Text or regex to search"),
-            excludePatterns: z.array(z.string()).optional().default([]),
-            ignoreCase: z.boolean().optional().default(true),
-            maxResults: z.number().optional().default(50),
-            contextLines: z.number().optional().default(0).describe("Number of context lines"),
-            literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as literal string."),
-            countOnly: z.boolean().optional().default(false).describe("Return match/file counts only, no content."),
-            includeHidden: z.boolean().optional().default(false).describe("Include hidden files in search."),
-            symbolQuery: z.string().optional().describe("Search symbols by name substring."),
-            symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe("Filter by symbol kind."),
-            listSymbols: z.boolean().optional().default(false).describe("List all symbols."),
-            structuralQuery: z.string().optional().describe("Find structurally similar symbols."),
-        },
+        description: "Search file contents, find files, or search symbols.",
+        inputSchema: z.discriminatedUnion("mode", [
+                z.object({
+                    mode: z.literal("content"),
+                    path: z.string().describe("Directory to search."),
+                    maxResults: z.number().optional().default(50).describe("Maximum result lines."),
+                    contentQuery: z.string().describe("Text or regex to search for."),
+                    pattern: z.string().optional().describe("Glob to limit which files are searched, e.g. '**/*.ts'."),
+                    ignoreCase: z.boolean().optional().default(true).describe("Case-insensitive match."),
+                    contextLines: z.number().optional().default(0).describe("Context lines around each match."),
+                    literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as a literal string."),
+                    countOnly: z.boolean().optional().default(false).describe("Return match and file counts only."),
+                    includeHidden: z.boolean().optional().default(false).describe("Include hidden files."),
+                }),
+                z.object({
+                    mode: z.literal("files"),
+                    path: z.string().describe("Directory to search."),
+                    maxResults: z.number().optional().default(100).describe("Maximum files returned."),
+                    pattern: z.string().optional().describe("Path glob, e.g. '**/*.ts'."),
+                    pathContains: z.string().optional().describe("Substring that must appear in the full path."),
+                    extensions: z.array(z.string()).optional().describe("Filter by extensions, e.g. ['.ts']. Dot required."),
+                    namePattern: z.string().optional().describe("Glob matched against filename only."),
+                    includeMetadata: z.boolean().optional().default(false).describe("Include size and modified date."),
+                    includeHidden: z.boolean().optional().default(false).describe("Include hidden files."),
+                }),
+                z.object({
+                    mode: z.literal("symbol"),
+                    path: z.string().describe("Directory to search."),
+                    maxResults: z.number().optional().default(50).describe("Maximum symbol matches."),
+                    symbolQuery: z.string().describe("Symbol name substring to match."),
+                    symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe("Filter by symbol kind."),
+                    pattern: z.string().optional().describe("Glob to limit which files are scanned."),
+                }),
+                z.object({
+                    mode: z.literal("list_symbols"),
+                    path: z.string().describe("Directory to scan."),
+                    maxResults: z.number().optional().default(50).describe("Maximum files reported."),
+                    symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe("Filter by symbol kind."),
+                    pattern: z.string().optional().describe("Glob to limit which files are scanned."),
+                }),
+                z.object({
+                    mode: z.literal("structural"),
+                    path: z.string().describe("Directory scope for the search."),
+                    maxResults: z.number().optional().default(20).describe("Maximum similar symbols returned."),
+                    structuralQuery: z.string().describe("Symbol name to find structurally similar definitions of."),
+                    symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe("Filter candidates by symbol kind."),
+                }),
+                z.object({
+                    mode: z.literal("definition"),
+                    path: z.string().describe("Directory to search."),
+                    maxResults: z.number().optional().default(100).describe("Maximum files returned."),
+                    definesSymbol: z.string().describe("Symbol name to find definitions of. Dot-qualified supported."),
+                    namePattern: z.string().optional().describe("Glob matched against filename only."),
+                    pathContains: z.string().optional().describe("Substring that must appear in the full path."),
+                    extensions: z.array(z.string()).optional().describe("Filter by extensions, e.g. ['.ts']. Dot required."),
+                }),
+            ]),
         annotations: { readOnlyHint: true }
     }, async (args) => {
         const rootPath = await ctx.validatePath(args.path);
 
         // ---- SYMBOL SEARCH / LIST MODE ----
-        if (args.symbolQuery || args.listSymbols) {
+        if (args.mode === "symbol" || args.mode === "list_symbols") {
             const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
 
             // Discover files — reuse ripgrep for speed
             const hasRg = await ripgrepAvailable();
             let filePaths = [];
-            const callerExcludes = args.excludePatterns ?? [];
-            const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
 
             if (hasRg) {
                 const results = await ripgrepFindFiles(rootPath, {
                     namePattern: args.pattern || null,
                     maxResults: 2000,
-                    excludePatterns: [...callerExcludes, ...defaultExcludeGlobs],
+                    excludePatterns: DEFAULT_EXCLUDE_GLOBS,
                 });
                 if (results) filePaths = results;
             }
@@ -89,18 +129,14 @@ export function register(server, ctx) {
             const supportedFiles = filePaths.filter(f => isSupported(f));
 
             if (supportedFiles.length === 0) {
-                const text = 'No supported files found.';
-                return {
-                    content: [{ type: "text", text }],
-                };
+                return { content: [{ type: "text", text: 'No supported files found.' }] };
             }
 
             const MAX_FILE_SIZE = 512 * 1024;
             const BATCH_SIZE = 50;
             const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
 
-            if (args.listSymbols) {
-                // ---- LIST SYMBOLS MODE ----
+            if (args.mode === "list_symbols") {
                 const outputLines = [];
 
                 for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
@@ -133,7 +169,6 @@ export function register(server, ctx) {
                     }
                 }
 
-                // Enforce char budget
                 const budgetLines = [];
                 let charCount = 0;
                 for (const line of outputLines) {
@@ -142,10 +177,7 @@ export function register(server, ctx) {
                     charCount += line.length + 1;
                 }
 
-                const text = budgetLines.join('\n');
-                return {
-                    content: [{ type: "text", text }],
-                };
+                return { content: [{ type: "text", text: budgetLines.join('\n') }] };
 
             } else {
                 // ---- SYMBOL QUERY MODE ----
@@ -189,7 +221,6 @@ export function register(server, ctx) {
                     if (outputLines.length >= userMaxResults) break;
                 }
 
-                // Enforce char budget
                 const budgetLines = [];
                 let charCount = 0;
                 for (const line of outputLines.slice(0, userMaxResults)) {
@@ -198,17 +229,13 @@ export function register(server, ctx) {
                     charCount += line.length + 1;
                 }
 
-                const text = budgetLines.length > 0
-                    ? budgetLines.join('\n')
-                    : 'No matches.';
-                return {
-                    content: [{ type: "text", text }],
-                };
+                const text = budgetLines.length > 0 ? budgetLines.join('\n') : 'No matches.';
+                return { content: [{ type: "text", text }] };
             }
         }
 
         // ---- STRUCTURAL SIMILARITY MODE ----
-        if (args.structuralQuery) {
+        if (args.mode === "structural") {
             const repoRoot = findRepoRoot(rootPath);
             if (!repoRoot) {
                 return { content: [{ type: 'text', text: 'Not in a git repository.' }] };
@@ -217,7 +244,6 @@ export function register(server, ctx) {
             const db = getDb(repoRoot);
             await indexDirectory(db, repoRoot, rootPath, { maxFiles: 2000 });
 
-            // Resolve query symbol — disambiguate if multiple definitions exist.
             const scopePrefix = path.relative(repoRoot, rootPath);
             const qBaseQuery = scopePrefix
                 ? 'SELECT file_path, line, end_line, kind, type FROM symbols WHERE name = ? AND kind = ? AND file_path LIKE ?'
@@ -252,7 +278,6 @@ export function register(server, ctx) {
                 return { content: [{ type: 'text', text: 'Could not compute fingerprint.' }] };
             }
 
-            // Filter candidates by same symbol type as query.
             const candType = (args.symbolKind && args.symbolKind !== 'any') ? args.symbolKind : (qRow.type || null);
             let candQuery, candParams;
             if (scopePrefix && candType) {
@@ -278,7 +303,6 @@ export function register(server, ctx) {
             for (const cand of candidates) {
                 if (cand.name === args.structuralQuery && cand.file_path === qRow.file_path) continue;
                 const absPath = path.resolve(repoRoot, cand.file_path); // nosemgrep
-
 
                 const lang = getLangForFile(absPath);
                 if (!lang) continue;
@@ -306,7 +330,6 @@ export function register(server, ctx) {
                 return { content: [{ type: 'text', text: 'No structurally similar symbols found.' }] };
             }
 
-            // Enforce char budget on output.
             const outLines = [];
             charCount = 0;
             for (const r of top) {
@@ -318,138 +341,309 @@ export function register(server, ctx) {
             return { content: [{ type: 'text', text: outLines.join('\n') }] };
         }
 
-        // ---- CONTENT SEARCH / FILE FIND MODE ----
+        // ---- DEFINITION MODE (find files defining a symbol) ----
+        if (args.mode === "definition") {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 100));
+            const hasRg = await ripgrepAvailable();
+
+            let rawResults = [];
+
+            if (hasRg) {
+                const extGlobs = args.extensions?.length ? args.extensions.map(e => `*${e}`) : null;
+                const effectivePattern = (extGlobs?.length === 1 && !args.namePattern)
+                    ? extGlobs[0]
+                    : (args.namePattern || null);
+
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: effectivePattern,
+                    pathContains: args.pathContains || null,
+                    maxResults: Math.min(userMaxResults * 5, 2000),
+                    excludePatterns: DEFAULT_EXCLUDE_GLOBS,
+                });
+                if (results !== null) rawResults = results;
+            }
+
+            if (rawResults.length === 0) {
+                const nameRegex = args.namePattern
+                    ? new RegExp(args.namePattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.'), 'i')
+                    : null;
+
+                async function walk(dir) {
+                    if (rawResults.length >= userMaxResults * 5) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; } // nosemgrep
+                    for (const entry of entries) {
+                        if (rawResults.length >= userMaxResults * 5) return;
+                        const fullPath = path.join(dir, entry.name); // nosemgrep
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            try { await ctx.validatePath(fullPath); } catch { continue; }
+                            await walk(fullPath);
+                        } else {
+                            const nameMatch = !nameRegex || nameRegex.test(entry.name);
+                            const pathMatch = !args.pathContains || fullPath.toLowerCase().includes(args.pathContains.toLowerCase());
+                            if (nameMatch && pathMatch) rawResults.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            if (args.extensions?.length) {
+                const extSet = new Set(args.extensions.map(e => e.toLowerCase()));
+                rawResults = rawResults.filter(f => extSet.has(path.extname(f).toLowerCase()));
+            }
+
+            const supportedFiles = rawResults.filter(f => isSupported(f));
+            if (supportedFiles.length === 0) {
+                return { content: [{ type: "text", text: 'No supported files found for symbol search.' }] };
+            }
+
+            const BATCH_SIZE = 50;
+            const MAX_FILE_SIZE = 512 * 1024;
+            const symbolName = args.definesSymbol;
+            const symbolMatches = [];
+
+            for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
+                const batch = supportedFiles.slice(i, i + BATCH_SIZE);
+                const results = await Promise.all(batch.map(async (filePath) => {
+                    try {
+                        const stat = await fs.stat(filePath); // nosemgrep
+                        if (stat.size > MAX_FILE_SIZE || stat.size === 0) return null;
+
+                        const langName = getLangForFile(filePath);
+                        if (!langName) return null;
+
+                        const source = await fs.readFile(filePath, 'utf-8'); // nosemgrep
+                        const defs = await getDefinitions(source, langName);
+                        if (!defs) return null;
+
+                        const parts = symbolName.split('.');
+                        const targetName = parts[parts.length - 1];
+                        const parentNames = parts.slice(0, -1);
+
+                        let matches = defs.filter(d => d.name === targetName);
+                        if (matches.length === 0) return null;
+
+                        if (parentNames.length > 0) {
+                            matches = matches.filter(sym => {
+                                let current = sym;
+                                for (let pi = parentNames.length - 1; pi >= 0; pi--) {
+                                    const parent = defs.find(d =>
+                                        d.name === parentNames[pi] &&
+                                        d.line <= current.line &&
+                                        d.endLine >= current.endLine &&
+                                        d !== current
+                                    );
+                                    if (!parent) return false;
+                                    current = parent;
+                                }
+                                return true;
+                            });
+                            if (matches.length === 0) return null;
+                        }
+
+                        return { filePath, matches };
+                    } catch {
+                        return null;
+                    }
+                }));
+
+                for (const result of results) {
+                    if (result) symbolMatches.push(result);
+                }
+
+                if (symbolMatches.length >= userMaxResults) break;
+            }
+
+            if (symbolMatches.length === 0) {
+                return { content: [{ type: "text", text: 'No matches.' }] };
+            }
+
+            const outputLines = [];
+            for (const { filePath, matches } of symbolMatches.slice(0, userMaxResults)) {
+                for (const sym of matches) {
+                    outputLines.push(`${filePath}:${sym.line}  [${sym.type}] ${sym.name} (lines ${sym.line}-${sym.endLine})`);
+                }
+            }
+
+            return { content: [{ type: "text", text: outputLines.join('\n') }] };
+        }
+
+        // ---- FILES MODE ----
+        if (args.mode === "files") {
+            const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 100));
+            const hasRg = await ripgrepAvailable();
+
+            let rawResults = [];
+
+            if (hasRg) {
+                const extGlobs = args.extensions?.length ? args.extensions.map(e => `*${e}`) : null;
+                const effectivePattern = args.pattern
+                    || ((extGlobs?.length === 1 && !args.namePattern) ? extGlobs[0] : (args.namePattern || null));
+
+                const results = await ripgrepFindFiles(rootPath, {
+                    namePattern: effectivePattern,
+                    pathContains: args.pathContains || null,
+                    maxResults: Math.min(userMaxResults * 2, 2000),
+                    excludePatterns: DEFAULT_EXCLUDE_GLOBS,
+                });
+                if (results !== null) rawResults = results;
+            }
+
+            if (rawResults.length === 0) {
+                const nameRegex = args.namePattern
+                    ? new RegExp(args.namePattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.'), 'i')
+                    : null;
+
+                async function walk(dir) {
+                    if (rawResults.length >= userMaxResults) return;
+                    let entries;
+                    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; } // nosemgrep
+                    for (const entry of entries) {
+                        if (rawResults.length >= userMaxResults) return;
+                        const fullPath = path.join(dir, entry.name); // nosemgrep
+                        const rel = path.relative(rootPath, fullPath);
+                        if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                        if (isSensitive(fullPath)) continue;
+                        if (entry.isDirectory()) {
+                            try { await ctx.validatePath(fullPath); } catch { continue; }
+                            await walk(fullPath);
+                        } else if (entry.isFile()) {
+                            const nameMatch = !nameRegex || nameRegex.test(entry.name);
+                            const patternMatch = !args.pattern || minimatch(rel, args.pattern, { dot: true });
+                            const pathMatch = !args.pathContains || fullPath.toLowerCase().includes(args.pathContains.toLowerCase());
+                            if (nameMatch && patternMatch && pathMatch) rawResults.push(fullPath);
+                        }
+                    }
+                }
+                await walk(rootPath);
+            }
+
+            if (args.extensions?.length) {
+                const extSet = new Set(args.extensions.map(e => e.toLowerCase()));
+                rawResults = rawResults.filter(f => extSet.has(path.extname(f).toLowerCase()));
+            }
+
+            rawResults = rawResults.slice(0, userMaxResults);
+            rawResults.sort();
+
+            let outputLines;
+            if (args.includeMetadata && rawResults.length > 0) {
+                outputLines = await Promise.all(rawResults.map(async (filePath) => {
+                    try {
+                        const stat = await fs.stat(filePath); // nosemgrep
+                        const sizeKB = (stat.size / 1024).toFixed(1);
+                        const modified = stat.mtime.toISOString().slice(0, 10);
+                        return `${filePath}  (${sizeKB}KB, ${modified})`;
+                    } catch {
+                        return filePath;
+                    }
+                }));
+            } else {
+                outputLines = rawResults;
+            }
+
+            const budgetLines = [];
+            let charCount = 0;
+            for (const line of outputLines) {
+                if (charCount + line.length + 1 > CHAR_BUDGET) break;
+                budgetLines.push(line);
+                charCount += line.length + 1;
+            }
+
+            const text = budgetLines.length > 0 ? budgetLines.join('\n') : 'No files found.';
+            return { content: [{ type: "text", text }] };
+        }
+
+        // ---- CONTENT SEARCH MODE ----
         const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
         const contextLines = Math.max(0, args.contextLines ?? 0);
+        const allExcludes = DEFAULT_EXCLUDE_GLOBS;
 
-        const callerExcludes = args.excludePatterns ?? [];
-        const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
-        const allExcludes = [...callerExcludes, ...defaultExcludeGlobs];
-
-        const mode = (!args.contentQuery && args.pattern) ? 'files' : 'content';
-
-        let contentRegex;
-        if (mode === 'content') {
-            if (!args.contentQuery) {
-                throw new Error("Provide contentQuery for content search, or pattern without contentQuery for file search.");
-            }
-            const flags = args.ignoreCase ? 'gi' : 'g';
-            contentRegex = args.literalSearch
-                ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags) // nosemgrep
-                : new RegExp(args.contentQuery, flags); // nosemgrep
-        }
+        const flags = args.ignoreCase ? 'gi' : 'g';
+        const contentRegex = args.literalSearch
+            ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags) // nosemgrep
+            : new RegExp(args.contentQuery, flags); // nosemgrep
 
         // ---- RIPGREP PATH ----
         const hasRg = await ripgrepAvailable();
         if (hasRg) {
-            if (mode === 'files') {
-                const results = await ripgrepFindFiles(rootPath, {
-                    namePattern: args.pattern || null,
-                    maxResults: userMaxResults,
-                    excludePatterns: allExcludes,
-                });
-                if (results !== null) {
-                    const text = results.length > 0 ? results.join('\n') : 'No files found.';
-                    return {
-                        content: [{ type: "text", text }],
-                    };
+            let rgResults = null;
+
+            if (args.contentQuery.length > 2) {
+                try {
+                    const candidateFiles = await bm25PreFilterFiles(
+                        rootPath,
+                        args.contentQuery,
+                        100,
+                        allExcludes
+                    );
+
+                    if (candidateFiles.length > 0) {
+                        rgResults = await ripgrepSearch(rootPath, {
+                            contentQuery: args.contentQuery,
+                            filePattern: args.pattern || null,
+                            ignoreCase: args.ignoreCase ?? true,
+                            maxResults: Math.max(userMaxResults, 500),
+                            excludePatterns: allExcludes,
+                            contextLines,
+                            literalSearch: args.literalSearch ?? false,
+                            includeHidden: args.includeHidden ?? false,
+                            fileList: candidateFiles,
+                        });
+                    }
+                } catch {
                 }
             }
 
-            if (mode === 'content') {
-                let rgResults = null;
+            if (rgResults === null) {
+                rgResults = await ripgrepSearch(rootPath, {
+                    contentQuery: args.contentQuery,
+                    filePattern: args.pattern || null,
+                    ignoreCase: args.ignoreCase ?? true,
+                    maxResults: Math.max(userMaxResults, 500),
+                    excludePatterns: allExcludes,
+                    contextLines,
+                    literalSearch: args.literalSearch ?? false,
+                    includeHidden: args.includeHidden ?? false,
+                });
+            }
 
-                if (args.contentQuery.length > 2) {
-                    try {
-                        const candidateFiles = await bm25PreFilterFiles(
-                            rootPath,
-                            args.contentQuery,
-                            100,
-                            allExcludes
-                        );
+            if (rgResults !== null) {
+                if (rgResults.length === 0) {
+                    return { content: [{ type: "text", text: 'No matches.' }] };
+                }
 
-                        if (candidateFiles.length > 0) {
-                            rgResults = await ripgrepSearch(rootPath, {
-                                contentQuery: args.contentQuery,
-                                filePattern: args.pattern || null,
-                                ignoreCase: args.ignoreCase ?? true,
-                                maxResults: Math.max(userMaxResults, 500),
-                                excludePatterns: allExcludes,
-                                contextLines,
-                                literalSearch: args.literalSearch ?? false,
-                                includeHidden: args.includeHidden ?? false,
-                                fileList: candidateFiles,
-                            });
-                        }
-                    } catch {
+                if (args.countOnly) {
+                    const fileSet = new Set(rgResults.map(r => r.file));
+                    return { content: [{ type: "text", text: `matches: ${rgResults.length}\nfiles: ${fileSet.size}` }] };
+                }
+
+                const rawLines = rgResults.map(r => `${r.file}:${r.line}: ${r.content}`);
+
+                let outputLines;
+                if (rawLines.length > RANK_THRESHOLD) {
+                    const { ranked } = bm25RankResults(rawLines, args.contentQuery, SEARCH_CHAR_BUDGET);
+                    outputLines = ranked;
+                } else {
+                    outputLines = [];
+                    let charCount = 0;
+                    for (const line of rawLines) {
+                        if (charCount + line.length + 1 > SEARCH_CHAR_BUDGET) break;
+                        outputLines.push(line);
+                        charCount += line.length + 1;
                     }
                 }
 
-                // Fallback if BM25 didn't run or failed
-                if (rgResults === null) {
-                    rgResults = await ripgrepSearch(rootPath, {
-                        contentQuery: args.contentQuery,
-                        filePattern: args.pattern || null,
-                        ignoreCase: args.ignoreCase ?? true,
-                        maxResults: Math.max(userMaxResults, 500),
-                        excludePatterns: allExcludes,
-                        contextLines,
-                        literalSearch: args.literalSearch ?? false,
-                        includeHidden: args.includeHidden ?? false,
-                    });
-                }
-
-                if (rgResults !== null) {
-                    if (rgResults.length === 0) {
-                        const text = 'No matches.';
-                        return {
-                            content: [{ type: "text", text }],
-                        };
-                    }
-
-                    // ---- COUNT-ONLY MODE ----
-                    if (args.countOnly) {
-                        const fileSet = new Set(rgResults.map(r => r.file));
-                        const text = `matches: ${rgResults.length}\nfiles: ${fileSet.size}`;
-                        return {
-                            content: [{ type: "text", text }],
-                        };
-                    }
-
-                    // Format results as lines
-                    const rawLines = rgResults.map(r => `${r.file}:${r.line}: ${r.content}`);
-
-                    // ---- POST-FILTER MODE ----
-                    let outputLines;
-
-                    if (rawLines.length > RANK_THRESHOLD) {
-                        const { ranked } = bm25RankResults(
-                            rawLines, args.contentQuery, SEARCH_CHAR_BUDGET
-                        );
-                        outputLines = ranked;
-                    } else {
-                        outputLines = [];
-                        let charCount = 0;
-                        for (const line of rawLines) {
-                            if (charCount + line.length + 1 > SEARCH_CHAR_BUDGET) break;
-                            outputLines.push(line);
-                            charCount += line.length + 1;
-                        }
-                    }
-
-                    const text = outputLines.join('\n');
-                    return {
-                        content: [{ type: "text", text }],
-                    };
-                }
-
+                return { content: [{ type: "text", text: outputLines.join('\n') }] };
             }
         }
 
         // ------------------------------------------------------------------
-        // JS fallback
+        // JS fallback (content mode)
         // ------------------------------------------------------------------
-        const fileResults = [];
         const contentResults = [];
         const maxJsFallback = Math.min(200, userMaxResults);
 
@@ -468,7 +662,7 @@ export function register(server, ctx) {
         }
 
         async function walk(dir) {
-            if (fileResults.length >= maxJsFallback && contentResults.length >= maxJsFallback) return;
+            if (contentResults.length >= maxJsFallback) return;
             let entries;
             try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; } // nosemgrep
             for (const entry of entries) {
@@ -483,54 +677,33 @@ export function register(server, ctx) {
                 if (entry.isDirectory()) {
                     await walk(fullPath);
                 } else if (entry.isFile()) {
-                    if (mode === 'files') {
-                        if (minimatch(rel, args.pattern, { dot: true })) {
-                            fileResults.push(fullPath);
-                            if (fileResults.length >= maxJsFallback) return;
-                        }
-                    } else {
-                        if (!args.pattern || minimatch(rel, args.pattern, { dot: true })) await grepFile(fullPath);
-                    }
+                    if (!args.pattern || minimatch(rel, args.pattern, { dot: true })) await grepFile(fullPath);
                 }
             }
         }
 
         await walk(rootPath);
 
-        const results = mode === 'files' ? fileResults : contentResults;
-
-        // ---- COUNT-ONLY MODE (JS fallback) ----
         if (args.countOnly) {
             const fileSet = new Set(contentResults.map(r => r.split(':')[0]));
-            const text = mode === 'files'
-                ? `files: ${results.length}`
-                : `matches: ${results.length}\nfiles: ${fileSet.size}`;
-            return {
-                content: [{ type: "text", text }],
-            };
+            return { content: [{ type: "text", text: `matches: ${contentResults.length}\nfiles: ${fileSet.size}` }] };
         }
 
-        // Apply BM25 post-filter on JS fallback too if over threshold
         let finalOutput;
-        if (mode !== 'files' && results.length > RANK_THRESHOLD && args.contentQuery) {
-            const { ranked } = bm25RankResults(results, args.contentQuery, SEARCH_CHAR_BUDGET);
+        if (contentResults.length > RANK_THRESHOLD) {
+            const { ranked } = bm25RankResults(contentResults, args.contentQuery, SEARCH_CHAR_BUDGET);
             finalOutput = ranked;
         } else {
-            // Truncate to char budget
             finalOutput = [];
             let charCount = 0;
-            for (const line of results) {
+            for (const line of contentResults) {
                 if (charCount + line.length + 1 > SEARCH_CHAR_BUDGET) break;
                 finalOutput.push(line);
                 charCount += line.length + 1;
             }
         }
 
-        const text = finalOutput.length > 0
-            ? finalOutput.join('\n')
-            : 'No matches.';
-        return {
-            content: [{ type: "text", text }],
-        };
+        const text = finalOutput.length > 0 ? finalOutput.join('\n') : 'No matches.';
+        return { content: [{ type: "text", text }] };
     });
 }

@@ -10,14 +10,10 @@ import { register as registerReadMediaFile } from '../tools/read_media_file.js';
 import { register as registerReadMultipleFiles } from '../tools/read_multiple_files.js';
 import { register as registerWriteFile } from '../tools/write_file.js';
 import { register as registerEditFile } from '../tools/edit_file.js';
-import { register as registerCreateDirectory } from '../tools/create_directory.js';
 import { register as registerListDirectory } from '../tools/list_directory.js';
 import { register as registerDirectoryTree } from '../tools/directory_tree.js';
-import { register as registerMoveFile } from '../tools/move_file.js';
-import { register as registerDeleteFile } from '../tools/delete_file.js';
 import { register as registerSearchFiles } from '../tools/search_files.js';
-import { register as registerFindFiles } from '../tools/find_files.js';
-import { register as registerGetFileInfo } from '../tools/get_file_info.js';
+import { register as registerFilesystem } from '../tools/filesystem.js';
 import { register as registerStashRestore } from '../tools/stash_restore.js';
 import { onRootsChanged } from './project-context.js';
 
@@ -58,14 +54,10 @@ function registerAllTools(server, ctx) {
   registerReadMultipleFiles(server, ctx);
   registerWriteFile(server, ctx);
   registerEditFile(server, ctx);
-  registerCreateDirectory(server, ctx);
   registerListDirectory(server, ctx);
   registerDirectoryTree(server, ctx);
-  registerMoveFile(server, ctx);
-  registerDeleteFile(server, ctx);
   registerSearchFiles(server, ctx);
-  registerFindFiles(server, ctx);
-  registerGetFileInfo(server, ctx);
+  registerFilesystem(server, ctx);
   registerStashRestore(server, ctx);
 }
 

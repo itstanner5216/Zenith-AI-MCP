@@ -1,21 +1,38 @@
-# Codebase Symbol Index — Design Specification
+# Refactor Batch Tool — Design Specification
 
 ## Overview
 
-This document describes the design goals for a new subsystem integrated into the existing Secure Filesystem MCP Server. The subsystem provides per-project (per-git-repo) SQLite-backed symbol indexing with dependency impact analysis, context-efficient batch diff editing, edit versioning, and cross-session pattern reuse. It is designed to give an agent the ability to scope, plan, batch-edit, and safely roll back refactors in a fraction of the context that traditional file-read-edit workflows consume.
+This document specifies a new MCP tool, `refactor_batch`, for the Zenith-MCP server. It enables an agent to apply one edit pattern across N similar symbols in a git repository, with impact analysis, structural outlier detection, atomic batch apply, and symbol-versioned rollback.
 
-The entire feature surface is exposed as **one tool** — a new mode that extends the existing `edit_file` tool rather than adding parallel tools the agent has to discover and choose between. This is load-bearing: the server steers the workflow through sequential auto-progression, which is what reliably gets an agent to use it correctly rather than fall back to naive file-reading.
+It is built as a **separate tool**, not as an extension of `edit_file`. A previous attempt to bolt this workflow onto `edit_file` produced ~165 lines of dead code and a bloated schema; that approach is not repeated.
+
+The pitch is honest: this is not "refactor an entire repo in 2-3 calls." It is "apply one edit pattern across N similar symbols safely, with rollback, in one workflow." Realistic gain is **3–10× reduction in tool calls on the batchable slice of a refactor** (renames, deprecations, migration sweeps, logging/telemetry rollouts, error-type swaps), plus a symbol-level safety net the rest of the server doesn't have today.
 
 ---
 
 ## Guiding Philosophy
 
-The existing server already enforces one rule above all others: **return only new, decision-relevant information, never waste context.** This subsystem must obey the same constraint throughout every design decision.
+The existing server's hard rule applies here: **return only new, decision-relevant information; never waste context.** Every response is minimal, every parameter has a clear purpose, every workflow step earns its place by removing more agent calls than it adds.
 
-Every feature answers one of three questions a model asks during a refactor:
-1. **What is the scope of this work?** (impact analysis)
-2. **What exactly needs to change?** (batch diff editing)
-3. **Can I safely undo or reapply this?** (versioning and pattern reuse)
+The tool answers three questions an agent asks during a refactor:
+1. **What is the scope?** (impact analysis)
+2. **What exactly needs to change?** (diff load with context)
+3. **Can I undo or reapply this?** (versioning + reapply)
+
+---
+
+## Architectural Decisions (Locked)
+
+These are decisions made up-front based on lessons from the previous failed attempt and from honest assessment of the realistic value:
+
+1. **Separate tool, not an `edit_file` mode.** `refactor_batch` is its own tool. `edit_file` stays lean and stateless. Both share `core/edit-engine.js` for actual mutation logic.
+2. **Workflow gating via error messages, not coupled state.** The mandatory "load before apply" gate is enforced by the server returning a clear error pointing to the next call. Same pattern `stashRestore` uses today. No bundled state machine forced through one tool.
+3. **Caps are by character count, not occurrence count.** Hallucination risk scales with regenerated output size. The server enforces a max regenerated-content budget per apply call.
+4. **Context lines around symbols are loaded by default.** The agent gets the function body PLUS configurable lines above and below. The model needs surrounding context to know HOW to edit, not just WHAT.
+5. **Outlier detection uses Tree-sitter structural comparison, not text heuristics.** Param node-type sequences, return-type kinds, parent-scope kinds. No comma counting.
+6. **SQLite uses WAL mode and concurrent-safe writes.** Parallel sub-agent orchestration is a supported usage pattern, not a tool feature.
+7. **Symbol-version subsystem ships first, standalone.** Lower risk, independently valuable, gives `edit_file` a safety net before batch ever lands.
+8. **Tool description is honest.** Not "refactor a codebase." It says: "Apply one edit pattern across multiple similar symbols, with rollback."
 
 ---
 
@@ -23,41 +40,27 @@ Every feature answers one of three questions a model asks during a refactor:
 
 ### 1. Per-Project SQLite Database (Auto-Provisioned)
 
-Each git repository root gets its own SQLite file, auto-created on first use and auto-discovered thereafter. The database stores the structured symbol graph for the project.
+Each git repository root gets its own SQLite file, auto-created on first use, gitignored.
 
-**Design Goals:**
-
-- Provisioning is invisible to the agent — activating the tool in a new repo just works.
-- The database lives at `.mcp/` in the repo root, travels with the project, and is gitignored by default.
-- Schema indexes at minimum: symbol name, kind (function, class, method, variable), definition file path (repo-relative), and a serialized call/reference graph edge table.
-- Populated and kept fresh via Tree-sitter (already integrated) — no new parsing infrastructure needed. The existing WASM grammars handle extraction.
-- Updates are incremental: when a file changes, only that file's symbols are re-parsed and re-written. A file hash check determines whether re-indexing is needed.
-- After every successful batch apply, the server immediately re-parses and re-indexes the affected files internally. This is not a tool call — it is a required side effect of every apply. A stale index after an edit would corrupt subsequent impact queries in the same session, making multi-round refactors unreliable.
-- The model may exclude a specific symbol occurrence from batch operations by supplying its exact line number as an exclusion hint. The line number must be obtained independently via an existing search tool — this subsystem does not resolve line numbers and is not a codebase search tool. For example, if the model has already located a symbol in a file outside the intended edit scope (e.g., `read_text_file` with `symbol:` mode returned line 88 for a known outlier), it passes that line number as an exclusion hint so the index skips that specific occurrence.
+- **Location:** `.mcp/symbols.db` at repo root.
+- **Mode:** WAL (`PRAGMA journal_mode=WAL`). Required for parallel sub-agent safety.
+- **Schema:** symbol name, kind, repo-relative file path, file hash, last-indexed timestamp, call/reference graph edges, symbol-version snapshots.
+- **Population:** Tree-sitter (existing WASM grammars). No new parsing infrastructure.
+- **Updates:** Incremental, file-hash gated. Re-index runs after every successful apply.
+- **Concurrency:** Re-indexing is idempotent — safe if another agent already re-indexed the same file. Writes serialize at the SQLite layer; no application-level lock needed beyond what WAL gives you. Document the realistic ceiling: 3–8 parallel agents on the same repo before SQLite write contention starts to matter.
+- **Project-root resolution:** Use existing `findRepoRoot` from `core/symbol-index.js`. Non-git roots can be registered via the existing `stashRestore init` mode (or auto-created lazily on first batch call).
 
 ---
 
 ### 2. Impact Query
 
-The first thing an agent needs before touching anything is blast radius: "If I change `processPayment`, how many other symbols call it or depend on it?"
+The first thing an agent needs before touching anything is blast radius.
 
-**Design Goals:**
-
-- Returns a numbered flat list of every symbol that references the target, grouped by file. No headers, no separators, no line numbers.
-- Intentionally terse: symbol name, reference count, and repo-relative file path only. Line numbers are deliberately omitted — the server holds them internally but they are not decision-relevant here. If the agent needs to locate a symbol precisely, it uses an existing search tool on the now-known target file.
-- **Symbol disambiguation:** In large repos, the same name may be defined in multiple modules. If the query resolves more than one definition, the server returns them grouped by definition site and requires the agent to narrow scope before proceeding:
-  ```
-  Multiple definitions found for "validateToken":
-  a) auth/tokens.js
-  b) legacy/compat.js
-  c) api/middleware.js
-  Specify a definition to continue.
-  ```
-  The agent may also pass an optional file scope parameter upfront to skip disambiguation entirely.
-- Supports reverse queries — "what does this symbol call?" — and multi-hop depth queries so the agent can ask "what is affected two levels out?" without additional round trips.
+- **Output:** numbered flat list of symbols that reference the target, grouped by file. Symbol name, reference count, repo-relative path. **No line numbers** — those are not decision-relevant at this stage. If the agent needs precise locations later, it uses `search_files`.
+- **Disambiguation:** if the target name resolves to multiple definitions, return the candidate definition sites and require the agent to narrow scope before proceeding.
+- **Reverse + multi-hop:** support "what does this call?" and N-level transitive queries.
 
 **Example response:**
-
 ```
 1) validateCard[4x] (payments/validator.js)
 2) chargeStripe[3x] (payments/stripe.js)
@@ -66,204 +69,248 @@ The first thing an agent needs before touching anything is blast radius: "If I c
 12 total
 ```
 
-The server's response always ends with a prompt for the next step: the numbered list of what the agent can specify to load into the diff.
+The response is terminal information — no prose tail like "now call load with…" The next-step is implied by the tool's documented workflow and reinforced by error messages if the agent skips ahead.
 
 ---
 
-### 3. Drill Down & Batch Diff Editing
+### 3. Diff Load (with Context)
 
-After reviewing the impact list, the agent selects which symbols to load. This is a mandatory view step — **the diff cannot be bypassed**. The agent must see the function bodies before any edit is accepted. The server enforces this; providing an edit payload without a loaded diff is rejected.
+After reviewing the impact list, the agent calls `load` with target indices or symbol names, plus an optional context range.
 
-- **Function body loading:** The server loads the complete function body for each selected symbol. No context range parameter — the function boundaries detected by Tree-sitter define what is loaded. If the agent needs surrounding context beyond the function body, it already has that from compressed reads of the file.
+- **Function body:** loaded uncompressed via Tree-sitter symbol bounds.
+- **Context range:** integer parameter, default 5, max 30. The server includes that many lines above the symbol and that many lines below. This is how the model differentiates implementation contexts across files — try/catch wrapper, surrounding helpers, scope kind, file conventions. Cost is trivial; benefit is the model can actually edit correctly.
+- **Char-based budget cap.** Default 30,000 characters of regenerated content per `apply` call (configurable via env). The `load` step computes total payload size including context lines and headers; if it exceeds budget, the server loads as many symbols as fit and reports remaining count. Pagination via `loadMore`. Never silently truncates mid-symbol.
+  - Why chars not occurrences: hallucination risk scales with output size, not input size. 50 small functions is fine; 15 large ones is the danger zone. Char-based cap self-adjusts.
+- **Outlier detection (real, structural):** Before assembling the diff, the server compares each occurrence within a symbol group using Tree-sitter:
+  - Param node-type sequence (e.g., `Identifier, Identifier, ObjectPattern` vs `Identifier, Identifier`)
+  - Return-type node kind
+  - Parent-scope kind (e.g., `class_declaration` vs `program`)
+  - Decorator presence
+  - Async/generator modifiers
+  Divergent occurrences are flagged inline with `⚠ <reason>`. **Flagged occurrences require explicit acknowledgement in the apply payload** (e.g., `validateCard 1,2,3 ack:3`) — without ack, the apply rejects them. This is the load-bearing safety mechanism; it is not optional.
 
-The server assembles a single compact diff document. Each symbol group gets a header; its occurrences — the individual places that symbol appears across the codebase — are numbered sequentially within the group. "Occurrence N" is the Nth entry in the diff for that group, not a line number.
-
+**Example diff:**
 ```
+4 in payments/validator.js, 3 in payments/stripe.js
 validateCard [1] payments/validator.js
+  // upstream: called from checkout.js
+function validateCard(card) {
+  if (!card.number) throw new InvalidCardError()
+  return luhn(card.number)
+}
+  // downstream: feeds into chargeStripe
 
-<function body>
-
-validateCard [2] payments/stripe.js
-
-<function body>
+validateCard [2] payments/stripe.js ⚠ param shape differs
+function validateCard({ card, ctx }) {
+  ...
+}
 ```
 
-This continues for however many symbol groups were requested. All groups are concatenated into one response — one step, all targets loaded.
+---
 
-**Design Goals:**
+### 4. Apply
 
-- The server pulls each selected symbol from the SQLite index (re-reading the file if the entry is stale).
-- **Context budget enforcement:** If the requested selection would exceed the server's character budget, the server loads as many symbols as fit and returns a count of what was deferred:
-```
-31 of 47 loaded. Next: 32-47
-```
-  It never silently truncates mid-symbol.
-- **Outlier detection:** Before returning the diff, the server scans each occurrence within a group for structural divergence — differing call signatures, integration patterns, or surrounding context suggesting the occurrence may not safely accept the same edit as its peers. Divergent occurrences are flagged inline:
-```
-validateCard [3] payments/checkout.js ⚠ signature differs
-```
-  If occurrences within a group require fundamentally different edits, they should be excluded from the batch and handled directly with `edit_file`. The batch is designed for applying one edit across N identical-or-near-identical occurrences.
-- **Dry-run mode:** When the model returns an edit payload with `dryRun: true`, the server runs the syntax gate and reports CAUTION flags but applies nothing:
+The agent returns the edited diff with occurrence selectors.
 
-```
-  Dry run: 14 edits across 6 files — 0 syntax errors, 2 CAUTION flags (validateCard/3, auditLog/1)
-```
-
-  Dry-run is only available once an edit payload has been provided — it cannot be invoked without one.
-- **Syntax validation gate (pre-apply, critical):** Before any edit is committed, the server parses the incoming diff through Tree-sitter and rejects any chunk that would produce syntactically invalid code. Rejection is minimal: chunk index and parse error only. No partial commits.
-- **Applying edits:** The model returns one edited diff payload. For each symbol group it lists only the occurrences it is targeting — comma-separated indices. Occurrences not listed are not touched. No exclusion syntax.
-```
-validateCard 1,2,3
-
-function validateCard(card) { if (!card.number) throw new InvalidCardError() return luhn(card.number) }
-
-chargeStripe 1,2,3
-```
-
-The server matches each group to its source files via the loaded diff metadata and applies all edits atomically using the existing `edit_file` Symbol Mode machinery. If occurrences within a group require different edits, the model submits them as separate groups with the specific occurrence indices:
-```  
-validateCard 1,3
-
-validateCard 2
-```
-- **Batch calls:** The model can pass multiple symbol groups in a single call. The workflow above handles each group simultaneously — a failure in one group does not block the others.
-- **Failure handling:** If any chunk fails to apply, the entire group for that symbol is rejected. Groups that applied successfully are not rolled back. The server returns the minimal failing snippet(s). The model has **one** opportunity to submit a corrected edit for the failed group. If that also fails:
+- **Format:** symbol header line with comma-separated occurrence indices, optional `ack:` for flagged outliers, then the new body.
   ```
-  Review and edit this symbol directly — the file may have changed since the diff was loaded.
+  validateCard 1,2,3
+  function validateCard(card) { ... }
+  
+  chargeStripe 1,2 ack:2
+  function chargeStripe(card, amount) { ... }
   ```
-  No further retries are accepted for that group in the current session unless a direct targeted edit is applied separately from this tool.
-- **Token efficiency goal:** The agent reads and rewrites only the relevant function bodies plus narrow context — not entire files. For a 20-function refactor across 8 files, this is expected to reduce token consumption by 3–5× compared to read-then-edit workflows.
-
-- **Compression integration:** The batch diff always loads uncompressed function bodies. Compression is never applied to the edit surface. The expected workflow is: the agent explores the codebase via compressed reads (`read_multiple_files` with compression on by default), builds its mental model of the architecture, identifies targets, then enters the batch workflow with those targets. The batch tool handles exact content from that point forward. The agent does not need to re-read files uncompressed before entering the batch workflow — the batch tool does this internally.
-
----
-
-### 4. Edit Versioning (Undo / Restore)
-
-Every symbol body the batch editor touches is snapshotted into the SQLite database before the edit is applied. Restore and reapply only become available after at least one edit has landed in the current session.
-
-**Design Goals:**
-
-- Pre-edit source text is stored against the symbol's identifier and session identifier (keyed to server PID and working directory). This is automatic — the agent does not manage it.
-- The agent can query version history for a symbol and get a terse list of prior versions with timestamps to understand prior edits if context was lost during a compaction phase. 
-- A restore operation takes a symbol identifier (or a list) and a version reference, and writes the prior text back using the same atomic edit machinery. Restores are themselves versioned so history is never lost.
-- **Reapply:** Once an edit has been applied, the server caches the edit payload for the session. The agent can apply the cached edit to new targets — including symbols it previously excluded — without rewriting the edit body. This is how a pattern discovered mid-session gets applied to additional functions found later.
-- Version entries expire at session close. Old snapshots are pruned automatically on session start.
-
-**Why this matters:** The model can refactor confidently knowing it has a symbol-level safety net. Three turns after a batch edit, if it determines two of the changed functions broke an invariant, it restores exactly those two without touching anything else.
+- **Pre-apply gates (in order):**
+  1. **Load required.** No load → reject with pointer to load step.
+  2. **Outlier ack required.** Any flagged occurrence in the apply set without `ack:` → reject with the flagged indices listed.
+  3. **Char budget.** Total regenerated content > budget → reject with suggestion to split.
+  4. **Syntax gate (Tree-sitter parse).** Any chunk that produces parse errors → reject with chunk index and parse-error line/column. No partial commits.
+- **Application:** Reuses `core/edit-engine.js` symbol-mode logic. Same atomic temp-file + rename machinery already proven in `edit_file`.
+- **Per-group failure semantics:** If a chunk fails syntax or apply, the whole group for that symbol rejects. Other groups that already succeeded are NOT rolled back (they were atomically written). The agent gets one retry on the failed group; failure on retry returns a "review directly" message and locks that group out of the current session.
+- **Dry-run:** `dryRun: true` runs all gates, returns syntax-check + outlier summary, applies nothing. Available only with a real edit payload.
+- **Post-apply:**
+  - Snapshot pre-edit text of every modified symbol into the version store.
+  - Re-index affected files (incremental, file-hash gated).
+  - Cache the apply payload for `reapply`.
+  - Return minimal success: `Applied N symbols across M files.`
 
 ---
 
-### 5. Structural Search (Absorbed into `search_files`)
+### 5. Symbol Versioning (Ship First, Standalone)
 
-Pattern and structural similarity search — "find other symbols in this repo with the same shape as the ones I just edited" — is not a separate tool. This capability is added as a query mode to the existing `search_files` tool, which already has `symbolQuery` backed by Tree-sitter and BM25. Structural matching is another query type on the same stack: same kind, similar call sites, similar parameter shapes, using Tree-sitter node-type matching rather than text matching.
+This subsystem is independently valuable and ships **before** the batch workflow lands. It gives `edit_file` a safety net even without `refactor_batch`. The batch tool layers on top of this proven base.
 
-This keeps the tool count flat and puts the capability where search already lives.
-
----
-
-### 6. User-Facing Safety
-
-The primary user-facing safety tool is **git**. Before starting a major refactor session, users should commit or stash current state. The SQLite version store handles mid-session, per-symbol restores at the agent level — restore is available as a parameter on the same tool.
-
-A dedicated standalone CLI is not a priority. Git's existing tooling (`git diff`, `git restore`, `git stash`) covers the user-facing safety surface more robustly than a bespoke CLI would. The agent's restore capability handles the in-session use case.
-
----
-## The Single-Tool State Machine
-
-The entire workflow is one tool — a `batch` mode that extends `edit_file`. All parameters exist in the schema at all times, but the server enforces one mandatory gate: the diff must be returned before an edit is accepted. Providing an edit payload without a loaded diff is rejected.
-
-**Stage 0 → 2: Default Path (Skip-Ahead)**
-The agent calls `batch` with `symbols` (exact names with optional file paths). The server loads the diff directly. This is the expected entry point — the agent has already explored the codebase via compressed reads and knows its targets.
-
-**Stage 0 → 1 → 2: Impact Query (On Demand)**
-The agent calls `batch` with a `query` (symbol name, optional file scope, optional depth). The server returns the impact list. The agent responds with `load` (indices or symbol names). The server returns the compact diff document. This path is for when the agent genuinely doesn't know the blast radius — renaming a widely-used function, changing an interface, or modifying a symbol it hasn't encountered across compressed reads.
-
-**Stage 2 → 3: Apply**
-The agent returns the edited diff with occurrence selectors. The server validates, applies, re-indexes, and snapshots originals. On success the server confirms minimally and notes that `restore` and `reapply` are now available.
-
-**Stage 3+: Restore / Reapply**
-Available any time within the session. `restore` takes a symbol and version reference. `reapply` takes new target symbols and applies the cached edit payload without the agent rewriting it.
----
-
-## Data Flow
-
-```
-batch(query?) called
-      │
-      ├─ query provided ─────────────────────────────────────────────────┐
-      │                                                                        │
-      ▼                                                                       ▼
-Server asks for query                          Impact query runs → disambiguation if needed
-                                                                  │
-                                                                  ▼
-                                               Numbered impact list returned + load prompt
-
-                                    ┌─ symbols provided at activation (defaultpath) ┐
-                                    │                                                │
-                                    ▼                                               ▼
-                            Agent specifies load indices + range      Server loads diff
-                                    │                                                │
-                                    └───────────────────────┬────────────┘
-                                                            │
-                                                            ▼                                                                 
-            Budget check → outlier detection → diff assembled (⚠ CAUTION inline)
-                                                            │
-                                                            ▼
-                                Agent reviews diff — CANNOT BE BYPASSED
-                                                            │
-                                                            ▼
-                 Agent returns edited diff + occurrence selectors (optionally dryRun: true)
-                                                            │
-                                          ┌─────────────────┴──────────────────┐
-                                          ▼                                ▼
-                                   dryRun: true                          Normal apply
-                         Validate + report, no write     Syntax gate → snapshot → apply
-                                                                            → internal re-index
-                                                                                │
-                                                              ┌─────────────────┴────────────────┐
-                                                              ▼                                ▼
-                                                   Group failure                           Group success
-                                              Minimal snippet returned              restore / reapply now available
-                                              One retry accepted →
-                                              terminal lock if retry fails
-```
+- **Storage:** `symbol_versions` table in `.mcp/symbols.db`. Keyed by repo-relative path + symbol name + session ID (server PID + repo root).
+- **Capture point:** any symbol-mode edit through `core/edit-engine.js` (whether via `edit_file` or `refactor_batch`) snapshots the pre-edit body.
+- **Version listing:** if `mode === "restore"` is called with a symbol name but no version number, the server returns the version list (timestamp, hash, originating tool). The current behavior of `stash_restore.js:165` (silently calling `restoreVersion(db, args.symbol)` with no list) is replaced.
+- **Restore:** takes symbol + version reference, writes prior text back via the same atomic edit machinery. Restores are themselves versioned so history is never lost.
+- **`dryRun` parameter on restore:** add to schema (current bug: handler references `args.dryRun` but the restore branch schema doesn't declare it).
+- **Pruning:** version entries older than configurable TTL (default: 24h) prune on session start.
 
 ---
 
-## Integration With Existing Server
+### 6. Reapply
 
-This subsystem is additive — it does not modify any existing tool behavior.
+Once an edit has been applied, the server caches the edit payload (per symbol group) for the session.
 
-| Existing Capability | How This Subsystem Uses It |
+- The agent calls `reapply` with new target symbols (names + optional file scopes).
+- The server fetches the cached payload for the originally-edited symbol group, runs the load → outlier-check → syntax-gate → apply pipeline against the new targets.
+- New targets go through the same outlier ack flow. If they're structurally different from the originals, they get flagged and require ack.
+- This is how a pattern discovered mid-session gets propagated to symbols found later, without the agent rewriting the edit body.
+
+---
+
+### 7. Structural Search (Existing `search_files`)
+
+Pattern and structural similarity search ("find other symbols with this shape") is already absorbed into `search_files` via the `structural` mode (per the recent schema refactor). No new tool needed. `refactor_batch` does not duplicate this.
+
+---
+
+## The State Machine
+
+`refactor_batch` is one tool with these modes (`z.discriminatedUnion("mode", [...])`):
+
+1. **`query`** — impact analysis. `target` (symbol name), `fileScope?`, `direction: forward|reverse`, `depth?`.
+2. **`load`** — load function bodies + context. `selection` (indices from query, or explicit `{symbol, file?}` pairs), `contextLines?` (default 5, max 30), `loadMore?` (boolean, continues from prior truncation).
+3. **`apply`** — apply edits. `payload` (the edited diff string), `dryRun?`.
+4. **`reapply`** — apply cached payload to new targets. `symbolGroup` (the originally-edited symbol name), `newTargets`, `dryRun?`.
+5. **`restore`** — restore a symbol to a prior version. `symbol`, `file?`, `version?` (omit to list versions), `dryRun?`.
+6. **`history`** — list version history for a symbol. `symbol`, `file?`.
+
+### Workflow gating (via error messages, not coupled state)
+
+- `apply` without a prior `load` in this session → `"No diff loaded. Call load first."`
+- `apply` payload references symbols not in the loaded diff → `"Unknown symbol: <name>. Load it first."`
+- `apply` includes flagged outlier without `ack:` → `"Flagged outliers require ack: <indices>"`
+- `loadMore` without a prior truncated `load` → `"Nothing to continue."`
+- `reapply` for a symbol group never applied → `"No cached payload for <symbol>."`
+
+Session boundary: server PID + repo root. Both stable → session continues. Either changes → session closes, version snapshots prune per TTL.
+
+---
+
+## Caps & Limits
+
+| Limit | Default | Rationale |
+|---|---|---|
+| `contextLines` | 5 | Enough surrounding context to read intent, not so much that the diff bloats. |
+| `contextLines` max | 30 | High-stakes refactors can dial up. Past 30 the agent should be using `read_text_file` instead. |
+| Apply char budget | 30,000 | Empirical reliability cliff for regenerated code in single LLM output. |
+| Load char budget | 30,000 | Matches apply, since apply re-emits what load returned. |
+| Retry per failed group | 1 | After one retry, lock the group and tell the agent to use `edit_file` directly. |
+| Symbol-version TTL | 24h | Prune on session start. Configurable. |
+| Parallel agents (advisory) | 3–8 per repo | Past this, SQLite write contention starts mattering. Document, don't enforce. |
+
+All limits configurable via env vars: `REFACTOR_MAX_CHARS`, `REFACTOR_MAX_CONTEXT`, `REFACTOR_VERSION_TTL_HOURS`.
+
+---
+
+## Concurrency Model (Parallel Sub-Agents)
+
+Parallel sub-agent orchestration is a **supported usage pattern**, not a tool feature. The orchestrating agent decides how to shard.
+
+**Mandatory invariant:** file-disjoint sharding. Two agents must NEVER write to the same file. Symbol-disjoint is insufficient because two symbols in the same file = two writes = last-write-wins data loss (atomic rename does not help when both writes are valid but to different regions).
+
+**Shard pattern (recommended):**
+1. Orchestrator runs `query` once.
+2. Groups occurrences by `filePath`.
+3. Distributes file-groups across N sub-agents (N=3–8 realistic ceiling).
+4. Each sub-agent independently runs `load` → `apply` on its assigned files.
+5. SQLite WAL handles concurrent readers; writes serialize internally.
+
+**SQLite implementation requirements:**
+- `PRAGMA journal_mode=WAL` set on first `getDb()` call.
+- `PRAGMA synchronous=NORMAL` (WAL-safe, faster than FULL).
+- `PRAGMA busy_timeout=5000` so concurrent writers wait instead of failing immediately.
+- Re-indexing must be idempotent: `INSERT ... ON CONFLICT(path, hash) DO UPDATE` semantics.
+- Version-snapshot writes use `INSERT ... ON CONFLICT(symbol, file, hash) DO NOTHING` so duplicate snapshots from concurrent agents are silently deduplicated.
+
+The tool itself has no awareness of parallel agents — each call is independent. The `core/symbol-index.js` layer guarantees concurrency safety.
+
+---
+
+## Integration with Existing Server
+
+This subsystem is additive — it does not modify any existing tool's behavior.
+
+| Existing capability | How `refactor_batch` uses it |
 |---|---|
-| Tree-sitter WASM parsing | Symbol extraction, boundary detection, outlier detection, syntax validation gate, internal re-index after apply |
-| `edit_file` Symbol Mode | Underlying apply mechanism for batch edits and restores; `batch` mode is an extension of this tool |
-| LRU AST cache | Reused as-is; index population and re-indexing reuse cached parses where available |
-| `validatePath()` security | All SQLite DB paths and file targets pass through existing path validation |
-| `CHAR_BUDGET` | Enforced during diff load to cap payload size and prevent context overrun |
-| `search_files` `symbolQuery` | Extended with structural similarity mode for pattern-based candidate discovery |
-| Minimal response discipline | All server responses follow the same terse, scope-correct rules — including auto-progression prompts |
-| `_pendingRetries` cache pattern | Session state (`_batchSession`) uses the same map-with-TTL pattern already in `edit_file.js` |
+| Tree-sitter WASM parsing | Symbol extraction, boundary detection, structural outlier detection, syntax validation gate |
+| `core/edit-engine.js` (new, extracted from `edit_file.js` + `stash_restore.js`) | Underlying apply mechanism — single source of truth for block/symbol/content edit logic |
+| LRU AST cache | Reused as-is |
+| `validatePath()` security | All file targets pass through existing path validation |
+| `search_files` `structural` mode | Already provides structural-similarity discovery; `refactor_batch` does not duplicate |
+| `findRepoRoot` (`core/symbol-index.js`) | Project-root resolution |
+| Stash subsystem | Not directly used; failed batch groups don't go to stash (they get one retry then lock — different semantics) |
+| `CHAR_BUDGET` (`core/shared.js`) | Hard ceiling above the apply char budget; the apply budget defaults below CHAR_BUDGET |
+
+### Required preliminary refactors (do these first)
+
+Before `refactor_batch` can be cleanly built, two cleanups in the existing code:
+
+1. **Extract `core/edit-engine.js`.** Move from `edit_file.js`: `findMatch`, `findOccurrence`, `mapTrimmedIndex`, `findOriginalEnd`, `generateDiagnostic`, and the block/symbol/content apply loop. Both `edit_file.js` and `stash_restore.js` currently duplicate ~70 lines of this. `refactor_batch` would become the third duplicate — extract first.
+2. **Delete the dead batch carcass in `edit_file.js`.** Remove `_batchSession`, `getOrCreateSession`, `loadDiff`, `parseEditPayload`, `trimBodyLines`, `resolveRepoPath`, the unused exports at line 412, and the now-orphaned imports (`indexDirectory, indexFile, ensureIndexFresh, impactQuery, snapshotSymbol, getVersionHistory, getVersionText, restoreVersion, getSessionId, pruneOldSessions, getSymbols, getDefinitions, isSupported, CHAR_BUDGET`). Delete `_parked_batch_analysis.js`.
+
+These two cleanups are non-negotiable and unblock everything below.
 
 ---
 
-## Non-Goals (Out of Scope for This Design)
+## Phased Implementation Order
 
-- Separate tools for each workflow step (impact query, diff load, apply, restore are all params on one tool)
-- Standalone user restore CLI (git covers this; in-session restore is handled by the tool itself)
-- Real-time file watching / hot-reload of the index (incremental re-index on demand is sufficient; post-apply re-index is internal)
-- Cross-repo indexing or monorepo federation
-- Type-inference or semantic analysis beyond what Tree-sitter's tag queries provide
-- Per-occurrence divergent edits within a single batch group (exclude those and use `edit_file` directly)
-- Integration with external code review or CI systems
+The phasing protects against repeating the previous failure (everything-at-once produced unworkable code). Each phase is shippable on its own and adds value before the next phase exists.
+
+### Phase 0: Preliminary cleanup
+- Extract `core/edit-engine.js` from current `edit_file.js` + `stash_restore.js`.
+- Delete dead batch infrastructure in `edit_file.js`.
+- Delete `_parked_batch_analysis.js`.
+- Fix the `dryRun`-missing-from-restore-schema bug in `stash_restore.js`.
+
+### Phase 1: Symbol versioning subsystem
+- WAL-mode SQLite with `symbol_versions` table.
+- Snapshot capture point in `core/edit-engine.js` (so `edit_file` symbol-mode edits get versioned automatically).
+- Extend `stash_restore.js` `restore` mode: list versions when `version` omitted; restore specific version when given.
+- Add `history` capability (could live in `stash_restore` or a tiny new tool — decide based on whether `stash_restore`'s schema already feels overloaded).
+- Ship. Use it for a week. Validate the indexing/concurrency layer holds up under real edit_file usage before layering batch on top.
+
+### Phase 2: Impact query + diff load
+- Add `core/symbol-index.js` reference-graph population (already partially exists — ensure it's complete for the supported languages).
+- Build `refactor_batch` tool with `query` and `load` modes only. No apply yet.
+- Outlier detection using real Tree-sitter structural comparison.
+- Char-based budgeting and `loadMore` pagination.
+- Ship. Validate the load output is actually useful — does the model make good apply decisions from it? If outlier detection misclassifies, fix before adding apply.
+
+### Phase 3: Apply + reapply
+- Add `apply` and `reapply` modes to `refactor_batch`.
+- All four pre-apply gates (load required, outlier ack, char budget, syntax).
+- Per-group failure semantics with one retry then lock.
+- Post-apply snapshot + re-index + cache for reapply.
+- Ship.
+
+### Phase 4: Polish + documentation
+- Document the parallel sub-agent orchestration pattern in README with a worked example.
+- Tune defaults based on usage data (context lines, char budgets, retry count).
+- Consider absorbing the `stash_restore` `restore` and `history` capabilities INTO `refactor_batch` if the version-management surface feels split awkwardly across two tools. Decide based on real usage.
+
+---
+
+## Non-Goals
+
+- Coupling batch state into `edit_file`. (Tried it; produced 165 lines of dead code.)
+- A single tool call that "refactors the whole repo." Real-world refactors are 5–50 symbols, not 5000.
+- Per-occurrence divergent edits within a single batch group. Flag, ack, or split into separate groups.
+- Cross-repo or monorepo federation.
+- Type-inference or semantic analysis beyond what Tree-sitter tag queries provide.
+- A standalone user CLI. Git's existing tooling (`git diff`, `git restore`, `git stash`) covers the user-facing safety surface. The agent's restore capability handles in-session use.
+- Concurrent multi-user writes to the same file. Last-write-wins at the OS level. File-disjoint sharding is the agent's responsibility.
+- Real-time file watching or hot-reload of the index. Incremental re-index on demand is sufficient.
 
 ---
 
 ## Resolved Implementation Decisions
 
-1. **Index freshness on load:** Diff load always re-verifies file hashes before assembling. Stale entries are re-parsed on demand.
-2. **Diff format:** Custom separator format (as shown in Section 3) is the target. More LLM-readable and reliably parseable than unified diff syntax.
-3. **Session boundary:** Server PID + working directory (repo root). Both must remain constant for the session to stay live. When either changes, the session closes and snapshot pruning begins.
-4. **Concurrent user/agent edits:** Out of scope. The atomic write machinery handles last-write-wins at the OS level. Users editing files mid-session while an agent is operating do so at their own risk. Play stupid games, get stupid prizes. 
-5. **Skip-ahead reliability:** If a model provides symbols at activation and the edits fail syntax validation or apply, normal failure handling applies. No special treatment — the gate catches bad edits regardless of how the session was entered.
+1. **Index freshness on load:** verify file hashes before assembling. Re-parse stale entries on demand.
+2. **Diff format:** custom separator format (header + body + blank line) — more LLM-readable than unified diff and reliably parseable.
+3. **Session boundary:** server PID + repo root. Either changes → session closes.
+4. **Concurrent edits by humans:** out of scope. Atomic write machinery handles last-write-wins. Users editing files mid-session do so at their own risk.
+5. **Skip-ahead reliability:** if the agent provides symbols at activation and edits fail validation, normal failure handling applies. No special treatment.
+6. **Tool count:** one new tool (`refactor_batch`). Versioning capabilities live initially in `stash_restore` (Phase 1), with potential consolidation in Phase 4 based on real usage.

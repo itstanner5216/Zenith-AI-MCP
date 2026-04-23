@@ -10,11 +10,11 @@ export function register(server, ctx) {
         title: "List Directory",
         description: "List files and directories. Directories have trailing /.",
         inputSchema: {
-            path: z.string().optional(),
+            path: z.string().optional().describe("Directory to list."),
             depth: z.number().optional().default(1).describe("Recursion depth. Max 10."),
             includeSizes: z.boolean().optional().default(false).describe("Show file sizes."),
             sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort order. Requires includeSizes."),
-            listAllowed: z.boolean().optional().default(false).describe("List allowed directories instead.")
+            listAllowed: z.boolean().optional().default(false).describe("List allowed root directories instead of directory contents.")
         },
         annotations: { readOnlyHint: true }
     }, async (args) => {
@@ -76,7 +76,7 @@ export function register(server, ctx) {
             }
 
             if (truncated) {
-                lines.push('## truncated ##');
+                lines.push('[truncated]');
             }
             return lines;
         }

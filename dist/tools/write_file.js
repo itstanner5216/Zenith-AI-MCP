@@ -35,10 +35,10 @@ export function register(server, ctx) {
         title: "Write File",
         description: "Create or overwrite a file. Auto-creates parent directories. Use 'append' to add instead of replace.",
         inputSchema: {
-            path: z.string(),
-            content: z.string(),
-            createOnly: z.boolean().optional().default(false).describe("If true, fails when the file already exists."),
-            append: z.boolean().optional().default(false).describe("If true, appends content to the end of an existing file. Creates the file if it doesn't exist."),
+            path: z.string().describe("File to write."),
+            content: z.string().describe("Content to write."),
+            createOnly: z.boolean().optional().default(false).describe("Fail if the file already exists."),
+            append: z.boolean().optional().default(false).describe("Append instead of overwriting."),
         },
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
@@ -53,7 +53,7 @@ export function register(server, ctx) {
         } catch { /* file doesn't exist */ }
 
         if (args.createOnly && existed) {
-            throw new Error(`File already exists (createOnly). Use a different path or remove createOnly.`);
+            throw new Error(`File already exists.`);
         }
 
         const parentDir = path.dirname(validPath);
@@ -105,7 +105,7 @@ export function register(server, ctx) {
         } catch (error) {
             try { await fs.unlink(tempPath); } catch { /* ignore cleanup failure */ }
             const stashId = stashWrite(ctx, validPath, normalizedContent, args.append ? 'append' : 'write');
-            throw new Error(`Write failed: ${error.message}. stash:${stashId}`);
+            throw new Error(`Write failed. Cached as stash:${stashId}.`);
         }
         let message;
         if (args.append) {

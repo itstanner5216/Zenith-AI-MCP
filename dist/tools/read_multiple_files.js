@@ -31,7 +31,7 @@ export function register(server, ctx) {
                 .max(50)
                 .describe("File paths to read."),
             maxCharsPerFile: z.number().optional().describe("Max characters per file."),
-            compression: z.boolean().optional().default(true).describe("Compression is on by default. Set false to turn it off."),
+            compression: z.boolean().optional().default(true).describe("Compress whitespace in returned content."),
             showLineNumbers: z.boolean().optional().default(false).describe("Prefix each line with its line number."),
         },
         annotations: { readOnlyHint: true }

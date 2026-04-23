@@ -8,10 +8,10 @@ import { isSupported, getFileSymbolSummary, getFileSymbols } from '../core/tree-
 export function register(server, ctx) {
     server.registerTool("directory_tree", {
         title: "Directory Tree",
-        description: "Recursive tree view as indented text. Directories end with '/', files may include symbol metadata.",
+        description: "Show a recursive directory tree.",
         inputSchema: {
-            path: z.string(),
-            excludePatterns: z.array(z.string()).optional().default([]),
+            path: z.string().describe("Root directory."),
+            excludePatterns: z.array(z.string()).optional().default([]).describe("Glob patterns to exclude."),
             showSymbols: z.boolean().optional().default(false).describe("Show symbol counts per file."),
             showSymbolNames: z.boolean().optional().default(false).describe("Show symbol names per file. Implies showSymbols.")
         },
@@ -142,7 +142,7 @@ export function register(server, ctx) {
         }
 
         const textLines = formatIndent(treeData);
-        const text = textLines.join('\n') + (totalEntries >= MAX_ENTRIES ? '\n## truncated ##' : '');
+        const text = textLines.join('\n') + (totalEntries >= MAX_ENTRIES ? '\n[truncated]' : '');
         return {
             content: [{ type: "text", text }],
         };
