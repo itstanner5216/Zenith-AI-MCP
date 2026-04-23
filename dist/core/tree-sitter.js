@@ -779,7 +779,10 @@ export async function checkSyntaxErrors(source, langName) {
     const tree = parser.parse(source);
 
     try {
-        if (!tree.rootNode.hasError()) {
+        const rootHasError = typeof tree.rootNode.hasError === 'function'
+            ? tree.rootNode.hasError()
+            : tree.rootNode.hasError;
+        if (!rootHasError) {
             return [];
         }
 
@@ -788,7 +791,10 @@ export async function checkSyntaxErrors(source, langName) {
 
         function walk(node) {
             if (errors.length >= MAX_ERRORS) return;
-            if (node.type === 'ERROR' || node.isMissing()) {
+            const nodeMissing = typeof node.isMissing === 'function'
+                ? node.isMissing()
+                : node.isMissing;
+            if (node.type === 'ERROR' || nodeMissing) {
                 errors.push({
                     line: node.startPosition.row + 1,
                     column: node.startPosition.column,
@@ -879,4 +885,121 @@ export function computeStructuralSimilarity(fingerprintA, fingerprintB) {
 
     const union = gramsA.size + gramsB.size - intersection;
     return union === 0 ? 0.0 : intersection / union;
+}
+
+/**
+ * Extract a structural signature for the symbol whose definition spans
+ * `startLine`..`endLine` (1-based, inclusive). Used by refactor_batch outlier
+ * detection to flag occurrences whose shape differs from peers in the same
+ * symbol group.
+ *
+ * Returns null if the language cannot be loaded or no matching def node is found.
+ */
+export async function getSymbolStructure(source, langName, startLine, endLine) {
+    const language = await loadLanguage(langName);
+    if (!language) return null;
+
+    const parser = new Parser();
+    parser.setLanguage(language);
+    const tree = parser.parse(source);
+
+    try {
+        const startRow = startLine - 1;
+        const endRow = endLine - 1;
+
+        const DEF_TYPES = new Set([
+            'function_declaration', 'function_definition', 'method_definition',
+            'arrow_function', 'function', 'method',
+            'class_declaration', 'class_definition',
+            'function_signature', 'method_signature',
+            'lexical_declaration', 'variable_declaration',
+        ]);
+
+        let defNode = null;
+        function findDef(node) {
+            if (DEF_TYPES.has(node.type) &&
+                node.startPosition.row === startRow &&
+                node.endPosition.row === endRow) {
+                defNode = node;
+                return true;
+            }
+            for (let i = 0; i < node.childCount; i++) {
+                if (findDef(node.child(i))) return true;
+            }
+            return false;
+        }
+        findDef(tree.rootNode);
+        if (!defNode) return null;
+
+        const params = [];
+        function collectParams(node) {
+            if (/parameters?$/.test(node.type) || node.type === 'formal_parameters') {
+                for (let i = 0; i < node.childCount; i++) {
+                    const c = node.child(i);
+                    if (c.type === '(' || c.type === ')' || c.type === ',') continue;
+                    params.push(c.type);
+                }
+                return true;
+            }
+            for (let i = 0; i < node.childCount; i++) {
+                if (collectParams(node.child(i))) return true;
+            }
+            return false;
+        }
+        collectParams(defNode);
+
+        let returnKind = null;
+        for (let i = 0; i < defNode.childCount; i++) {
+            const c = defNode.child(i);
+            const fieldName = defNode.fieldNameForChild ? defNode.fieldNameForChild(i) : null;
+            if (fieldName === 'return_type' || /^type_annotation$|^return_type$/.test(c.type)) {
+                returnKind = c.type;
+                break;
+            }
+        }
+
+        let parentKind = null;
+        let p = defNode.parent;
+        while (p) {
+            if (DEF_TYPES.has(p.type) || p.type === 'program' || p.type === 'module' || p.type === 'source_file') {
+                parentKind = p.type;
+                break;
+            }
+            p = p.parent;
+        }
+
+        const decorators = [];
+        if (defNode.parent) {
+            const siblings = [];
+            for (let i = 0; i < defNode.parent.childCount; i++) siblings.push(defNode.parent.child(i));
+            const idx = siblings.indexOf(defNode);
+            for (let i = idx - 1; i >= 0; i--) {
+                if (siblings[i].type === 'decorator') decorators.unshift(siblings[i].type);
+                else break;
+            }
+        }
+        for (let i = 0; i < defNode.childCount; i++) {
+            const c = defNode.child(i);
+            if (c.type === 'decorator') decorators.push(c.type);
+        }
+
+        const MODIFIER_TYPES = new Set(['async', 'static', 'public', 'private', 'protected', 'readonly', '*']);
+        const modifiers = new Set();
+        function collectModifiers(node) {
+            if (MODIFIER_TYPES.has(node.type)) modifiers.add(node.type);
+            for (let i = 0; i < node.childCount; i++) collectModifiers(node.child(i));
+        }
+        for (let i = 0; i < defNode.childCount; i++) collectModifiers(defNode.child(i));
+
+        return {
+            params,
+            returnKind,
+            parentKind,
+            decorators,
+            modifiers: [...modifiers].sort(),
+        };
+    } finally {
+        tree.delete();
+        parser.delete();
+    }
 }

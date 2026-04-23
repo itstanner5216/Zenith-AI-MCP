@@ -9,7 +9,8 @@ import { getProjectContext } from '../core/project-context.js';
 import { findMatch, applyEditList, syntaxWarn } from '../core/edit-engine.js';
 import {
     findRepoRoot, getDb, indexFile,
-    getVersionHistory, getVersionText, restoreVersion,
+    getVersionHistory, getVersionText,
+    snapshotSymbol, getSessionId,
 } from '../core/symbol-index.js';
 
 export function register(server, ctx) {
@@ -48,6 +49,11 @@ export function register(server, ctx) {
                 mode: z.literal("init").describe("Register a non-git directory as a project root."),
                 projectRoot: z.string().describe("Directory to register."),
                 projectName: z.string().optional().describe("Optional project name."),
+            }),
+            z.object({
+                mode: z.literal("history").describe("List version snapshots for a symbol."),
+                symbol: z.string().describe("Symbol name. Dot-qualified for methods."),
+                file: z.string().optional().describe("Restrict to one file."),
             }),
         ]),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
@@ -111,6 +117,24 @@ export function register(server, ctx) {
         }
 
         // =================================================================
+        // HISTORY — list version snapshots for a symbol
+        // =================================================================
+        if (args.mode === 'history') {
+            const filePath = args.file || ctx.getAllowedDirectories()[0];
+            const absPath = await ctx.validatePath(filePath);
+            const repoRoot = findRepoRoot(absPath) || path.dirname(absPath);
+            const db = getDb(repoRoot);
+            const sessionId = ctx.sessionId || getSessionId();
+            const relPath = args.file ? path.relative(repoRoot, absPath) : null;
+            const rows = getVersionHistory(db, args.symbol, sessionId, relPath);
+            if (!rows.length) {
+                return { content: [{ type: 'text', text: 'Empty.' }] };
+            }
+            const lines = rows.map((r, i) => `v${i} ${r.file_path} ${new Date(r.created_at).toISOString()}`);
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+        }
+
+        // =================================================================
         // RESTORE — rollback a stash entry or restore a symbol version
         // =================================================================
         if (args.mode === 'restore') {
@@ -118,13 +142,13 @@ export function register(server, ctx) {
             if (args.symbol) {
                 const filePath = args.file;
                 if (!filePath) throw new Error('file required for symbol restore.');
-                const absPath = await ctx.validatePath(filePath).catch(() => filePath);
+                const absPath = await ctx.validatePath(filePath);
                 const repoRoot = findRepoRoot(absPath) || path.dirname(absPath);
                 const db = getDb(repoRoot);
 
                 if (args.version !== undefined) {
                     const relPath = path.relative(repoRoot, absPath);
-                    const history = getVersionHistory(db, args.symbol, ctx.sessionId, relPath);
+                    const history = getVersionHistory(db, args.symbol, ctx.sessionId || getSessionId(), relPath);
                     const versionEntry = history?.[args.version];
                     if (!versionEntry) throw new Error(`${args.symbol}: version ${args.version} not found.`);
                     const text = getVersionText(db, versionEntry.id);
@@ -142,6 +166,13 @@ export function register(server, ctx) {
                     const newContent = lines.join('\n');
 
                     if (!args.dryRun) {
+                        try {
+                            const sessionId = ctx.sessionId || getSessionId();
+                            const relPath = path.relative(repoRoot, absPath);
+                            const curLines = content.split('\n');
+                            const curText = curLines.slice(sym.line - 1, sym.endLine).join('\n');
+                            snapshotSymbol(db, args.symbol, relPath, curText, sessionId, sym.line);
+                        } catch { /* best-effort */ }
                         const tempPath = `${absPath}.${randomBytes(16).toString('hex')}.tmp`;
                         await fs.writeFile(tempPath, newContent, 'utf-8');
                         await fs.rename(tempPath, absPath);
@@ -149,8 +180,13 @@ export function register(server, ctx) {
                     }
                     return { content: [{ type: 'text', text: `${args.symbol}: restored to v${args.version}.` }] };
                 } else {
-                    const restored = restoreVersion(db, args.symbol);
-                    return { content: [{ type: 'text', text: `${args.symbol}: ${restored ? 'restored' : 'no history'}.` }] };
+                    const relPath = path.relative(repoRoot, absPath);
+                    const rows = getVersionHistory(db, args.symbol, ctx.sessionId || getSessionId(), relPath);
+                    if (!rows.length) {
+                        return { content: [{ type: 'text', text: 'Empty.' }] };
+                    }
+                    const lines = rows.map((r, i) => `v${i} ${new Date(r.created_at).toISOString()}`);
+                    return { content: [{ type: 'text', text: lines.join('\n') }] };
                 }
             }
 
@@ -188,7 +224,7 @@ export function register(server, ctx) {
                 for (const c of corrections) {
                     disambiguations.set(c.index - 1, { startLine: c.startLine, nearLine: c.nearLine });
                 }
-                const { workingContent, errors } = await applyEditList(originalContent, edits, {
+                const { workingContent, errors, pendingSnapshots } = await applyEditList(originalContent, edits, {
                     filePath: validPath,
                     isBatch: edits.length > 1,
                     disambiguations,
@@ -212,6 +248,18 @@ export function register(server, ctx) {
                 } catch (error) {
                     try { await fs.unlink(tempPath); } catch {}
                     throw error;
+                }
+
+                if (!args.dryRun && pendingSnapshots && pendingSnapshots.length > 0) {
+                    try {
+                        const repoRoot = findRepoRoot(validPath) || path.dirname(validPath);
+                        const db = getDb(repoRoot);
+                        const sessionId = ctx.sessionId || getSessionId();
+                        const relPath = path.relative(repoRoot, validPath);
+                        for (const snap of pendingSnapshots) {
+                            snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                        }
+                    } catch { /* best-effort */ }
                 }
 
                 const warning = await syntaxWarn(validPath, workingContent);

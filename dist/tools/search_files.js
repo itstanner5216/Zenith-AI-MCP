@@ -34,7 +34,6 @@ export function register(server, ctx) {
                     maxResults: z.number().optional().default(50).describe("Maximum result lines."),
                     contentQuery: z.string().describe("Text or regex to search for."),
                     pattern: z.string().optional().describe("Glob to limit which files are searched, e.g. '**/*.ts'."),
-                    ignoreCase: z.boolean().optional().default(true).describe("Case-insensitive match."),
                     contextLines: z.number().optional().default(0).describe("Context lines around each match."),
                     literalSearch: z.boolean().optional().default(false).describe("Treat contentQuery as a literal string."),
                     countOnly: z.boolean().optional().default(false).describe("Return match and file counts only."),
@@ -55,14 +54,7 @@ export function register(server, ctx) {
                     mode: z.literal("symbol"),
                     path: z.string().describe("Directory to search."),
                     maxResults: z.number().optional().default(50).describe("Maximum symbol matches."),
-                    symbolQuery: z.string().describe("Symbol name substring to match."),
-                    symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe("Filter by symbol kind."),
-                    pattern: z.string().optional().describe("Glob to limit which files are scanned."),
-                }),
-                z.object({
-                    mode: z.literal("list_symbols"),
-                    path: z.string().describe("Directory to scan."),
-                    maxResults: z.number().optional().default(50).describe("Maximum files reported."),
+                    symbolQuery: z.string().optional().describe("Substring to match against symbol names. Omit to list all matching symbolKind."),
                     symbolKind: z.enum(['function', 'class', 'method', 'interface', 'type', 'enum', 'module', 'any']).optional().default('any').describe("Filter by symbol kind."),
                     pattern: z.string().optional().describe("Glob to limit which files are scanned."),
                 }),
@@ -88,7 +80,8 @@ export function register(server, ctx) {
         const rootPath = await ctx.validatePath(args.path);
 
         // ---- SYMBOL SEARCH / LIST MODE ----
-        if (args.mode === "symbol" || args.mode === "list_symbols") {
+        if (args.mode === "symbol") {
+            const listAll = !args.symbolQuery;
             const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
 
             // Discover files — reuse ripgrep for speed
@@ -136,7 +129,7 @@ export function register(server, ctx) {
             const BATCH_SIZE = 50;
             const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
 
-            if (args.mode === "list_symbols") {
+            if (listAll) {
                 const outputLines = [];
 
                 for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
@@ -562,7 +555,7 @@ export function register(server, ctx) {
         const contextLines = Math.max(0, args.contextLines ?? 0);
         const allExcludes = DEFAULT_EXCLUDE_GLOBS;
 
-        const flags = args.ignoreCase ? 'gi' : 'g';
+        const flags = 'gi';
         const contentRegex = args.literalSearch
             ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags) // nosemgrep
             : new RegExp(args.contentQuery, flags); // nosemgrep
@@ -585,7 +578,7 @@ export function register(server, ctx) {
                         rgResults = await ripgrepSearch(rootPath, {
                             contentQuery: args.contentQuery,
                             filePattern: args.pattern || null,
-                            ignoreCase: args.ignoreCase ?? true,
+                            ignoreCase: true,
                             maxResults: Math.max(userMaxResults, 500),
                             excludePatterns: allExcludes,
                             contextLines,
@@ -602,7 +595,7 @@ export function register(server, ctx) {
                 rgResults = await ripgrepSearch(rootPath, {
                     contentQuery: args.contentQuery,
                     filePattern: args.pattern || null,
-                    ignoreCase: args.ignoreCase ?? true,
+                    ignoreCase: true,
                     maxResults: Math.max(userMaxResults, 500),
                     excludePatterns: allExcludes,
                     contextLines,

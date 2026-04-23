@@ -1,250 +1,306 @@
 # Zenith-MCP
 
-Node.js server implementing Model Context Protocol (MCP) for filesystem operations.
+Node.js server implementing the Model Context Protocol (MCP) for advanced filesystem operations, code-aware editing, and intelligent search.
 
 ## Features
 
-- Read/write files
-- Create/list/delete directories
-- Move files/directories
-- Search files
-- Get file metadata
-- Dynamic directory access control via [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots)
+- **Read/write files** — text, media, and batch reads with budget-aware truncation and optional compression
+- **Surgical editing** — content-match, block-replace, and symbol-aware edits with dry-run preview
+- **Intelligent search** — content search with BM25 ranking, file discovery, symbol search, structural similarity, and definition lookup
+- **Cross-file refactoring** — impact analysis, batch symbol loading, and coordinated multi-file edits with rollback
+- **Code awareness** — Tree-sitter AST parsing for 20+ languages (lazy-loaded WASM grammars)
+- **Symbol indexing & versioning** — per-project SQLite index with impact graphs and automatic version snapshots
+- **Stash & restore** — retry failed edits, restore symbol versions, and manage project roots
+- **Dynamic directory access control** via [MCP Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots)
+- **Dual transport** — stdio (local) and HTTP (remote with Streamable HTTP + legacy SSE)
+
+## Server Modes
+
+### stdio (Local)
+Standard MCP stdio transport for local clients like Claude Desktop or VS Code.
+
+```bash
+npx zenith-mcp /path/to/dir1 /path/to/dir2
+```
+
+### HTTP (Remote)
+Express-based HTTP server supporting both Streamable HTTP and legacy SSE transports.
+
+```bash
+ZENITH_MCP_API_KEY=secret npx zenith-mcp-http /path/to/dir1 --port=3100 --host=0.0.0.0
+```
+
+**HTTP Endpoints:**
+- `POST /mcp` — Streamable HTTP (initialize + messages)
+- `GET /mcp` — Streamable HTTP SSE notification stream
+- `DELETE /mcp` — Streamable HTTP session teardown
+- `GET /sse` — Legacy SSE transport
+- `POST /messages` — Legacy SSE message endpoint
+- `GET /health` — Health check
+
+Sessions are isolated per client and reaped after 30 minutes of idle time (configurable via `SESSION_TTL_MS`). All HTTP requests require `Authorization: Bearer <API_KEY>`.
 
 ## Directory Access Control
 
-The server uses a flexible directory access control system. Directories can be specified via command-line arguments or dynamically via [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots).
+Directories can be specified via command-line arguments or dynamically via [MCP Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots).
 
 ### Method 1: Command-line Arguments
-Specify Allowed directories when starting the server:
 ```bash
 zenith-mcp /path/to/dir1 /path/to/dir2
 ```
 
 ### Method 2: MCP Roots (Recommended)
-MCP clients that support [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically update the Allowed directories. 
+MCP clients that support Roots can dynamically update allowed directories at runtime via `roots/list_changed` notifications. Roots completely replace server-side directories when provided.
 
-Roots notified by Client to Server, completely replace any server-side Allowed directories when provided.
+**Important:** If the server starts without CLI directories AND the client doesn't support roots (or provides empty roots), initialization will fail.
 
-**Important**: If server starts without command-line arguments AND client doesn't support roots protocol (or provides empty roots), the server will throw an error during initialization.
-
-This is the recommended method, as this enables runtime directory updates via `roots/list_changed` notifications without server restart, providing a more flexible and modern integration experience.
+> **Why no fallback?** Allowed directories are a strict security sandbox — they determine what the AI can read and write. The server intentionally does *not* fall back to `process.cwd()` or auto-detected git roots, because that could accidentally expose sensitive files. A separate "project root" resolver (used only for the symbol index and stash database) does have fallbacks (git → cwd → registered roots → global), but that layer never grants filesystem access.
 
 ### How It Works
+1. **Server Startup** — uses CLI directories as the baseline
+2. **Client Initialization** — if the client supports roots, the server requests `roots/list` and replaces allowed directories
+3. **Runtime Updates** — `notifications/roots/list_changed` triggers a refresh
+4. **Access Control** — all filesystem operations are restricted to allowed directories; symlinks are resolved and validated
 
-The server's directory access control follows this flow:
+## Tools
 
-1. **Server Startup**
-   - Server starts with directories from command-line arguments (if provided)
-   - If no arguments provided, server starts with empty allowed directories
+### `read_text_file`
+Read a text file with multiple modes.
 
-2. **Client Connection & Initialization**
-   - Client connects and sends `initialize` request with capabilities
-   - Server checks if client supports roots protocol (`capabilities.roots`)
-   
-3. **Roots Protocol Handling** (if client supports roots)
-   - **On initialization**: Server requests roots from client via `roots/list`
-   - Client responds with its configured roots
-   - Server replaces ALL allowed directories with client's roots
-   - **On runtime updates**: Client can send `notifications/roots/list_changed`
-   - Server requests updated roots and replaces allowed directories again
+- **mode: `standard`**
+  - `path` (string)
+  - `maxChars` (number, optional, default 50000, up to 400000)
+  - `head` (number, optional) — first N lines
+  - `tail` (number, optional) — last N lines
+  - `offset` (number, optional) — start line (0-based), combine with `head`
+  - `showLineNumbers` (boolean, optional)
+  - `compression` (boolean, optional) — compress whitespace via structured compression
 
-4. **Fallback Behavior** (if client doesn't support roots)
-   - Server continues using command-line directories only
-   - No dynamic updates possible
+- **mode: `grep`**
+  - `path` (string)
+  - `grep` (string) — regex to match lines (case-insensitive)
+  - `grepContext` (number, optional, default 0, max 30) — context lines around matches
+  - `maxChars` (number, optional)
+  - `showLineNumbers` (boolean, optional)
 
-5. **Access Control**
-   - All filesystem operations are restricted to allowed directories
-   - Use `list_allowed_directories` tool to see current directories
-   - Server requires at least ONE allowed directory to operate
+- **mode: `window`**
+  - `path` (string)
+  - `aroundLine` (number, optional) — center window on this line
+  - `context` (number, optional, default 30) — window radius
+  - `ranges` (array of `{startLine, endLine}`, optional) — explicit line ranges
+  - `maxChars` (number, optional)
+  - `showLineNumbers` (boolean, optional)
 
-**Note**: The server will only allow operations within directories specified either via `args` or via Roots.
+- **mode: `symbol`**
+  - `path` (string)
+  - `symbol` (string) — symbol name, dot-qualified for methods (e.g. `AuthService.login`)
+  - `nearLine` (number, optional) — disambiguate multiple matches
+  - `expandLines` (number, optional, default 0, max 50) — extra context around symbol
+  - `maxChars` (number, optional)
 
+### `read_media_file`
+Read an image or audio file. Returns base64 data with MIME type.
+- `path` (string)
+- Supported: `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg`, `.mp3`, `.wav`, `.ogg`, `.flac`
 
+### `read_multiple_files`
+Read up to 50 files concurrently with dynamic character budget balancing.
+- `paths` (string[])
+- `maxCharsPerFile` (number, optional)
+- `compression` (boolean, optional, default true) — compress whitespace
+- `showLineNumbers` (boolean, optional, default false)
+- Failed reads won't stop the entire operation
 
-## API
+### `write_file`
+Create, overwrite, or append to a file. Auto-creates parent directories. Atomic writes with temp-file + rename.
+- `path` (string)
+- `content` (string)
+- `failIfExists` (boolean, optional) — fail if file already exists
+- `append` (boolean, optional) — append instead of overwriting; smart-resumes overlapping tails
 
-### Tools
+### `edit_file`
+Surgical file editing with three modes. Supports dry-run preview. Failed edits are stashed for retry.
 
-- **read_text_file**
-  - Read complete contents of a file as text
-  - Inputs:
-    - `path` (string)
-    - `head` (number, optional): First N lines
-    - `tail` (number, optional): Last N lines
-  - Always treats the file as UTF-8 text regardless of extension
-  - Cannot specify both `head` and `tail` simultaneously
+- **mode: `content`**
+  - `oldContent` (string) — exact text to find (uses exact, trimmed, and indent-stripped matching)
+  - `newContent` (string)
 
-- **read_media_file**
-  - Read an image or audio file
-  - Inputs:
-    - `path` (string)
-  - Streams the file and returns base64 data with the corresponding MIME type
+- **mode: `block`**
+  - `block_start` (string) — trimmed first line of the block to replace
+  - `block_end` (string) — trimmed last line of the block
+  - `replacement_block` (string)
 
-- **read_multiple_files**
-  - Read multiple files simultaneously
-  - Input: `paths` (string[])
-  - Failed reads won't stop the entire operation
+- **mode: `symbol`**
+  - `symbol` (string) — symbol name, dot-qualified for methods
+  - `newText` (string)
+  - `nearLine` (number, optional)
 
-- **write_file**
-  - Create new file or overwrite existing (exercise caution with this)
-  - Inputs:
-    - `path` (string): File location
-    - `content` (string): File content
+All modes support `dryRun` to preview changes without writing.
 
-- **edit_file**
-  - Make selective edits using advanced pattern matching and formatting
-  - Features:
-    - Line-based and multi-line content matching
-    - Whitespace normalization with indentation preservation
-    - Multiple simultaneous edits with correct positioning
-    - Indentation style detection and preservation
-    - Git-style diff output with context
-    - Preview changes with dry run mode
-  - Inputs:
-    - `path` (string): File to edit
-    - `edits` (array): List of edit operations
-      - `oldText` (string): Text to search for (can be substring)
-      - `newText` (string): Text to replace with
-    - `dryRun` (boolean): Preview changes without applying (default: false)
-  - Returns detailed diff and match information for dry runs, otherwise applies changes
-  - Best Practice: Always use dryRun first to preview changes before applying them
+### `directory`
+Directory exploration with two modes.
 
-- **create_directory**
-  - Create new directory or ensure it exists
-  - Input: `path` (string)
-  - Creates parent directories if needed
-  - Succeeds silently if directory exists
+- **mode: `list`** — list directory contents
+  - `path` (string, optional)
+  - `depth` (number, optional, default 1, max 10) — recursion depth
+  - `includeSizes` (boolean, optional, default false)
+  - `sortBy` (enum `"name" | "size"`, optional, default `"name"`) — requires `includeSizes`
+  - `listAllowed` (boolean, optional, default false) — list allowed root directories instead
 
-- **list_directory**
-  - List directory contents with [FILE] or [DIR] prefixes
-  - Input: `path` (string)
+- **mode: `tree`** — recursive directory tree with optional symbol metadata
+  - `path` (string)
+  - `excludePatterns` (string[], optional) — glob patterns to exclude
+  - `showSymbols` (boolean, optional, default false) — show symbol counts per file
+  - `showSymbolNames` (boolean, optional, default false) — show symbol names per file
 
-- **list_directory_with_sizes**
-  - List directory contents with [FILE] or [DIR] prefixes, including file sizes
-  - Inputs:
-    - `path` (string): Directory path to list
-    - `sortBy` (string, optional): Sort entries by "name" or "size" (default: "name")
-  - Returns detailed listing with file sizes and summary statistics
-  - Shows total files, directories, and combined size
+### `search_files`
+Multi-mode search with ripgrep + BM25 ranking and JS fallback.
 
-- **move_file**
-  - Move or rename files and directories
-  - Inputs:
-    - `source` (string)
-    - `destination` (string)
-  - Fails if destination exists
+- **mode: `content`** — text/regex search (always case-insensitive)
+  - `path` (string)
+  - `contentQuery` (string) — text or regex to search for
+  - `pattern` (string, optional) — glob to limit files
+  - `contextLines` (number, optional, default 0)
+  - `literalSearch` (boolean, optional, default false)
+  - `countOnly` (boolean, optional, default false)
+  - `includeHidden` (boolean, optional, default false)
+  - `maxResults` (number, optional, default 50)
 
-- **search_files**
-  - Recursively search for files/directories that match or do not match patterns
-  - Inputs:
-    - `path` (string): Starting directory
-    - `pattern` (string): Search pattern
-    - `excludePatterns` (string[]): Exclude any patterns.
-  - Glob-style pattern matching
-  - Returns full paths to matches
+- **mode: `files`** — file discovery
+  - `path` (string)
+  - `pattern` (string, optional)
+  - `namePattern` (string, optional)
+  - `pathContains` (string, optional)
+  - `extensions` (string[], optional)
+  - `includeMetadata` (boolean, optional, default false)
+  - `includeHidden` (boolean, optional, default false)
+  - `maxResults` (number, optional, default 100)
 
-- **directory_tree**
-  - Get recursive JSON tree structure of directory contents
-  - Inputs:
-    - `path` (string): Starting directory
-    - `excludePatterns` (string[]): Exclude any patterns. Glob formats are supported.
-  - Returns:
-    - JSON array where each entry contains:
-      - `name` (string): File/directory name
-      - `type` ('file'|'directory'): Entry type
-      - `children` (array): Present only for directories
-        - Empty array for empty directories
-        - Omitted for files
-  - Output is formatted with 2-space indentation for readability
-    
-- **get_file_info**
-  - Get detailed file/directory metadata
-  - Input: `path` (string)
-  - Returns:
-    - Size
-    - Creation time
-    - Modified time
-    - Access time
-    - Type (file/directory)
-    - Permissions
+- **mode: `symbol`** — find symbols by name substring, or list all symbols when omitted
+  - `path` (string)
+  - `symbolQuery` (string, optional) — omit to list all symbols
+  - `symbolKind` (enum, optional, default `"any"`)
+  - `pattern` (string, optional)
+  - `maxResults` (number, optional, default 50)
 
-- **list_allowed_directories**
-  - List all directories the server is allowed to access
-  - No input required
-  - Returns:
-    - Directories that this server can read/write from
+- **mode: `structural`** — find structurally similar symbols (AST fingerprinting)
+  - `path` (string)
+  - `structuralQuery` (string) — symbol name to find similar definitions of
+  - `symbolKind` (enum, optional, default `"any"`)
+  - `maxResults` (number, optional, default 20)
 
-### Tool annotations (MCP hints)
+- **mode: `definition`** — find files defining a specific symbol
+  - `path` (string)
+  - `definesSymbol` (string) — dot-qualified supported
+  - `namePattern` (string, optional)
+  - `pathContains` (string, optional)
+  - `extensions` (string[], optional)
+  - `maxResults` (number, optional, default 100)
 
-This server sets [MCP ToolAnnotations](https://modelcontextprotocol.io/specification/2025-03-26/server/tools#toolannotations)
-on each tool so clients can:
+### `file_manager`
+Directory and file management operations.
+- **mode: `mkdir`** — `path`
+- **mode: `delete`** — `path` (file only, irreversible)
+- **mode: `move`** — `source`, `destination`
+- **mode: `info`** — `path` (returns size, created, modified, accessed, type, permissions)
 
-- Distinguish **read‑only** tools from write‑capable tools.
-- Understand which write operations are **idempotent** (safe to retry with the same arguments).
-- Highlight operations that may be **destructive** (overwriting or heavily mutating data).
+### `stashRestore`
+Retry failed edits, restore versions, browse stash, and manage project roots.
 
-The mapping for filesystem tools is:
+- **mode: `apply`** — retry a stashed edit or write
+  - `stashId` (number)
+  - `corrections` (array, optional) — disambiguation for failed edits
+  - `newPath` (string, optional) — redirect a failed write
+  - `dryRun` (boolean, optional)
 
-| Tool                        | readOnlyHint | idempotentHint | destructiveHint | Notes                                            |
-|-----------------------------|--------------|----------------|-----------------|--------------------------------------------------|
-| `read_text_file`            | `true`       | –              | –               | Pure read                                       |
-| `read_media_file`           | `true`       | –              | –               | Pure read                                       |
-| `read_multiple_files`       | `true`       | –              | –               | Pure read                                       |
-| `list_directory`            | `true`       | –              | –               | Pure read                                       |
-| `list_directory_with_sizes` | `true`       | –              | –               | Pure read                                       |
-| `directory_tree`            | `true`       | –              | –               | Pure read                                       |
-| `search_files`              | `true`       | –              | –               | Pure read                                       |
-| `get_file_info`             | `true`       | –              | –               | Pure read                                       |
-| `list_allowed_directories`  | `true`       | –              | –               | Pure read                                       |
-| `create_directory`          | `false`      | `true`         | `false`         | Re‑creating the same dir is a no‑op             |
-| `write_file`                | `false`      | `true`         | `true`          | Overwrites existing files                       |
-| `edit_file`                 | `false`      | `false`        | `true`          | Re‑applying edits can fail or double‑apply      |
-| `move_file`                 | `false`      | `false`        | `false`         | Move/rename only; repeat usually errors         |
+- **mode: `restore`** — rollback a symbol version or clear a stash entry
+  - `stashId` (number, optional)
+  - `symbol` (string, optional)
+  - `version` (number, optional)
+  - `file` (string, optional)
+  - `dryRun` (boolean, optional)
 
-> Note: `idempotentHint` and `destructiveHint` are meaningful only when `readOnlyHint` is `false`, as defined by the MCP spec.
+- **mode: `list`** — show all stash entries
+  - `type` (enum `"edit" | "write"`, optional)
+
+- **mode: `read`** — view a stash entry's contents
+  - `stashId` (number)
+
+- **mode: `init`** — register a non-git directory as a project root
+  - `projectRoot` (string)
+  - `projectName` (string, optional)
+
+- **mode: `history`** — list version snapshots for a symbol
+  - `symbol` (string)
+  - `file` (string, optional)
+
+### `refactor_batch`
+Apply one edit pattern across multiple similar symbols, with outlier detection and rollback.
+
+- **mode: `query`** — impact analysis (callers or callees)
+  - `target` (string) — symbol name
+  - `fileScope` (string, optional)
+  - `direction` (enum `"forward" | "reverse"`, default `"forward"`)
+  - `depth` (number, default 1, max 5)
+
+- **mode: `load`** — load symbol bodies with context
+  - `selection` (array) — indices from prior query or explicit `{symbol, file}` pairs
+  - `contextLines` (number, optional, default 5, max 30)
+  - `loadMore` (boolean, optional, default false)
+
+- **mode: `apply`** — apply edited diff to selected occurrences
+  - `payload` (string) — edited diff with symbol headers
+  - `dryRun` (boolean, optional)
+
+- **mode: `reapply`** — reuse a cached payload on new targets
+  - `symbolGroup` (string)
+  - `newTargets` (array) — names or `{symbol, file}` pairs
+  - `dryRun` (boolean, optional)
+
+## Tool Annotations
+
+| Tool                  | readOnlyHint | idempotentHint | destructiveHint | Notes                                           |
+|-----------------------|--------------|----------------|-----------------|-------------------------------------------------|
+| `read_text_file`      | `true`       | —              | —               | Pure read                                       |
+| `read_media_file`     | `true`       | —              | —               | Pure read                                       |
+| `read_multiple_files` | `true`       | —              | —               | Pure read                                       |
+| `directory`           | `true`       | —              | —               | Pure read                                       |
+| `search_files`        | `true`       | —              | —               | Pure read                                       |
+| `write_file`          | `false`      | `false`        | `true`          | Overwrites existing files                       |
+| `edit_file`           | `false`      | `false`        | `true`          | Re-applying edits can fail or double-apply      |
+| `file_manager`        | `false`      | `false`        | `true`          | Mixed: mkdir is idempotent, delete/move are not |
+| `stashRestore`        | `false`      | `false`        | `true`          | Restores and applies are stateful               |
+| `refactor_batch`      | `false`      | `false`        | `true`          | Multi-file writes                               |
 
 ## Usage with Claude Desktop
+
 Add this to your `claude_desktop_config.json`:
 
-Note: you can provide sandboxed directories to the server by mounting them to `/projects`. Adding the `ro` flag will make the directory readonly by the server.
-
-### Docker
-Note: all directories must be mounted to `/projects` by default.
-
+### NPX (stdio)
 ```json
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "docker",
+    "zenith": {
+      "command": "npx",
       "args": [
-        "run",
-        "-i",
-        "--rm",
-        "--mount", "type=bind,src=/Users/username/Desktop,dst=/projects/Desktop",
-        "--mount", "type=bind,src=/path/to/other/allowed/dir,dst=/projects/other/allowed/dir,ro",
-        "--mount", "type=bind,src=/path/to/file.txt,dst=/projects/path/to/file.txt",
-        "mcp/filesystem",
-        "/projects"
+        "-y",
+        "zenith-mcp",
+        "/Users/username/Desktop"
       ]
     }
   }
 }
 ```
 
-### NPX
-
+### HTTP
 ```json
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "zenith-mcp",
-        "/Users/username/Desktop",
-        "/path/to/other/allowed/dir"
-      ]
+    "zenith": {
+      "url": "http://localhost:3100/mcp",
+      "headers": {
+        "Authorization": "Bearer your-api-key"
+      }
     }
   }
 }
@@ -252,51 +308,17 @@ Note: all directories must be mounted to `/projects` by default.
 
 ## Usage with VS Code
 
-For quick installation, click the installation buttons below...
-
-[![Install with NPX in VS Code](https://img.shields.io/badge/VS_Code-NPM-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=filesystem&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40modelcontextprotocol%2Fserver-filesystem%22%2C%22%24%7BworkspaceFolder%7D%22%5D%7D) [![Install with NPX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-NPM-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=filesystem&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40modelcontextprotocol%2Fserver-filesystem%22%2C%22%24%7BworkspaceFolder%7D%22%5D%7D&quality=insiders)
-
-[![Install with Docker in VS Code](https://img.shields.io/badge/VS_Code-Docker-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=filesystem&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22--rm%22%2C%22--mount%22%2C%22type%3Dbind%2Csrc%3D%24%7BworkspaceFolder%7D%2Cdst%3D%2Fprojects%2Fworkspace%22%2C%22mcp%2Ffilesystem%22%2C%22%2Fprojects%22%5D%7D) [![Install with Docker in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Docker-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=filesystem&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22--rm%22%2C%22--mount%22%2C%22type%3Dbind%2Csrc%3D%24%7BworkspaceFolder%7D%2Cdst%3D%2Fprojects%2Fworkspace%22%2C%22mcp%2Ffilesystem%22%2C%22%2Fprojects%22%5D%7D&quality=insiders)
-
-For manual installation, you can configure the MCP server using one of these methods:
-
-**Method 1: User Configuration (Recommended)**
-Add the configuration to your user-level MCP configuration file. Open the Command Palette (`Ctrl + Shift + P`) and run `MCP: Open User Configuration`. This will open your user `mcp.json` file where you can add the server configuration.
+**Method 1: User Configuration**
+Open the Command Palette (`Ctrl + Shift + P`) and run `MCP: Open User Configuration`.
 
 **Method 2: Workspace Configuration**
-Alternatively, you can add the configuration to a file called `.vscode/mcp.json` in your workspace. This will allow you to share the configuration with others.
+Add the configuration to `.vscode/mcp.json` in your workspace.
 
-> For more details about MCP configuration in VS Code, see the [official VS Code MCP documentation](https://code.visualstudio.com/docs/copilot/customization/mcp-servers).
-
-You can provide sandboxed directories to the server by mounting them to `/projects`. Adding the `ro` flag will make the directory readonly by the server.
-
-### Docker
-Note: all directories must be mounted to `/projects` by default. 
-
+### NPX Example
 ```json
 {
   "servers": {
-    "filesystem": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "--mount", "type=bind,src=${workspaceFolder},dst=/projects/workspace",
-        "mcp/filesystem",
-        "/projects"
-      ]
-    }
-  }
-}
-```
-
-### NPX
-
-```json
-{
-  "servers": {
-    "filesystem": {
+    "zenith": {
       "command": "npx",
       "args": [
         "-y",
@@ -308,14 +330,30 @@ Note: all directories must be mounted to `/projects` by default.
 }
 ```
 
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `ZENITH_MCP_API_KEY` / `MCP_BRIDGE_API_KEY` / `COMMANDER_API_KEY` | API key for HTTP mode (required) |
+| `SESSION_TTL_MS` | HTTP session idle timeout in ms (default: 1800000) |
+| `CHAR_BUDGET` | Global character budget for reads (default: 400000) |
+| `SEARCH_CHAR_BUDGET` | Character budget for search results (default: 15000) |
+| `DEFAULT_EXCLUDES` | Comma-separated default exclude patterns |
+| `SENSITIVE_PATTERNS` | Comma-separated sensitive file glob patterns |
+| `REFACTOR_MAX_CHARS` | Max characters for refactor_batch (default: 30000) |
+| `REFACTOR_MAX_CONTEXT` | Max context lines for refactor_batch (default: 30) |
+| `REFACTOR_VERSION_TTL_HOURS` | Version snapshot TTL in hours (default: 24) |
+| `TOON_PROJECT_DIR` | Path to the `toon` compression project (default: `/home/tanner/Projects/toon`) |
+
 ## Build
 
-Docker build:
-
 ```bash
-docker build -t mcp/filesystem -f src/filesystem/Dockerfile .
+npm install
+npm run build
 ```
+
+The `dist/` directory contains the compiled output. No TypeScript compilation step is required; the project uses a dist-only JavaScript layout.
 
 ## License
 
-This MCP server is licensed under the MIT License. This means you are free to use, modify, and distribute the software, subject to the terms and conditions of the MIT License. For more details, please see the LICENSE file in the project repository.
+MIT License. See the LICENSE file in the project repository.

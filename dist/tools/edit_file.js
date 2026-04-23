@@ -1,9 +1,11 @@
 import { z } from "zod";
 import fs from "fs/promises";
+import path from 'path';
 import { randomBytes } from 'crypto';
 import { normalizeLineEndings, createMinimalDiff } from '../core/lib.js';
 import { stashEdits } from '../core/stash.js';
 import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
+import { findRepoRoot, getDb, snapshotSymbol, getSessionId } from '../core/symbol-index.js';
 
 export function register(server, ctx) {
     server.registerTool("edit_file", {
@@ -40,7 +42,7 @@ export function register(server, ctx) {
         const originalContent = normalizeLineEndings(await fs.readFile(validPath, 'utf-8'));
         const isBatch = args.edits.length > 1;
 
-        const { workingContent, errors } = await applyEditList(originalContent, args.edits, {
+        const { workingContent, errors, pendingSnapshots } = await applyEditList(originalContent, args.edits, {
             filePath: validPath,
             isBatch,
         });
@@ -63,6 +65,18 @@ export function register(server, ctx) {
         } catch (error) {
             try { await fs.unlink(tempPath); } catch {}
             throw error;
+        }
+
+        if (pendingSnapshots.length > 0) {
+            try {
+                const repoRoot = findRepoRoot(validPath) || path.dirname(validPath);
+                const db = getDb(repoRoot);
+                const sessionId = ctx.sessionId || getSessionId();
+                const relPath = path.relative(repoRoot, validPath);
+                for (const snap of pendingSnapshots) {
+                    snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                }
+            } catch { /* versioning is best-effort; never fail an edit because of it */ }
         }
 
         const warning = await syntaxWarn(validPath, workingContent);

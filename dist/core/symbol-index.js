@@ -19,6 +19,7 @@ export function findRepoRoot(filePath) {
             cwd,
             encoding: 'utf-8',
             timeout: 5000,
+            stdio: ['ignore', 'pipe', 'ignore'],
         });
         return result.trim();
     } catch {
@@ -46,6 +47,8 @@ export function getDb(repoRoot) {
 
     const db = new Database(path.join(mcpDir, 'symbols.db')); // nosemgrep
     db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('busy_timeout = 5000');
     db.pragma('foreign_keys = ON');
 
     db.exec(`
@@ -94,6 +97,10 @@ export function getDb(repoRoot) {
 
     // Schema migration: add line column to versions for accurate symbol disambiguation on restore
     try { db.exec('ALTER TABLE versions ADD COLUMN line INTEGER'); } catch { /* already exists */ }
+    try { db.exec('ALTER TABLE versions ADD COLUMN text_hash TEXT'); } catch { /* already exists */ }
+    try {
+        db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_versions_dedup ON versions(symbol_name, file_path, text_hash, session_id)');
+    } catch { /* tolerate pre-existing duplicates */ }
 
     if (!_exitHandlerRegistered) {
         _exitHandlerRegistered = true;
@@ -103,6 +110,8 @@ export function getDb(repoRoot) {
             }
         });
     }
+
+    try { db.prepare('DELETE FROM versions WHERE created_at < ?').run(Date.now() - (Number(process.env.REFACTOR_VERSION_TTL_HOURS) || 24) * 60 * 60 * 1000); } catch { /* table may be mid-migration */ }
 
     _dbCache.set(repoRoot, db);
     return db;
@@ -119,6 +128,16 @@ export function getSessionId(clientSessionId) {
 
 export function pruneOldSessions(db, currentSessionId) {
     db.prepare('DELETE FROM versions WHERE session_id != ?').run(currentSessionId);
+}
+
+function pruneOldVersions(db, ttlMs) {
+    const cutoff = Date.now() - ttlMs;
+    db.prepare('DELETE FROM versions WHERE created_at < ?').run(cutoff);
+}
+
+function defaultVersionTtlMs() {
+    const hours = Number(process.env.REFACTOR_VERSION_TTL_HOURS) || 24;
+    return hours * 60 * 60 * 1000;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,9 +376,10 @@ export function impactQuery(db, symbolName, opts = {}) {
 // ---------------------------------------------------------------------------
 
 export function snapshotSymbol(db, symbolName, filePath, originalText, sessionId, line) {
+    const textHash = createHash('md5').update(originalText || '').digest('hex');
     db.prepare(
-        'INSERT INTO versions (symbol_name, file_path, original_text, session_id, created_at, line) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(symbolName, filePath, originalText, sessionId, Date.now(), line ?? null);
+        'INSERT OR IGNORE INTO versions (symbol_name, file_path, original_text, session_id, created_at, line, text_hash) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(symbolName, filePath, originalText, sessionId, Date.now(), line ?? null, textHash);
 }
 
 export function getVersionHistory(db, symbolName, sessionId, filePath) {

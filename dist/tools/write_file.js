@@ -37,7 +37,7 @@ export function register(server, ctx) {
         inputSchema: {
             path: z.string().describe("File to write."),
             content: z.string().describe("Content to write."),
-            createOnly: z.boolean().optional().default(false).describe("Fail if the file already exists."),
+            failIfExists: z.boolean().optional().default(false).describe("Fail if the file already exists."),
             append: z.boolean().optional().default(false).describe("Append instead of overwriting."),
         },
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
@@ -52,7 +52,7 @@ export function register(server, ctx) {
             existed = true;
         } catch { /* file doesn't exist */ }
 
-        if (args.createOnly && existed) {
+        if (args.failIfExists && existed) {
             throw new Error(`File already exists.`);
         }
 

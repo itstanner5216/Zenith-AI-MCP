@@ -47,6 +47,7 @@ export class ProjectContext {
         this._boundRoot = null;   // resolved project root (git or manual)
         this._isGlobal = false;   // true if we fell through to global
         this._resolved = false;   // true if we've done initial resolution
+        this._explicit = false;   // true if root was set explicitly via initProject (sticky)
     }
 
     // --- Public API ---
@@ -59,7 +60,18 @@ export class ProjectContext {
         // If a specific file is given, try its repo first
         if (filePath) {
             const fileRoot = this._resolveFromPath(filePath);
-            if (fileRoot) return fileRoot;
+            if (fileRoot) {
+                // Auto-promote the first-touched repo as the bound root, but only
+                // when nothing has been explicitly bound via initProject. This lets
+                // session-wide tools (e.g. refactor_batch query with no fileScope)
+                // inherit the project the agent has been working in.
+                if (!this._explicit && (!this._resolved || !this._boundRoot)) {
+                    this._boundRoot = fileRoot;
+                    this._isGlobal = false;
+                    this._resolved = true;
+                }
+                return fileRoot;
+            }
         }
 
         // Return cached bound root if already resolved
@@ -102,6 +114,7 @@ export class ProjectContext {
         this._boundRoot = null;
         this._isGlobal = false;
         this._resolved = false;
+        this._explicit = false;
         this._resolve();
     }
 
@@ -119,10 +132,11 @@ export class ProjectContext {
             'INSERT OR REPLACE INTO project_roots (root_path, name, created_at) VALUES (?, ?, ?)'
         ).run(abs, name || path.basename(abs), Date.now());
 
-        // Bind to this project immediately
+        // Bind to this project immediately (sticky — overrides any auto-promote)
         this._boundRoot = abs;
         this._isGlobal = false;
         this._resolved = true;
+        this._explicit = true;
         return abs;
     }
 

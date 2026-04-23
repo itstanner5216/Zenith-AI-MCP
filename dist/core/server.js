@@ -10,11 +10,11 @@ import { register as registerReadMediaFile } from '../tools/read_media_file.js';
 import { register as registerReadMultipleFiles } from '../tools/read_multiple_files.js';
 import { register as registerWriteFile } from '../tools/write_file.js';
 import { register as registerEditFile } from '../tools/edit_file.js';
-import { register as registerListDirectory } from '../tools/list_directory.js';
-import { register as registerDirectoryTree } from '../tools/directory_tree.js';
+import { register as registerDirectory } from '../tools/directory.js';
 import { register as registerSearchFiles } from '../tools/search_files.js';
 import { register as registerFilesystem } from '../tools/filesystem.js';
 import { register as registerStashRestore } from '../tools/stash_restore.js';
+import { register as registerRefactorBatch } from '../tools/refactor_batch.js';
 import { onRootsChanged } from './project-context.js';
 
 export async function resolveInitialAllowedDirectories(args) {
@@ -54,11 +54,11 @@ function registerAllTools(server, ctx) {
   registerReadMultipleFiles(server, ctx);
   registerWriteFile(server, ctx);
   registerEditFile(server, ctx);
-  registerListDirectory(server, ctx);
-  registerDirectoryTree(server, ctx);
+  registerDirectory(server, ctx);
   registerSearchFiles(server, ctx);
   registerFilesystem(server, ctx);
   registerStashRestore(server, ctx);
+  registerRefactorBatch(server, ctx);
 }
 
 export function createFilesystemServer(ctx) {

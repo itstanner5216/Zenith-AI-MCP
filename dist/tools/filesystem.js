@@ -3,7 +3,7 @@ import fs from "fs/promises";
 import { getFileStats } from '../core/lib.js';
 
 export function register(server, ctx) {
-    server.registerTool("auto_filesystem", {
+    server.registerTool("file_manager", {
         title: "Filesystem",
         description: "Create directories, delete files, move/rename, or get file metadata.",
         inputSchema: z.discriminatedUnion("mode", [

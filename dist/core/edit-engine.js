@@ -141,6 +141,7 @@ function generateDiagnostic(content, oldText, editIndex, isBatch) {
 async function applyEditList(content, edits, { filePath, isBatch, disambiguations } = {}) {
     let workingContent = content;
     const errors = [];
+    const pendingSnapshots = [];
 
     for (let i = 0; i < edits.length; i++) {
         const edit = edits[i];
@@ -214,9 +215,16 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
             }
             const sym = symbolMatches[0];
             const lines = workingContent.split('\n');
+            const originalText = lines.slice(sym.line - 1, sym.endLine).join('\n');
             const normalizedNew = normalizeLineEndings(edit.newText);
             lines.splice(sym.line - 1, sym.endLine - (sym.line - 1), ...normalizedNew.split('\n'));
             workingContent = lines.join('\n');
+            pendingSnapshots.push({
+                symbol: edit.symbol,
+                originalText,
+                line: sym.line,
+                filePath: filePath,
+            });
             continue;
         }
 
@@ -249,7 +257,7 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
         }
     }
 
-    return { workingContent, errors };
+    return { workingContent, errors, pendingSnapshots };
 }
 
 // ---------------------------------------------------------------------------
