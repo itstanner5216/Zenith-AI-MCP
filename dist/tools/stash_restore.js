@@ -3,10 +3,10 @@ import fs from "fs/promises";
 import path from 'path';
 import { randomBytes } from 'crypto';
 import { normalizeLineEndings, createMinimalDiff } from '../core/lib.js';
-import { getLangForFile, findSymbol, checkSyntaxErrors } from '../core/tree-sitter.js';
+import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
 import { getStashEntry, consumeAttempt, clearStash, listStash } from '../core/stash.js';
 import { getProjectContext } from '../core/project-context.js';
-import { findMatch } from './edit_file.js';
+import { findMatch, applyEditList, syntaxWarn } from '../core/edit-engine.js';
 import {
     findRepoRoot, getDb, indexFile,
     getVersionHistory, getVersionText, restoreVersion,
@@ -34,10 +34,11 @@ export function register(server, ctx) {
                 symbol: z.string().optional().describe("Symbol name to restore."),
                 version: z.number().optional().describe("Version number from history."),
                 file: z.string().optional().describe("File containing the symbol."),
+                dryRun: z.boolean().optional().default(false).describe("Preview without writing."),
             }),
             z.object({
                 mode: z.literal("list").describe("Show all stash entries."),
-                type: z.enum(['edit', 'write', 'symbol']).optional().describe("Filter by entry type."),
+                type: z.enum(['edit', 'write']).optional().describe("Filter by entry type."),
             }),
             z.object({
                 mode: z.literal("read").describe("View contents of a stash entry."),
@@ -59,7 +60,7 @@ export function register(server, ctx) {
         // =================================================================
         if (args.mode === 'init') {
             if (!args.projectRoot) throw new Error('projectRoot required.');
-            const abs = pc.initProject(args.projectRoot, args.projectName);
+            pc.initProject(args.projectRoot, args.projectName);
             return { content: [{ type: 'text', text: `Registered.` }] };
         }
 
@@ -70,15 +71,10 @@ export function register(server, ctx) {
             const { entries, isGlobal } = listStash(ctx, args.file);
             let filtered = entries;
             if (args.type) {
-                if (args.type === 'symbol') {
-                    filtered = entries.filter(e => e.type === 'edit' && e.payload?.edits?.some(ed => ed.symbol));
-                } else {
-                    filtered = entries.filter(e => e.type === args.type);
-                }
+                filtered = entries.filter(e => e.type === args.type);
             }
             if (!filtered.length) {
-                let msg = args.type ? `No ${args.type} entries in stash.` : 'Stash is empty.';
-                if (isGlobal) msg += ' No project detected — showing global stash. Use init mode to register a project root.';
+                const msg = isGlobal ? 'Empty. (global)' : 'Empty.';
                 return { content: [{ type: 'text', text: msg }] };
             }
             const lines = filtered.map(e =>
@@ -104,23 +100,14 @@ export function register(server, ctx) {
                     const mode = e.symbol ? `symbol:${e.symbol}` : e.block_start ? `block:${e.block_start}...${e.block_end}` : `content`;
                     return `#${i + 1} [${status}] ${mode}`;
                 });
-                return { content: [{ type: 'text', text: `edit ${entry.filePath}\n${lines.join('\n')}` }] };
+                return { content: [{ type: 'text', text: `[edit] ${entry.filePath}\n${lines.join('\n')}` }] };
             }
 
             if (entry.type === 'write') {
                 const p = entry.payload;
                 const preview = p.content.length > 500 ? p.content.slice(0, 500) + '...' : p.content;
-                return { content: [{ type: 'text', text: `write [${p.mode}] ${entry.filePath}\n${preview}` }] };
+                return { content: [{ type: 'text', text: `[write] ${entry.filePath}\n${preview}` }] };
             }
-
-            const edits = entry.payload.edits || [];
-            const summary = edits.map((e, i) => {
-                if (e.block_start) return `#${i+1}: block [${e.block_start}] → [${e.block_end}]`;
-                if (e.oldContent) return `#${i+1}: content match`;
-                if (e.symbol) return `#${i+1}: symbol ${e.symbol}`;
-                return `#${i+1}: unknown`;
-            }).join('\n');
-            return { content: [{ type: 'text', text: `edit ${entry.filePath}\nfailed: ${(entry.payload.failedIndices||[]).join(', ')}\n${summary}` }] };
         }
 
         // =================================================================
@@ -172,7 +159,7 @@ export function register(server, ctx) {
             const entry = getStashEntry(ctx, args.stashId, args.file);
             if (!entry) throw new Error(`Stash #${args.stashId} not found.`);
             clearStash(ctx, args.stashId, args.file);
-            return { content: [{ type: 'text', text: `Stash #${args.stashId} cleared.` }] };
+            return { content: [{ type: 'text', text: `Cleared.` }] };
         }
 
         // =================================================================
@@ -193,87 +180,19 @@ export function register(server, ctx) {
             if (entry.type === 'edit') {
                 const validPath = await ctx.validatePath(entry.filePath);
                 const originalContent = normalizeLineEndings(await fs.readFile(validPath, 'utf-8'));
-                let workingContent = originalContent;
                 const edits = entry.payload.edits;
                 const failedIndices = entry.payload.failedIndices;
                 const corrections = args.corrections || [];
-                const errors = [];
 
-                const correctionMap = new Map();
-                for (const c of corrections) correctionMap.set(c.index, c);
-
-                for (let i = 0; i < edits.length; i++) {
-                    let edit = { ...edits[i] };
-
-                    // For ambiguous block edits, the correction just provides startLine
-                    if (failedIndices.includes(i)) {
-                        const corr = correctionMap.get(i + 1);
-                        if (corr) {
-                            if (corr.startLine !== undefined) edit.startLine = corr.startLine;
-                            if (corr.nearLine !== undefined) edit.nearLine = corr.nearLine;
-                        }
-                    }
-
-                    // Block replace mode
-                    if (edit.block_start || edit.block_end) {
-                        if (!edit.block_start || !edit.block_end) { errors.push({ i, msg: `#${i+1}: both block_start and block_end required.` }); continue; }
-                        if (edit.replacement_block === undefined) { errors.push({ i, msg: `#${i+1}: replacement_block required.` }); continue; }
-
-                        const lines = workingContent.split('\n');
-                        const expectedStart = edit.block_start.trim();
-                        const expectedEnd = edit.block_end.trim();
-                        const candidates = [];
-                        for (let s = 0; s < lines.length; s++) {
-                            if (lines[s].trim() !== expectedStart) continue;
-                            for (let e = s; e < lines.length; e++) {
-                                if (lines[e].trim() !== expectedEnd) { continue; }
-                                candidates.push({ start: s, end: e });
-                                break;
-                            }
-                        }
-
-                        if (candidates.length === 0) { errors.push({ i, msg: `#${i+1}: block_start not found.` }); continue; }
-
-                        let chosen;
-                        if (candidates.length === 1) {
-                            chosen = candidates[0];
-                        } else if (edit.startLine) {
-                            chosen = candidates.find(c => c.start === edit.startLine - 1);
-                            if (!chosen) { errors.push({ i, msg: `#${i+1}: no match at line ${edit.startLine}.` }); continue; }
-                        
-                        } else {
-                            const locs = candidates.map(c => `lines ${c.start + 1}-${c.end + 1}`).join(', ');
-                            errors.push({ i, msg: `#${i+1}: multiple matches: ${locs}. Provide startLine to disambiguate.` }); continue;
-                        }
-
-                        const normalizedNew = normalizeLineEndings(edit.replacement_block);
-                        lines.splice(chosen.start, chosen.end - chosen.start + 1, ...normalizedNew.split('\n'));
-                        workingContent = lines.join('\n');
-                        continue;
-                    }
-
-                    // Symbol mode
-                    if (edit.symbol) {
-                        const langName = getLangForFile(validPath);
-                        if (!langName) { errors.push({ i, msg: `#${i+1}: unsupported language.` }); continue; }
-                        const symbolMatches = await findSymbol(workingContent, langName, edit.symbol, { kindFilter: 'def', nearLine: edit.nearLine });
-                        if (!symbolMatches?.length) { errors.push({ i, msg: `#${i+1}: symbol not found.` }); continue; }
-                        if (symbolMatches.length > 1 && !edit.nearLine) { errors.push({ i, msg: `#${i+1}: multiple matches, use nearLine.` }); continue; }
-                        const sym = symbolMatches[0];
-                        const lines = workingContent.split('\n');
-                        lines.splice(sym.line - 1, sym.endLine - (sym.line - 1), ...normalizeLineEndings(edit.newText).split('\n'));
-                        workingContent = lines.join('\n');
-                        continue;
-                    }
-
-                    // Content match mode
-                    if (!edit.oldContent) { errors.push({ i, msg: `#${i+1}: provide block_start/block_end, oldContent, or symbol.` }); continue; }
-                    const match = findMatch(workingContent, edit.oldContent, edit.nearLine);
-                    if (!match) { errors.push({ i, msg: `#${i+1}: oldContent not found.` }); continue; }
-                    if (edit.newContent === undefined) { errors.push({ i, msg: `#${i+1}: newContent required.` }); continue; }
-                    const normalizedNew = normalizeLineEndings(edit.newContent);
-                    workingContent = workingContent.slice(0, match.index) + normalizedNew + workingContent.slice(match.index + match.matchedText.length);
+                const disambiguations = new Map();
+                for (const c of corrections) {
+                    disambiguations.set(c.index - 1, { startLine: c.startLine, nearLine: c.nearLine });
                 }
+                const { workingContent, errors } = await applyEditList(originalContent, edits, {
+                    filePath: validPath,
+                    isBatch: edits.length > 1,
+                    disambiguations,
+                });
 
                 if (errors.length > 0) {
                     const failMsg = errors.map(e => e.msg).join('\n');
@@ -295,21 +214,8 @@ export function register(server, ctx) {
                     throw error;
                 }
 
-                let syntaxWarning = '';
-                try {
-                    const ext = path.extname(validPath).toLowerCase();
-                    if (!['.scss', '.mdx', '.jsonc'].includes(ext)) {
-                        const langName = getLangForFile(validPath);
-                        if (langName) {
-                            const syntaxErrors = await checkSyntaxErrors(workingContent, langName);
-                            if (syntaxErrors?.length) {
-                                syntaxWarning = `\n⚠ Parse errors at lines ${syntaxErrors.map(e => `${e.line}:${e.column}`).join(', ')}`;
-                            }
-                        }
-                    }
-                } catch {}
-
-                return { content: [{ type: 'text', text: `Stash #${args.stashId} applied.${syntaxWarning}` }] };
+                const warning = await syntaxWarn(validPath, workingContent);
+                return { content: [{ type: 'text', text: `Applied.${warning}` }] };
             }
 
             // --- Write apply ---
