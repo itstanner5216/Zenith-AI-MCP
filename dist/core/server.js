@@ -18,6 +18,7 @@ import { register as registerDeleteFile } from '../tools/delete_file.js';
 import { register as registerSearchFiles } from '../tools/search_files.js';
 import { register as registerFindFiles } from '../tools/find_files.js';
 import { register as registerGetFileInfo } from '../tools/get_file_info.js';
+import { register as registerStashRestore } from '../tools/stash_restore.js';
 
 export async function resolveInitialAllowedDirectories(args) {
   return Promise.all(args.map(async (dir) => {
@@ -64,6 +65,7 @@ function registerAllTools(server, ctx) {
   registerSearchFiles(server, ctx);
   registerFindFiles(server, ctx);
   registerGetFileInfo(server, ctx);
+  registerStashRestore(server, ctx);
 }
 
 export function createFilesystemServer(ctx) {

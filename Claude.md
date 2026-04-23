@@ -80,12 +80,15 @@ The `edit_file` tool operates using a **Memory-First, All-or-Nothing** approach:
     *   *Content Match Mode:* Uses 3 strategies: exact match, trimmed match (ignores trailing spaces), and indent-stripped match (finds logic blocks and re-indents `newText` to match the file).
     *   *Range Mode:* Strictly requires `verifyStart` and `verifyEnd` strings only, you never have to write the full old text block, 2 lines instead of the currently enforced full old text of up to potentially 100 plus lines. The server asserts the trimmed contents of `startLine` and `endLine` match exactly to catch external file drift.
     *   *Symbol Mode:* Uses Tree-sitter to find the exact bounds of the symbol to replace, prevents full old text parroting as well.
-2.  **Atomic Commit:** If *any* edit in a batch fails validation, the whole batch is rejected, and the file is untouched. If successful, it writes to a temp file, verifies the file size, and uses `fs.rename()` for an atomic OS-level swap, preventing race conditions or symlink hijacking.
+2.  **Atomic Commit:** If *any* edit in a multi-edit batch fails validation, the whole batch is rejected and the file is untouched. Edits are stashed to SQLite for retry via `stashApply`. Single edits that fail are also stashed. On success, writes to a temp file, verifies size, and uses `fs.rename()` for an atomic swap.
 
-#### The Edit Cache Mechanism
-To save LLM tokens during failed edits, `edit_file.js` utilizes a `_pendingRetries` Map.
-*   If an edit fails (e.g., hallucinated spacing in `oldText`), the entire edit payload (including the massive `newText`) is cached with a 120-second TTL.
-*   The LLM can retry by sending only the correct `veryStart` line and `verifyEnd` line, completely omitting `oldText` AND `newText`. The tool rehydrates the `newText` from the cache and attempts the edit again.
+#### The Stash System
+Failed edits and writes are persisted to SQLite (`stash_edits` / `stash_writes` tables) with a 120-second TTL and 2-attempt limit.
+*   On edit failure, the error returns a `stashId` and lists only the failed edits with their specific mismatch.
+*   On write failure (e.g., permission denied, bad path), the content is stashed and a `stashId` is returned.
+*   The LLM retries via `stashApply` — providing the `stashId` and corrected verifications for only the failed edits (or a corrected `path` for writes). Unchanged edits rehydrate from the stash.
+*   After 2 failed attempts or 120s, the stash entry is deleted.
+
 
 #### Security Hardening
 *   **Sensitive Files:** `isSensitive()` blocks access to credentials (`.env`, `.pem`, etc.) using `minimatch` glob patterns.
@@ -100,7 +103,8 @@ To save LLM tokens during failed edits, `edit_file.js` utilizes a `_pendingRetri
 | **create_directory**    | Recursively creates directories.   | `path` (Idempotent).                                                                                                      |
 | **delete_file**         | Permanently deletes a file.        | `path` (Cannot delete directories).                                                                                       |
 | **directory_tree**      | Indented text tree of dirs/files.  | `path`, `excludePatterns`, `showSymbols` (Appends Tree-sitter metadata). Caps at 500 entries.                             |
-| **edit_file**           | Surgical, safe file modification.  | `path`, `edits`. Modes: Content Match, Range, Symbol. Supports dry-runs and retry-caching.                                |
+| **edit_file**           | Surgical, safe file modification.  | `path`, `edits`. Modes: Content Match, Range, Symbol. Supports dry-runs. Failures stashed for retry.                      |
+| **stashApply**          | Retry failed edits/writes.         | `stashId`, `type` (edit/write), `fixes` (corrected verifications), `path` (for write retries). 2 attempts max.            |
 | **find_files**          | Fast file location.                | `path`, `namePattern`, `pathContains`, `relevanceQuery` (BM25), `definesSymbol` (Tree-sitter).                            |
 | **get_file_info**       | Gets file/dir metadata.            | `path` (Returns size, mtime, permissions).                                                                                |
 | **list_directory**      | Text-format directory listing.     | `path`, `depth`, `listAllowed` (Lists root workspaces). Caps at 250 entries/dir.                                          |
