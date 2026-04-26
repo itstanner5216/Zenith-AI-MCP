@@ -13,25 +13,17 @@ export function register(server, ctx) {
         description: "Edit a text file.",
         inputSchema: {
             path: z.string().describe("File to edit."),
-            edits: z.array(z.discriminatedUnion("mode", [
-                z.object({
-                    mode: z.literal("block"),
-                    block_start: z.string().describe("Trimmed content of the first line of the block."),
-                    block_end: z.string().describe("Trimmed content of the last line of the block."),
-                    replacement_block: z.string().describe("Text that replaces the entire block."),
-                }),
-                z.object({
-                    mode: z.literal("content"),
-                    oldContent: z.string().describe("Exact text to find."),
-                    newContent: z.string().describe("Text that replaces oldContent."),
-                }),
-                z.object({
-                    mode: z.literal("symbol"),
-                    symbol: z.string().describe("Symbol name. Dot-qualified for methods."),
-                    newText: z.string().describe("Text that replaces the symbol."),
-                    nearLine: z.number().optional().describe("Approximate line number if multiple matches."),
-                }),
-            ])),
+            edits: z.array(z.object({
+                mode: z.enum(["block", "content", "symbol"]),
+                block_start: z.string().optional().describe("First line of block."),
+                block_end: z.string().optional().describe("Last line of block."),
+                replacement_block: z.string().optional().describe("Replacement text."),
+                oldContent: z.string().optional().describe("Text to find."),
+                newContent: z.string().optional().describe("Replacement text."),
+                symbol: z.string().optional().describe("Symbol name."),
+                newText: z.string().optional().describe("Replacement text."),
+                nearLine: z.number().optional().describe("Approx line number."),
+            })),
             dryRun: z.boolean().default(false).describe("Preview without writing."),
         },
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }

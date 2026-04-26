@@ -3,7 +3,7 @@ Generated: 2026-04-14T10:00:53.708Z
 
 Selected files:
 - /home/tanner/Projects/dcp-fork/lib/messages/inject.ts
-- /home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+- /home/tanner/Projects/zenith-mcp/src/zenithmcp/retrieval/models.py
 - /home/tanner/Projects/oh-my-opencode-rebase/bin/oh-my-opencode.js
 - /home/tanner/Projects/Enhanced-Perplexica/src/components/Widgets/Weather.tsx
 
@@ -134,7 +134,7 @@ const resolveContextLimit = (
 const shouldInjectCompressNudge = (
 
 ============================================================
-FILE: /home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+FILE: /home/tanner/Projects/zenith-mcp/src/zenithmcp/retrieval/models.py
 LANGUAGE: Python
 RAW_CHARS: 5528
 TARGET_BUDGET: 3869
@@ -154,7 +154,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
-    from src.multimcp.mcp_proxy import ToolMapping
+    from src.zenithmcp.mcp_proxy import ToolMapping
 
 
 @dataclass
@@ -615,7 +615,7 @@ const resolveContextLimit = (
 
     return contextLimit
 
-/home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+/home/tanner/Projects/zenith-mcp/src/zenithmcp/retrieval/models.py
 """Core data models for the retrieval pipeline."""
 
 from __future__ import annotations
@@ -625,7 +625,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
-    from src.multimcp.mcp_proxy import ToolMapping
+    from src.zenithmcp.mcp_proxy import ToolMapping
 
 
 @dataclass

@@ -12,32 +12,19 @@ import { z } from "zod";
  export function register(server, ctx) {
      server.registerTool("directory", {
          title: "Directory",
-         description: "List directory contents, show a recursive tree, or list allowed roots.",
-         inputSchema: z.discriminatedUnion("mode", [
-             z.object({
-                 mode: z.literal("list"),
-                 path: z.string().describe("Directory to list."),
-                 depth: z.number().optional().default(1).describe("Recursion depth. Max 10."),
-                 includeSizes: z.boolean().optional().default(false).describe("Show file sizes."),
-                 sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort order. Requires includeSizes."),
-             }),
-             z.object({
-                 mode: z.literal("tree"),
-                 path: z.string().describe("Root directory."),
-                 excludePatterns: z.array(z.string()).optional().default([]).describe("Glob patterns to exclude."),
-                 showSymbols: z.boolean().optional().default(false).describe("Show symbol counts per file."),
-                 showSymbolNames: z.boolean().optional().default(false).describe("Show symbol names per file. Implies showSymbols."),
-             }),
-             z.object({
-                 mode: z.literal("roots"),
-             }),
-         ]),
+         description: "List directory contents or show a recursive tree.",
+         inputSchema: z.object({
+             mode: z.enum(["list", "tree"]).describe("Operation mode."),
+             path: z.string().optional().describe("Dir path."),
+             depth: z.number().optional().default(1).describe("Recursion depth."),
+             includeSizes: z.boolean().optional().default(false).describe("Show file sizes."),
+             sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort order."),
+             excludePatterns: z.array(z.string()).optional().default([]).describe("Glob exclude patterns."),
+             showSymbols: z.boolean().optional().default(false).describe("Show symbol counts."),
+             showSymbolNames: z.boolean().optional().default(false).describe("Show symbol names."),
+         }),
          annotations: { readOnlyHint: true }
      }, async (args) => {
-         if (args.mode === "roots") {
-             return { content: [{ type: "text", text: ctx.getAllowedDirectories().join('\n') }] };
-         }
- 
          if (args.mode === "list") {
              const validPath = await ctx.validatePath(args.path);
              const depth = Math.max(1, Math.min(args.depth || 1, 10));

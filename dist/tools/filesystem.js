@@ -6,25 +6,12 @@ export function register(server, ctx) {
     server.registerTool("file_manager", {
         title: "Filesystem",
         description: "Create directories, delete files, move/rename, or get file metadata.",
-        inputSchema: z.discriminatedUnion("mode", [
-            z.object({
-                mode: z.literal("mkdir"),
-                path: z.string().describe("Directory to create. Creates nested directories."),
-            }),
-            z.object({
-                mode: z.literal("delete"),
-                path: z.string().describe("File to delete. Irreversible."),
-            }),
-            z.object({
-                mode: z.literal("move"),
-                source: z.string().describe("File or directory to move."),
-                destination: z.string().describe("New path."),
-            }),
-            z.object({
-                mode: z.literal("info"),
-                path: z.string().describe("File or directory to get metadata for."),
-            }),
-        ]),
+        inputSchema: z.object({
+            mode: z.enum(["mkdir", "delete", "move", "info"]).describe("Operation mode."),
+            path: z.string().optional().describe("File or directory path."),
+            source: z.string().optional().describe("Source path."),
+            destination: z.string().optional().describe("Destination path."),
+        }),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
         if (args.mode === "mkdir") {

@@ -672,9 +672,14 @@ Zenith-MCP uses a hybrid source layout:
 | `dist/grammars/` | WASM + SCM | Tree-sitter grammars and queries | Yes |
 | `src/adapters/` | TypeScript | MCP config adapter integrations | Yes |
 | `src/config/` | TypeScript | Adapter settings + CLI | Yes |
+| `src/retrieval/` | TypeScript | Retrieval pipeline, ranking, telemetry, observability | Yes |
+| `src/config/zenith-mcp/` | TypeScript | Zenith-MCP config management + admin CLI | Yes |
 | `dist/adapters/` | JavaScript | tsc output from `src/adapters/` | No |
 | `dist/config/` | JavaScript | tsc output from `src/config/` | No |
+| `dist/retrieval/` | JavaScript | tsc output from `src/retrieval/` | No |
 
-**Important:** Do NOT add `dist/` to `.gitignore`. Only `dist/adapters/` and `dist/config/` are tsc output. All other `dist/` subdirectories contain hand-authored source code.
+**Important:** Do NOT add `dist/` to `.gitignore`. Only `dist/adapters/`, `dist/config/`, and `dist/retrieval/` are tsc output. All other `dist/` subdirectories contain hand-authored source code.
+
+The retrieval pipeline is opt-in — `defaultRetrievalConfig()` sets `enabled: false`. The pipeline is initialized at server startup but remains inert until explicitly activated via config.
 
 The build script includes a prebuild safety check that aborts if `dist/core/server.js` is missing, preventing accidental destruction of source via `rm -rf dist`.

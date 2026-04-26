@@ -110,7 +110,7 @@ const resolveContextLimit = (
 
     return contextLimit
 
-/home/tanner/Projects/multi-mcp/src/multimcp/retrieval/models.py
+/home/tanner/Projects/zenith-mcp/src/zenithmcp/retrieval/models.py
 """Core data models for the retrieval pipeline."""
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
-    from src.multimcp.mcp_proxy import ToolMapping
+    from src.zenithmcp.mcp_proxy import ToolMapping
 
 
 @dataclass

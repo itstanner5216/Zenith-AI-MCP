@@ -5,7 +5,8 @@ import path from "path";
 import { normalizePath, expandHome } from './path-utils.js';
 import { getValidRootDirectories } from './roots-utils.js';
 
-import { register as registerReadTextFile } from '../tools/read_text_file.js';
+import { register as registerReadFile } from '../tools/read_file.js';
+import { register as registerSearchFile } from '../tools/search_file.js';
 import { register as registerReadMediaFile } from '../tools/read_media_file.js';
 import { register as registerReadMultipleFiles } from '../tools/read_multiple_files.js';
 import { register as registerWriteFile } from '../tools/write_file.js';
@@ -18,6 +19,8 @@ import { register as registerRefactorBatch } from '../tools/refactor_batch.js';
 import { configureRegistry } from '../adapters/index.js';
 import { loadSettings } from '../config/index.js';
 import { onRootsChanged } from './project-context.js';
+import { createRetrievalPipelineForZenith, ZenithToolRegistry } from '../retrieval/index.js';
+import { defaultRetrievalConfig } from '../retrieval/models.js';
 
 export async function resolveInitialAllowedDirectories(args) {
   return Promise.all(args.map(async (dir) => {
@@ -51,7 +54,8 @@ export async function validateDirectories(directories) {
 }
 
 function registerAllTools(server, ctx) {
-  registerReadTextFile(server, ctx);
+  registerReadFile(server, ctx);
+  registerSearchFile(server, ctx);
   registerReadMediaFile(server, ctx);
   registerReadMultipleFiles(server, ctx);
   registerWriteFile(server, ctx);
@@ -64,11 +68,26 @@ function registerAllTools(server, ctx) {
 }
 
 export function createFilesystemServer(ctx) {
-  const server = new McpServer({ name: "zenith-mcp", version: "0.3.0" });
+  const server = new McpServer(
+  { name: "zenith-mcp", version: "0.3.0" },
+  {
+    instructions: "Each call must set mode and the corresponding params, unless the schema lists the param explicitly as optional. Global Mode Rule: tool params apply only to the mode specified in the tools description. A param is shared only when explicitly listed for multiple modes."
+  }
+);
+
+  // Initialize adapter registry if user has enabled adapters
   const settings = loadSettings();
   if (settings.enabledAdapters.length > 0) {
     configureRegistry(settings.backupDir ?? undefined);
   }
+
+  // Initialize retrieval pipeline (opt-in via config — disabled by default)
+  const retrievalConfig = defaultRetrievalConfig();
+  const toolRegistry = new ZenithToolRegistry();
+  const pipeline = createRetrievalPipelineForZenith({ registry: toolRegistry, config: retrievalConfig });
+  ctx._retrievalPipeline = pipeline;
+  ctx._toolRegistry = toolRegistry;
+
   registerAllTools(server, ctx);
   return server;
 }

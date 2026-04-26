@@ -114,41 +114,26 @@ export function register(server, ctx) {
     server.registerTool("refactor_batch", {
         title: "Refactor Batch",
         description: "Apply one edit pattern across multiple similar symbols, with rollback.",
-        inputSchema: z.discriminatedUnion("mode", [
-            z.object({
-                mode: z.literal("query").describe("Find symbols that reference (or are referenced by) a target."),
-                target: z.string().describe("Symbol name to query."),
-                fileScope: z.string().optional().describe("Restrict to one file."),
-                direction: z.enum(['forward', 'reverse']).default('forward').describe("forward = callers; reverse = callees."),
-                depth: z.number().int().min(1).max(5).default(1).describe("Transitive levels to traverse."),
-            }),
-            z.object({
-                mode: z.literal("load").describe("Load function bodies plus surrounding context for the chosen symbols."),
-                selection: z.array(z.union([
-                    z.number().int().min(1).describe("1-based index from the prior query."),
-                    z.object({
-                        symbol: z.string().describe("Symbol name to load."),
-                        file: z.string().optional().describe("File containing the symbol."),
-                    }),
-                ])).describe("Indices from the prior query, or explicit {symbol, file} pairs."),
-                contextLines: z.number().int().min(0).max(MAX_CONTEXT_LINES).default(DEFAULT_CONTEXT).describe("Lines of context above and below each symbol."),
-                loadMore: z.boolean().default(false).describe("Continue from the previous truncated load."),
-            }),
-            z.object({
-                mode: z.literal("apply").describe("Apply the edited diff to all selected occurrences."),
-                payload: z.string().describe("Edited diff string with symbol headers (e.g. \"validateCard 1,2,3 ack:3\")."),
-                dryRun: z.boolean().default(false).describe("Run all gates without writing."),
-            }),
-            z.object({
-                mode: z.literal("reapply").describe("Apply a previously-applied symbol-group payload to new targets."),
-                symbolGroup: z.string().describe("Symbol name from a prior successful apply."),
-                newTargets: z.array(z.union([
-                    z.string(),
-                    z.object({ symbol: z.string(), file: z.string().optional() }),
-                ])).describe("New targets — names or {symbol, file} pairs."),
-                dryRun: z.boolean().default(false).describe("Run all gates without writing."),
-            }),
-        ]),
+        inputSchema: z.object({
+            mode: z.enum(["query", "load", "apply", "reapply"]).describe("Mode."),
+            target: z.string().optional().describe("Symbol name."),
+            fileScope: z.string().optional().describe("File path."),
+            direction: z.enum(["forward", "reverse"]).default("forward").describe("forward=callers, reverse=callees."),
+            depth: z.number().int().min(1).max(5).default(1).describe("Transitive depth."),
+            selection: z.array(z.union([
+                z.number().int().min(1),
+                z.object({ symbol: z.string(), file: z.string().optional() }),
+            ])).optional().describe("Indices or {symbol,file}."),
+            contextLines: z.number().int().min(0).max(MAX_CONTEXT_LINES).default(DEFAULT_CONTEXT).describe("Context lines."),
+            loadMore: z.boolean().default(false).describe("Continue truncated load."),
+            payload: z.string().optional().describe("Diff with symbol headers."),
+            dryRun: z.boolean().default(false).describe("Validate without writing."),
+            symbolGroup: z.string().optional().describe("Prior symbol name."),
+            newTargets: z.array(z.union([
+                z.string(),
+                z.object({ symbol: z.string(), file: z.string().optional() }),
+            ])).optional().describe("Names or {symbol,file}."),
+        }),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
         const pc = getProjectContext(ctx);

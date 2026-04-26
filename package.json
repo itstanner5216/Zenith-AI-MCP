@@ -15,14 +15,15 @@
   "bin": {
     "zenith-mcp": "dist/cli/stdio.js",
     "zenith-mcp-http": "dist/server/http.js",
-    "zenith-mcp-config": "dist/config/adapter-cli.js"
+    "zenith-mcp-config": "dist/config/adapter-cli.js",
+    "zenith-mcp-config-admin": "dist/config/zenith-mcp/admin-cli.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
     "prebuild": "node -e \"if(!require('fs').existsSync('dist/core/server.js')){console.error('ABORT: dist/ contains hand-authored source. Refusing to build into corrupted dist.');process.exit(1)}\"",
-    "build": "npm run prebuild && tsc && shx chmod +x dist/cli/*.js dist/server/*.js dist/config/adapter-cli.js",
+    "build": "npm run prebuild && tsc && shx chmod +x dist/cli/*.js dist/server/*.js dist/config/adapter-cli.js dist/config/zenith-mcp/admin-cli.js",
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "test": "vitest run --coverage",
@@ -37,9 +38,11 @@
     "express": "^5.2.1",
     "glob": "^10.5.0",
     "js-yaml": "^4.1.0",
+    "json-schema-typed": "^8.0.2",
     "json5": "^2.2.3",
     "minimatch": "^10.0.1",
     "web-tree-sitter": "^0.26.8",
+    "zod": "^4.3.6",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
@@ -47,9 +50,9 @@
     "@types/js-yaml": "^4.0.9",
     "@types/minimatch": "^5.1.2",
     "@types/node": "^22",
-    "@vitest/coverage-v8": "^2.1.8",
+    "@vitest/coverage-v8": "^4.1.5",
     "shx": "^0.3.4",
     "typescript": "^5.8.2",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.5"
   }
 }

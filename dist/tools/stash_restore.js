@@ -17,58 +17,26 @@ export function register(server, ctx) {
     server.registerTool("stashRestore", {
         title: "Stash Restore",
         description: "Retry failed edits/writes, restore previous versions, or browse cached entries.",
-        inputSchema: z.discriminatedUnion("mode", [
-            z.object({
-                mode: z.literal("apply").describe("Retry a stashed failed edit or write."),
-                stashId: z.number().describe("Stash entry ID."),
-                corrections: z.array(z.object({
-                    index: z.number().describe("1-based edit index to disambiguate."),
-                    startLine: z.number().optional().describe("Exact line for ambiguous block edits."),
-                    nearLine: z.number().optional().describe("Approximate line for ambiguous symbol edits."),
-                })).optional().describe("Disambiguation for failed edits."),
-                newPath: z.string().optional().describe("Redirect a failed write to a different path."),
-                dryRun: z.boolean().optional().default(false).describe("Preview without writing."),
-            }),
-            z.object({
-                mode: z.literal("restore").describe("Restore a symbol to a previous version, or clear a stash entry."),
-                stashId: z.number().optional().describe("Stash ID to clear."),
-                symbol: z.string().optional().describe("Symbol name to restore."),
-                version: z.number().optional().describe("Version number from history."),
-                file: z.string().optional().describe("File containing the symbol."),
-                dryRun: z.boolean().optional().default(false).describe("Preview without writing."),
-            }),
-            z.object({
-                mode: z.literal("list").describe("Show all stash entries."),
-                type: z.enum(['edit', 'write']).optional().describe("Filter by entry type."),
-            }),
-            z.object({
-                mode: z.literal("read").describe("View contents of a stash entry."),
-                stashId: z.number().describe("Stash entry ID."),
-            }),
-            z.object({
-                mode: z.literal("init").describe("Register a non-git directory as a project root."),
-                projectRoot: z.string().describe("Directory to register."),
-                projectName: z.string().optional().describe("Optional project name."),
-            }),
-            z.object({
-                mode: z.literal("history").describe("List version snapshots for a symbol."),
-                symbol: z.string().describe("Symbol name. Dot-qualified for methods."),
-                file: z.string().optional().describe("Restrict to one file."),
-            }),
-        ]),
+        inputSchema: z.object({
+            mode: z.enum(["apply", "restore", "list", "read", "history"]).describe("Operation mode."),
+            stashId: z.number().optional().describe("Stash entry ID."),
+            corrections: z.array(z.object({
+                index: z.number().describe("1-based edit index."),
+                startLine: z.number().optional().describe("Exact line for block edits."),
+                nearLine: z.number().optional().describe("Approximate line for symbol edits."),
+            })).optional().describe("Disambiguation hints."),
+            newPath: z.string().optional().describe("Redirect write to different path."),
+            dryRun: z.boolean().optional().default(false).describe("Preview without writing."),
+            symbol: z.string().optional().describe("Symbol name."),
+            version: z.number().optional().describe("Version number."),
+            file: z.string().optional().describe("File path."),
+            type: z.enum(['edit', 'write']).optional().describe("Filter by entry type."),
+
+        }),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
 
         const pc = getProjectContext(ctx);
-
-        // =================================================================
-        // INIT — register a project root (no git needed)
-        // =================================================================
-        if (args.mode === 'init') {
-            if (!args.projectRoot) throw new Error('projectRoot required.');
-            pc.initProject(args.projectRoot, args.projectName);
-            return { content: [{ type: 'text', text: `Registered.` }] };
-        }
 
         // =================================================================
         // LIST
