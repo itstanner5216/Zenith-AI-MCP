@@ -33,12 +33,14 @@
     "diff": "^5.1.0",
     "express": "^5.2.1",
     "glob": "^10.5.0",
+    "js-yaml": "^4.1.0",
     "minimatch": "^10.0.1",
     "web-tree-sitter": "^0.26.8",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
     "@types/diff": "^5.0.9",
+    "@types/js-yaml": "^4.0.9",
     "@types/minimatch": "^5.1.2",
     "@types/node": "^22",
     "@vitest/coverage-v8": "^2.1.8",
