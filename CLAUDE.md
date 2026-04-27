@@ -59,7 +59,13 @@ The server uses a modular architecture, isolating tool logic from core engine ca
 *   **`dist/core/project-context.js` (Project Resolution):** Root resolution ladder: MCP roots → git detection → cwd → manually registered roots → global fallback.
 *   **`dist/core/stash.js` (Stash Persistence):** SQLite-backed stash operations routed through `ProjectContext`.
 *   **`dist/core/compression.js` & `dist/core/toon_bridge.js` (Compression):** Structured code compression bridge.
-*   **`dist/tools/` (The Endpoints):** Directory containing isolated tool definitions (e.g., `edit_file.js`, `search_files.js`, `refactor_batch.js`).
+*   **`dist/tools/` (The Endpoints):** Directory containing isolated tool definitions (e.g., `edit_file.js`, `search_files.js`, `search_file.js`, `refactor_batch.js`).
+
+### TypeScript-Compiled Modules (`src/` → `dist/`)
+
+*   **`src/adapters/` (MCP Client Config Adapters):** Auto-configuration for 16 MCP clients (Claude Desktop, VS Code Copilot, Cline, Zed, Cursor, etc.). Abstract `MCPConfigAdapter` base class with per-platform implementations in `src/adapters/platforms/`. Registry in `src/adapters/registry.ts`. Config helpers (JSON5, TOML, YAML) in `src/adapters/helpers/`.
+*   **`src/config/` (Settings & CLIs):** Adapter settings (`adapter-settings.ts`, persisted at `~/.zenith-mcp/adapter-config.json`), adapter CLI (`adapter-cli.ts`), and Zenith-MCP server config (`src/config/zenith-mcp/`) with YAML-based `servers.yaml`, admin CLI (`admin-cli.ts`), tool cache management (`cache.ts`), and config types (`types.ts`).
+*   **`src/retrieval/` (Retrieval Pipeline):** Opt-in (disabled by default) 6-tier tool retrieval system. Pipeline (`pipeline.ts`), BMXF scoring with weighted RRF fusion (`ranking/`), session state management (`session.ts`), telemetry (`telemetry/`), observability (`observability/`), synthetic routing tool for demoted-tool discovery (`routing-tool.ts`), and Zenith integration hooks (`zenith-integration.ts`).
 
 ---
 
@@ -73,7 +79,7 @@ Instead of treating code as plain text, the server uses `web-tree-sitter` (WASM)
 
 #### BM25 & Ripgrep (Intelligent Search)
 To navigate massive codebases while respecting the LLM context limit (`CHAR_BUDGET` ~400k), the server employs a two-stage search:
-1.  **BM25 Pre-filtering:** When scanning a repository, the server builds an in-memory BM25 index of file paths and their first ~8KB. It ranks them against the natural language query to find the top 50 candidates, passing *only* those to `ripgrep`.
+1.  **BM25 Pre-filtering:** When scanning a repository, the server builds an in-memory BM25 index of file paths (boosted 3×) and their first ~8KB. It ranks them against the natural language query to find the top 100 candidates, passing *only* those to `ripgrep`.
 2.  **Ripgrep Execution:** Executes extremely fast regex searches on the pre-filtered files (or falls back to a JS implementation if `rg` is unavailable).
 3.  **BM25 Post-filtering:** If the results exceed `RANK_THRESHOLD` (50 lines), BM25 ranks the individual result lines. The most relevant matches are prioritized to fill the character budget, and the rest are truncated.
 
@@ -122,6 +128,7 @@ Failed edits and writes are persisted to SQLite (`stash` table, per-project DB) 
 | **stashRestore**        | Retry failed edits, restore versions, stash mgmt.| `mode`: `apply`/`restore`/`list`/`read`/`init`/`history`. `apply`: `stashId` + `corrections`. `restore`: `symbol`+`version` or `stashId`. `init`: register project root.     |
 | **directory**           | Directory exploration.                          | `mode`: `list`/`tree`. `list`: `path`, `depth` (max 10), `includeSizes`, `sortBy`, `listAllowed`. `tree`: `path`, `excludePatterns`, `showSymbols`, `showSymbolNames`. Caps at 250/500. |
 | **search_files**        | Content, file, symbol, structural search.       | `mode`: `content`/`files`/`symbol`/`structural`/`definition`. `content`: ripgrep+BM25, always case-insensitive, `literalSearch`, `countOnly`. `symbol`: `symbolQuery` optional (lists all when omitted). `structural`: AST fingerprint similarity. |
+| **search_file**         | Single-file grep or symbol search.               | `path`, `grep` (regex, case-insensitive), `grepContext` (max 30), `symbol` (dot-qualified), `nearLine`, `expandLines` (max 50), `maxChars`. Read-only. |
 | **file_manager**        | mkdir, delete, move, get metadata.              | `mode`: `mkdir`/`delete`/`move`/`info`. `info` returns size, mtime, permissions.                                                                                          |
 | **refactor_batch**      | Cross-file batch refactoring.                   | `mode`: `query` (impact analysis), `load` (symbol bodies), `apply` (multi-file diff), `reapply` (cached payload on new targets). Outlier detection, syntax gates, rollback. |
 
@@ -135,6 +142,26 @@ Failed edits and writes are persisted to SQLite (`stash` table, per-project DB) 
 3. Use `zod` for strict `inputSchema`.
 4. **Mandatory:** Call `await ctx.validatePath(args.path)` before *any* `fs` operation.
 5. Import and register it in `core/server.js`.
+
+**Adapter System (src/adapters/):**
+- `MCPConfigAdapter` base class in `src/adapters/base.ts` — abstract methods: `configPath`, `readConfig`, `writeConfig`, `registerServer`, `discoverServers`.
+- 16 platform adapters in `src/adapters/platforms/` (claude-desktop, opencode, cline, codex-cli, codex-desktop, continue-dev, gemini-cli, github-copilot, gptme, jetbrains, openclaw, raycast, roo-code, warp, zed, antigravity).
+- `AdapterRegistry` in `src/adapters/registry.ts` — enabled adapters configured via `~/.zenith-mcp/adapter-config.json` or env vars `ZENITH_MCP_ADAPTERS_ENABLED` / `ZENITH_MCP_ADAPTER_BACKUP_DIR`.
+- Adapter CLI: `npx zenith-mcp-config --list|--status|--enable <names>|--disable <name>|--backup-dir <path>`
+
+**Config Management (src/config/zenith-mcp/):**
+- YAML-based server config at `~/.zenith-mcp/zenith-mcp/servers.yaml`.
+- `ZenithMcpConfig` type: `{ servers, profiles, retrieval }` — each server has `tools`, `toolFilters`, `transport`, `idleTimeoutSeconds`.
+- Admin CLI: `npx zenith-mcp-config-admin list|status|install|scan` — manages server registrations and tool cache.
+- Tool cache (`cache.ts`): merge discovered tools, cleanup stale (disabled + previous cycle), get enabled set.
+
+**Retrieval Pipeline (src/retrieval/):**
+- Opt-in via `retrieval.enabled: true` in config (disabled by default).
+- 6-tier fallback: (1) BMXF blend of env+conv, (2) BMXF env-only, (3) keyword env-only, (4) static categories by project type, (5) frequency prior from logs, (6) universal namespace-based selection.
+- `RetrievalPipeline` intercepts `tools/list` and `tools/call` to filter/proxy tools per session.
+- Synthetic `request_tool` routing tool for accessing demoted tools.
+- Telemetry (`telemetry/`): workspace fingerprinting, session state, ranking events.
+- Observability (`observability/`): rolling metrics, JSONL logger, replay.
 
 **Tree-sitter Snippet (Finding a Symbol):**
 

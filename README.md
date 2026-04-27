@@ -91,7 +91,7 @@ Rollback is a single tool call: `stashRestore restore symbol:"AuthService.login"
 
 - **Read/write files** — text, media, and batch reads with budget-aware truncation and optional compression
 - **Surgical editing** — content-match, block-replace, and symbol-aware edits with dry-run preview
-- **Intelligent search** — content search with BM25 ranking, file discovery, symbol search, structural similarity, and definition lookup
+- **Intelligent search** — content search with BM25 ranking, file discovery, symbol search, structural similarity, definition lookup, and single-file grep/symbol search
 - **Cross-file refactoring** — impact analysis, batch symbol loading, and coordinated multi-file edits with rollback
 - **Code awareness** — Tree-sitter AST parsing for 20+ languages (lazy-loaded WASM grammars)
 - **Symbol indexing & versioning** — per-project SQLite index with impact graphs and automatic version snapshots
@@ -284,6 +284,17 @@ Multi-mode search with ripgrep + BM25 ranking and JS fallback.
   - `extensions` (string[], optional)
   - `maxResults` (number, optional, default 100)
 
+### `search_file`
+Single-file search by regex or symbol name. Read-only.
+
+- `path` (string) — file to search
+- `grep` (string, optional) — case-insensitive regex to match lines
+- `grepContext` (number, optional, default 0, max 30) — context lines around matches
+- `symbol` (string, optional) — symbol name, dot-qualified for methods (e.g. `AuthService.login`)
+- `nearLine` (number, optional) — disambiguate multiple symbol matches
+- `expandLines` (number, optional, default 0, max 50) — extra context around symbol
+- `maxChars` (number, optional, default 50000, up to 400000)
+
 ### `file_manager`
 Directory and file management operations.
 - **mode: `mkdir`** — `path`
@@ -353,6 +364,7 @@ Apply one edit pattern across multiple similar symbols, with outlier detection a
 | `read_multiple_files` | `true`       | —              | —               | Pure read                                       |
 | `directory`           | `true`       | —              | —               | Pure read                                       |
 | `search_files`        | `true`       | —              | —               | Pure read                                       |
+| `search_file`         | `true`       | —              | —               | Pure read (single-file)                         |
 | `write_file`          | `false`      | `false`        | `true`          | Overwrites existing files                       |
 | `edit_file`           | `false`      | `false`        | `true`          | Re-applying edits can fail or double-apply      |
 | `file_manager`        | `false`      | `false`        | `true`          | Mixed: mkdir is idempotent, delete/move are not |
@@ -431,6 +443,93 @@ Add the configuration to `.vscode/mcp.json` in your workspace.
 | `REFACTOR_MAX_CONTEXT` | Max context lines for refactor_batch (default: 30) |
 | `REFACTOR_VERSION_TTL_HOURS` | Version snapshot TTL in hours (default: 24) |
 | `TOON_PROJECT_DIR` | Path to the `toon` compression project (default: `/home/tanner/Projects/toon`) |
+| `ZENITH_MCP_ADAPTERS_ENABLED` | Comma-separated adapter names to enable (overrides config file) |
+| `ZENITH_MCP_ADAPTER_BACKUP_DIR` | Backup directory for adapter config file changes |
+
+## Adapter Configuration
+
+Zenith-MCP can auto-configure MCP client config files for 16 platforms.
+
+### Supported Adapters
+
+| Adapter | Config Format | Platform |
+|---------|---------------|----------|
+| Claude Desktop | JSON | macOS, Windows |
+| OpenCode | TOML | Linux, macOS |
+| VS Code Copilot | JSON | All |
+| Cline | JSON | All |
+| Codex CLI | JSON | All |
+| Codex Desktop | JSON5 | All |
+| Continue.dev | JSON | All |
+| Gemini CLI | JSON | All |
+| GitHub Copilot | JSON | All |
+| JetBrains | YAML | All |
+| OpenClaw | JSON | All |
+| Raycast | JSON | macOS |
+| Roo Code | JSON | All |
+| Warp | YAML | macOS, Linux |
+| Zed | JSON | All |
+| Antigravity | JSON | All |
+
+### Adapter CLI
+
+```bash
+# List all available adapters
+npx zenith-mcp-config --list
+
+# Enable adapters (comma-separated)
+npx zenith-mcp-config --enable claude_desktop,opencode
+
+# Check status
+npx zenith-mcp-config --status
+
+# Set backup directory (for config file backups before modification)
+npx zenith-mcp-config --backup-dir ~/.zenith-mcp/backups
+```
+
+Settings are persisted at `~/.zenith-mcp/adapter-config.json` and can be overridden via environment variables `ZENITH_MCP_ADAPTERS_ENABLED` and `ZENITH_MCP_ADAPTER_BACKUP_DIR`.
+
+## Server Configuration
+
+Zenith-MCP includes a config management system for managing external MCP server registrations.
+
+### Admin CLI
+
+```bash
+# List configured servers and their tools
+npx zenith-mcp-config-admin list
+
+# Show detailed status
+npx zenith-mcp-config-admin status
+
+# Register a new server
+npx zenith-mcp-config-admin install my-server npx -y my-mcp-server
+
+# Scan configured servers
+npx zenith-mcp-config-admin scan
+```
+
+Config is stored at `~/.zenith-mcp/zenith-mcp/servers.yaml`:
+
+```yaml
+servers:
+  my-server:
+    command: npx
+    args: ["-y", "my-mcp-server"]
+    transport: stdio
+    enabled: true
+    tools: {}
+    toolFilters:
+      allow: []
+      deny: []
+
+retrieval:
+  enabled: false
+  topK: 15
+  scorer: bmxf
+```
+
+The `retrieval` section controls the optional tool retrieval pipeline. When enabled, Zenith dynamically filters the tool set presented to clients based on workspace context and conversation history, using a 6-tier scoring fallback (BMXF blend → env-only → keyword → static categories → frequency prior → universal).
 
 ## Build
 
@@ -439,7 +538,7 @@ npm install
 npm run build
 ```
 
-The repository uses a hybrid layout: `dist/core/`, `dist/tools/`, `dist/cli/`, and `dist/server/` remain committed JavaScript source, while `src/` contains the TypeScript adapters and config code compiled by `npm run build` into `dist/adapters/` and `dist/config/`.
+The repository uses a hybrid layout: `dist/core/`, `dist/tools/`, `dist/cli/`, and `dist/server/` remain committed JavaScript source, while `src/` contains the TypeScript adapters, config, and retrieval code compiled by `npm run build` into `dist/adapters/`, `dist/config/`, and `dist/retrieval/`. These compiled directories are gitignored — only the hand-authored `dist/` subdirectories are version-controlled.
 
 ## License
 

@@ -212,6 +212,7 @@ Inline zero-dependency BM25 implementation (~120 lines):
 - Indexes only known text extensions (60+ extensions hardcoded)
 - Respects `.gitignore` via ripgrep when available; JS manual walk fallback
 - Caps at 5000 files, 512KB per file
+- `search_files` calls with topK=100; function default is 50
 
 **Post-filter mode:** `bm25RankResults(lines, query, charBudget)`
 - Ranks raw result lines by BM25 relevance
@@ -513,6 +514,22 @@ Returns `{ type: 'image'|'audio'|'blob', data: base64, mimeType }`.
   - Supports dot-qualified names (e.g., `AuthService.login`)
   - Uses tree-sitter definition parsing, not text search
 
+### `search_file`
+
+Single-file search — grep or symbol lookup within one file. Read-only.
+
+**Schema:** `path` (required), plus one of `grep` or `symbol`.
+
+- **Grep mode** — `grep` (regex, case-insensitive), `grepContext` (default 0, max 30), `maxChars`, `nearLine`
+  - Streaming `readline`-based scan with before/after context buffers
+  - Emits `---` separators between disjoint match groups
+  - Lines prefixed with `lineNum:*` for matches, `lineNum:` for context
+
+- **Symbol mode** — `symbol` (dot-qualified), `nearLine`, `expandLines` (default 0, max 50), `maxChars`
+  - Uses `findSymbol()` with `kindFilter: 'def'`
+  - Returns symbol body plus `expandLines` context on each side
+  - Always prefixes line numbers
+
 ### `file_manager`
 
 **Schema:** discriminated union on `mode`
@@ -588,7 +605,148 @@ Returns `{ type: 'image'|'audio'|'blob', data: base64, mimeType }`.
 
 ---
 
-## 7. MCP Roots Protocol
+## 7. Adapter System
+
+Zenith-MCP ships auto-configuration adapters for 16 MCP client platforms. These adapters read/write the client's native config file to register Zenith as an MCP server.
+
+**Base class:** `src/adapters/base.ts` — `MCPConfigAdapter`
+- Abstract methods: `configPath()`, `readConfig()`, `writeConfig()`, `registerServer()`, `discoverServers()`
+- Properties: `toolName`, `displayName`, `configFormat` (`json`|`toml`|`yaml`|`json5`), `supportedPlatforms`
+- Backup: `backup()` creates a `.bak` copy before any write
+
+**Platform adapters:** `src/adapters/platforms/`
+- `claude-desktop.ts`, `opencode.ts`, `cline.ts`, `codex-cli.ts`, `codex-desktop.ts`, `continue-dev.ts`, `gemini-cli.ts`, `github-copilot.ts`, `gptme.ts`, `jetbrains.ts`, `openclaw.ts`, `raycast.ts`, `roo-code.ts`, `warp.ts`, `zed.ts`, `antigravity.ts`
+- Each exports an `adapter` singleton
+
+**Registry:** `src/adapters/registry.ts` — `AdapterRegistry`
+- Singleton with `configureRegistry(backupDir?)`, `getAdapter(toolName)`, `listAdapters()`
+- Server initialization (`core/server.js`) loads settings and initializes registry when adapters are enabled
+
+**Config format helpers:** `src/adapters/helpers/` — `json5.ts`, `toml.ts`, `yaml.ts`
+
+**Settings:** `src/config/adapter-settings.ts`
+- Persisted at `~/.zenith-mcp/adapter-config.json`
+- Env overrides: `ZENITH_MCP_ADAPTERS_ENABLED`, `ZENITH_MCP_ADAPTER_BACKUP_DIR`
+
+**Adapter CLI:** `npx zenith-mcp-config`
+- `--list` — show all adapters
+- `--status` — show enabled adapters
+- `--enable <names>` — enable comma-separated adapters
+- `--disable <name>` — disable adapter
+- `--backup-dir <path>` — set backup directory
+- Interactive mode when no flags given
+
+---
+
+## 8. Config Management
+
+### Zenith-MCP Server Config (`src/config/zenith-mcp/`)
+
+YAML-based configuration for managing external MCP servers and tool retrieval settings.
+
+**Config file:** `~/.zenith-mcp/zenith-mcp/servers.yaml` (legacy path: `~/.zenith-mcp/multi-mcp/servers.yaml`)
+
+**Config structure:** `ZenithMcpConfig`
+```yaml
+servers:
+  my-server:
+    command: npx
+    args: ["-y", "my-server"]
+    env: {}
+    transport: stdio
+    enabled: true
+    tools: {}
+    toolFilters: { allow: [], deny: [] }
+profiles:
+  default:
+    servers: [my-server]
+retrieval:
+  enabled: false
+  topK: 15
+  scorer: bmxf
+```
+
+**Config loading:** `loadZenithMcpConfig()` reads YAML, normalizes via `normalizeServerConfig()` which handles both TS-era and Python-era field names (e.g., `type` → `transport`, `triggers` → `toolFilters.allow`, `idle_timeout_minutes` → `idleTimeoutSeconds`).
+
+**Tool cache:** `cache.ts`
+- `mergeDiscoveredTools()` — merges discovered tools, preserves existing `enabled` state, updates `lastSeenAt`
+- `cleanupStaleTools()` — removes disabled tools from previous discovery cycles
+- `getEnabledTools()` — returns set of enabled tool names
+
+**Admin CLI:** `npx zenith-mcp-config-admin`
+- `list [--server-filter <name>] [--disabled-only]` — list servers and tools with staleness indicators
+- `status` — multi-line status summary
+- `install <server-name> [command] [args...]` — register a server
+- `scan [server-name]` — read-only server discovery from config
+
+---
+
+## 9. Retrieval Pipeline
+
+Opt-in (disabled by default) system for dynamically filtering the tool set presented to LLM clients based on workspace context and conversation history. Reduces context waste when Zenith is used as a proxy managing many MCP servers.
+
+**Enabled via:** `retrieval.enabled: true` in `servers.yaml`
+
+### Architecture
+
+```
+src/retrieval/
+├── models.ts          — Core types: RetrievalConfig, ScoredTool, SessionRoutingState, RankingEvent
+├── pipeline.ts        — RetrievalPipeline: main orchestration, 6-tier fallback
+├── base.ts            — ToolRetriever / PassthroughRetriever interfaces
+├── session.ts         — SessionStateManager: promote/demote tool tracking
+├── catalog.ts         — Tool catalog snapshot builder
+├── keyword-matcher.ts — Trigger-based keyword matching (Tier 3)
+├── static-categories.ts — Predefined tool categories by project type (Tier 4)
+├── rollout.ts         — Canary/session group assignment
+├── routing-tool.ts    — Synthetic request_tool for demoted-tool access
+├── zenith-integration.ts — Pipeline factory, MCP handler interceptors
+├── zenith-tool-registry.ts — Local tool registry with Proxy-based live record
+├── assembler.ts       — TieredAssembler for description truncation
+├── ranking/
+│   ├── bmx-index.ts   — BMXF scoring index
+│   ├── fusion.ts      — Weighted RRF fusion + adaptive alpha
+│   ├── ranker.ts      — Scorer orchestration
+│   └── index.ts       — Re-exports
+├── telemetry/
+│   ├── scanner.ts     — Workspace fingerprinting
+│   ├── tokens.ts      — Token extraction from project files
+│   ├── evidence.ts    — Evidence aggregation
+│   └── monitor.ts     — Telemetry polling
+└── observability/
+    ├── logger.ts      — JSONL ranking event logger
+    ├── metrics.ts     — Rolling metrics (rescores, latency)
+    └── replay.ts      — Log replay for debugging
+```
+
+### 6-Tier Fallback Ladder
+
+The pipeline tries tiers in order; first successful result wins:
+
+1. **BMXF blend** — env-signal + conversation-signal BMXF scoring with weighted RRF fusion and adaptive alpha blending
+2. **BMXF env-only** — environment-signal-only scoring (workspace fingerprint)
+3. **Keyword env-only** — trigger-based keyword matching against tool descriptions
+4. **Static categories** — project type classification (rust_cli, python_web, node_web, infrastructure, generic) with pre-defined tool priority lists
+5. **Frequency prior** — exponential-decay weighted frequency from historical ranking events log
+6. **Universal fallback** — namespace-priority selection (12 tools max, one per server)
+
+### Session Lifecycle
+
+- `getToolsForList(sessionId, conversationContext)` — main entry point, called on every `tools/list` request
+- Tracks turn boundaries, tool call history, argument keys, router proxy counts
+- Promote/demote tools based on ranking scores and usage patterns
+- `onToolCalled(sessionId, toolName, args, isRouterProxy)` — records direct vs proxy usage
+
+### Routing Tool
+
+When tools are demoted (not in active set), a synthetic `request_tool` is injected:
+- `describe=true` → returns full tool schema
+- `describe=false` → proxies the call through to the underlying tool
+- Proxied calls are tracked separately for promotion decisions
+
+---
+
+## 10. MCP Roots Protocol
 
 The server implements the MCP Roots Protocol for dynamic directory negotiation.
 
@@ -606,7 +764,7 @@ The server implements the MCP Roots Protocol for dynamic directory negotiation.
 
 ---
 
-## 8. Response Discipline (Agent Policy)
+## 11. Response Discipline (Agent Policy)
 
 This is enforced by design across all tools:
 
@@ -621,7 +779,7 @@ When modifying tools, guard aggressively against context bloat. If unsure whethe
 
 ---
 
-## 9. Environment Variables Reference
+## 12. Environment Variables Reference
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -635,10 +793,12 @@ When modifying tools, guard aggressively against context bloat. If unsure whethe
 | `REFACTOR_MAX_CONTEXT` | 30 | Max context lines for refactor_batch |
 | `REFACTOR_VERSION_TTL_HOURS` | 24 | Version snapshot TTL in hours |
 | `TOON_PROJECT_DIR` | `/home/tanner/Projects/toon` | Path to `toon` compression project |
+| `ZENITH_MCP_ADAPTERS_ENABLED` | — | Comma-separated adapter names to enable |
+| `ZENITH_MCP_ADAPTER_BACKUP_DIR` | — | Backup directory for adapter config changes |
 
 ---
 
-## 10. Adding a New Tool
+## 13. Adding a New Tool
 
 1. Create `tools/my_new_tool.js`
 2. Export `register(server, ctx)`
@@ -650,7 +810,7 @@ When modifying tools, guard aggressively against context bloat. If unsure whethe
 
 ---
 
-## 11. Testing Considerations
+## 14. Testing Considerations
 
 - The project uses **Vitest** with `@vitest/coverage-v8`
 - `dist/core/` and `dist/tools/` are hand-authored source (dist-only layout). `dist/adapters/` and `dist/config/` are compiled from `src/` via `tsc`.
@@ -659,7 +819,7 @@ When modifying tools, guard aggressively against context bloat. If unsure whethe
 - The `toon` compression bridge requires Python with the `toon` module installed (optional for most tests)
 - SQLite databases are created in `.mcp/` directories and `~/.zenith-mcp/` — clean these between test runs if needed
 
-## 12. Hybrid Source Layout
+## 15. Hybrid Source Layout
 
 Zenith-MCP uses a hybrid source layout:
 
