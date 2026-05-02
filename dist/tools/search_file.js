@@ -4,30 +4,25 @@ import { createReadStream } from "fs";
 import { createInterface } from "readline";
 import { CHAR_BUDGET } from '../core/shared.js';
 import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
-
 export function register(server, ctx) {
     const handler = async (args) => {
         const validPath = await ctx.validatePath(args.path);
         const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
-
         if (args.grep) {
             const grepPattern = new RegExp(args.grep, 'i');
             const grepContext = Math.min(Math.max(0, args.grepContext ?? 0), 30);
             const beforeCount = grepContext;
             const afterCount = grepContext;
             const hasContext = beforeCount > 0 || afterCount > 0;
-
             const outputEntries = [];
             let totalLines = 0;
             let charCount = 0;
-
             const beforeBuffer = [];
             let afterRemaining = 0;
             let lastEmittedLine = 0;
-
             function emit(lineNum, line, isMatch) {
-                if (outputEntries.length > 0 && lineNum <= outputEntries[outputEntries.length - 1].num) return;
-
+                if (outputEntries.length > 0 && lineNum <= outputEntries[outputEntries.length - 1].num)
+                    return;
                 if (hasContext && lastEmittedLine > 0 && lineNum > lastEmittedLine + 1) {
                     const sep = '---';
                     if (charCount + sep.length + 1 <= maxChars) {
@@ -35,7 +30,6 @@ export function register(server, ctx) {
                         charCount += sep.length + 1;
                     }
                 }
-
                 const marker = isMatch ? '*' : '';
                 const formatted = `${lineNum}:${marker}${line}`;
                 if (charCount + formatted.length + 1 <= maxChars) {
@@ -44,15 +38,12 @@ export function register(server, ctx) {
                     lastEmittedLine = lineNum;
                 }
             }
-
             await new Promise((resolve, reject) => {
                 const stream = createReadStream(validPath, { encoding: 'utf-8' });
                 const rl = createInterface({ input: stream, crlfDelay: Infinity });
-
                 rl.on('line', (line) => {
                     totalLines++;
                     const isMatch = grepPattern.test(line);
-
                     if (isMatch) {
                         if (hasContext) {
                             for (const bufItem of beforeBuffer) {
@@ -60,75 +51,64 @@ export function register(server, ctx) {
                             }
                             beforeBuffer.length = 0;
                         }
-
                         emit(totalLines, line, true);
                         afterRemaining = afterCount;
-                    } else if (afterRemaining > 0) {
+                    }
+                    else if (afterRemaining > 0) {
                         emit(totalLines, line, false);
                         afterRemaining--;
-                    } else if (beforeCount > 0) {
+                    }
+                    else if (beforeCount > 0) {
                         beforeBuffer.push({ num: totalLines, text: line });
-                        if (beforeBuffer.length > beforeCount) beforeBuffer.shift();
+                        if (beforeBuffer.length > beforeCount)
+                            beforeBuffer.shift();
                     }
                 });
-
                 rl.on('close', resolve);
                 rl.on('error', reject);
                 stream.on('error', reject);
             });
-
             const content = outputEntries.length > 0
                 ? outputEntries.map(e => e.text).join('\n')
                 : 'No matches.';
-
             return {
                 content: [{ type: "text", text: content }],
             };
         }
-
         if (args.symbol) {
             const langName = getLangForFile(validPath);
             if (!langName) {
                 throw new Error('Unsupported file type.');
             }
-
             const source = await fs.readFile(validPath, 'utf-8');
             const allLines = source.split('\n');
             const totalLines = allLines.length;
-
             const matches = await findSymbol(source, langName, args.symbol, {
                 kindFilter: 'def',
                 nearLine: args.nearLine,
             });
-
             if (!matches || matches.length === 0) {
                 throw new Error('Symbol not found.');
             }
-
             if (matches.length > 1 && !args.nearLine) {
                 throw new Error('Multiple matches. Use nearLine.');
             }
-
             const sym = matches[0];
             const expand = Math.max(0, Math.min(args.expandLines ?? 0, 50));
             const startLine = Math.max(1, sym.line - expand);
             const endLine = Math.min(totalLines, sym.endLine + expand);
-
             const slice = allLines.slice(startLine - 1, endLine);
             const numbered = slice.map((line, i) => {
                 const ln = startLine + i;
                 return `${ln}:${line}`;
             });
-
             const text = numbered.join('\n');
             return {
                 content: [{ type: "text", text }],
             };
         }
-
         throw new Error('Provide grep or symbol.');
     };
-
     server.registerTool("search_file", {
         title: "Search File",
         description: "Search file by regex or symbol name.",
@@ -144,3 +124,5 @@ export function register(server, ctx) {
         annotations: { readOnlyHint: true }
     }, handler);
 }
+//# sourceMappingURL=search_file.js.map
+//# sourceMappingURL=search_file.js.map

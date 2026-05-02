@@ -6,7 +6,6 @@ import { normalizeLineEndings, createMinimalDiff } from '../core/lib.js';
 import { stashEdits } from '../core/stash.js';
 import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
 import { findRepoRoot, getDb, snapshotSymbol, getSessionId } from '../core/symbol-index.js';
-
 export function register(server, ctx) {
     server.registerTool("edit_file", {
         title: "Edit File",
@@ -29,36 +28,35 @@ export function register(server, ctx) {
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
         const validPath = await ctx.validatePath(args.path);
-        if (!args.edits?.length) throw new Error('No edits provided.');
-
+        if (!args.edits?.length)
+            throw new Error('No edits provided.');
         const originalContent = normalizeLineEndings(await fs.readFile(validPath, 'utf-8'));
         const isBatch = args.edits.length > 1;
-
         const { workingContent, errors, pendingSnapshots } = await applyEditList(originalContent, args.edits, {
             filePath: validPath,
             isBatch,
         });
-
         if (errors.length > 0) {
             const failedIndices = errors.map(e => e.i);
             const stashId = stashEdits(ctx, validPath, args.edits, failedIndices);
             const failMsg = errors.map(e => e.msg).join('\n');
             throw new Error(`${errors.length} failed. stash:${stashId}\n${failMsg}`);
         }
-
         if (args.dryRun) {
             return { content: [{ type: 'text', text: createMinimalDiff(originalContent, workingContent, validPath) }] };
         }
-
         const tempPath = `${validPath}.${randomBytes(16).toString('hex')}.tmp`;
         try {
             await fs.writeFile(tempPath, workingContent, 'utf-8');
             await fs.rename(tempPath, validPath);
-        } catch (error) {
-            try { await fs.unlink(tempPath); } catch {}
+        }
+        catch (error) {
+            try {
+                await fs.unlink(tempPath);
+            }
+            catch { }
             throw error;
         }
-
         if (pendingSnapshots.length > 0) {
             try {
                 const repoRoot = findRepoRoot(validPath) || path.dirname(validPath);
@@ -68,10 +66,11 @@ export function register(server, ctx) {
                 for (const snap of pendingSnapshots) {
                     snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
                 }
-            } catch { /* versioning is best-effort; never fail an edit because of it */ }
+            }
+            catch { /* versioning is best-effort; never fail an edit because of it */ }
         }
-
         const warning = await syntaxWarn(validPath, workingContent);
         return { content: [{ type: 'text', text: `Applied.${warning}` }] };
     });
 }
+//# sourceMappingURL=edit_file.js.map

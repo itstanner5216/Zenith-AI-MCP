@@ -1,5 +1,5 @@
-import fs from "fs/promises";
-import path from "path";
+import fs from 'fs/promises';
+import path from 'path';
 import { randomBytes } from 'crypto';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
@@ -7,48 +7,31 @@ import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
 import { isPathWithinAllowedDirectories } from './path-validation.js';
-
-// ---------------------------------------------------------------------------
-// Global allowed directories — retained for backward compatibility with
-// stdio mode and any code that still imports the bare functions.
-// HTTP sessions MUST use createFilesystemContext() instead.
-// ---------------------------------------------------------------------------
 let allowedDirectories = [];
-
 export function setAllowedDirectories(directories) {
     allowedDirectories = [...directories];
 }
-
 export function getAllowedDirectories() {
     return [...allowedDirectories];
 }
-
-// ---------------------------------------------------------------------------
-// Per-instance filesystem context factory
-// ---------------------------------------------------------------------------
 export function createFilesystemContext(initialAllowedDirectories = []) {
     let _allowedDirectories = [...initialAllowedDirectories];
-
     function getAllowedDirectories() {
         return [..._allowedDirectories];
     }
-
     function setAllowedDirectories(directories) {
         _allowedDirectories = [...directories];
     }
-
     async function validatePath(requestedPath) {
         const expandedPath = expandHome(requestedPath);
         const absolute = path.isAbsolute(expandedPath)
             ? path.resolve(expandedPath)
             : path.resolve(process.cwd(), expandedPath);
         const normalizedRequested = normalizePath(absolute);
-
         const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, _allowedDirectories);
         if (!isAllowed) {
             throw new Error(`Access denied - path outside allowed directories: ${absolute} not in ${_allowedDirectories.join(', ')}`);
         }
-
         try {
             const realPath = await fs.realpath(absolute);
             const normalizedReal = normalizePath(realPath);
@@ -56,7 +39,8 @@ export function createFilesystemContext(initialAllowedDirectories = []) {
                 throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${_allowedDirectories.join(', ')}`);
             }
             return realPath;
-        } catch (error) {
+        }
+        catch (error) {
             if (error.code === 'ENOENT') {
                 const parentDir = path.dirname(absolute);
                 try {
@@ -66,20 +50,16 @@ export function createFilesystemContext(initialAllowedDirectories = []) {
                         throw new Error(`Access denied - parent directory outside allowed directories: ${realParentPath} not in ${_allowedDirectories.join(', ')}`);
                     }
                     return absolute;
-                } catch {
+                }
+                catch {
                     throw new Error(`Parent directory does not exist: ${parentDir}`);
                 }
             }
             throw error;
         }
     }
-
     return { getAllowedDirectories, setAllowedDirectories, validatePath };
 }
-
-// ---------------------------------------------------------------------------
-// Pure Utility Functions (unchanged)
-// ---------------------------------------------------------------------------
 export function formatSize(bytes) {
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
     if (bytes === 0)
@@ -90,39 +70,29 @@ export function formatSize(bytes) {
     const unitIndex = Math.min(i, units.length - 1);
     return `${(bytes / Math.pow(1024, unitIndex)).toFixed(2)} ${units[unitIndex]}`;
 }
-
 export function normalizeLineEndings(text) {
     return text.replace(/\r\n/g, '\n');
 }
-
 export function createUnifiedDiff(originalContent, newContent, filepath = 'file') {
     const normalizedOriginal = normalizeLineEndings(originalContent);
     const normalizedNew = normalizeLineEndings(newContent);
     return createTwoFilesPatch(filepath, filepath, normalizedOriginal, normalizedNew, 'original', 'modified');
 }
-
 export function createMinimalDiff(originalContent, newContent, filepath = 'file') {
     const normalizedOriginal = normalizeLineEndings(originalContent);
     const normalizedNew = normalizeLineEndings(newContent);
     return createTwoFilesPatch(filepath, filepath, normalizedOriginal, normalizedNew, '', '', { context: 0 });
 }
-
-// ---------------------------------------------------------------------------
-// Global validatePath — delegates to global allowedDirectories.
-// Kept for backward compatibility; new code should use ctx.validatePath().
-// ---------------------------------------------------------------------------
 export async function validatePath(requestedPath) {
     const expandedPath = expandHome(requestedPath);
     const absolute = path.isAbsolute(expandedPath)
         ? path.resolve(expandedPath)
         : path.resolve(process.cwd(), expandedPath);
     const normalizedRequested = normalizePath(absolute);
-
     const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, allowedDirectories);
     if (!isAllowed) {
         throw new Error(`Access denied - path outside allowed directories: ${absolute} not in ${allowedDirectories.join(', ')}`);
     }
-
     try {
         const realPath = await fs.realpath(absolute);
         const normalizedReal = normalizePath(realPath);
@@ -130,7 +100,8 @@ export async function validatePath(requestedPath) {
             throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(', ')}`);
         }
         return realPath;
-    } catch (error) {
+    }
+    catch (error) {
         if (error.code === 'ENOENT') {
             const parentDir = path.dirname(absolute);
             try {
@@ -140,17 +111,14 @@ export async function validatePath(requestedPath) {
                     throw new Error(`Access denied - parent directory outside allowed directories: ${realParentPath} not in ${allowedDirectories.join(', ')}`);
                 }
                 return absolute;
-            } catch {
+            }
+            catch {
                 throw new Error(`Parent directory does not exist: ${parentDir}`);
             }
         }
         throw error;
     }
 }
-
-// ---------------------------------------------------------------------------
-// File Operations (unchanged)
-// ---------------------------------------------------------------------------
 export async function getFileStats(filePath) {
     const stats = await fs.stat(filePath);
     return {
@@ -163,30 +131,33 @@ export async function getFileStats(filePath) {
         permissions: stats.mode.toString(8).slice(-3),
     };
 }
-
 export async function readFileContent(filePath, encoding = 'utf-8') {
     return await fs.readFile(filePath, encoding);
 }
-
 export async function writeFileContent(filePath, content) {
     try {
         await fs.writeFile(filePath, content, { encoding: "utf-8", flag: 'wx' });
-    } catch (error) {
+    }
+    catch (error) {
         if (error.code === 'EEXIST') {
             const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
             try {
                 await fs.writeFile(tempPath, content, 'utf-8');
                 await fs.rename(tempPath, filePath);
-            } catch (renameError) {
-                try { await fs.unlink(tempPath); } catch { }
+            }
+            catch (renameError) {
+                try {
+                    await fs.unlink(tempPath);
+                }
+                catch { }
                 throw renameError;
             }
-        } else {
+        }
+        else {
             throw error;
         }
     }
 }
-
 export async function applyFileEdits(filePath, edits, dryRun = false) {
     const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
     let modifiedContent = content;
@@ -209,7 +180,8 @@ export async function applyFileEdits(filePath, edits, dryRun = false) {
             if (isMatch) {
                 const originalIndent = contentLines[i].match(/^\s*/)?.[0] || '';
                 const newLines = normalizedNew.split('\n').map((line, j) => {
-                    if (j === 0) return originalIndent + line.trimStart();
+                    if (j === 0)
+                        return originalIndent + line.trimStart();
                     const oldIndent = oldLines[j]?.match(/^\s*/)?.[0] || '';
                     const newIndent = line.match(/^\s*/)?.[0] || '';
                     if (oldIndent && newIndent) {
@@ -230,21 +202,26 @@ export async function applyFileEdits(filePath, edits, dryRun = false) {
     }
     const diff = createUnifiedDiff(content, modifiedContent, filePath);
     let numBackticks = 3;
-    while (diff.includes('`'.repeat(numBackticks))) { numBackticks++; }
+    while (diff.includes('`'.repeat(numBackticks))) {
+        numBackticks++;
+    }
     const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
     if (!dryRun) {
         const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
         try {
             await fs.writeFile(tempPath, modifiedContent, 'utf-8');
             await fs.rename(tempPath, filePath);
-        } catch (error) {
-            try { await fs.unlink(tempPath); } catch { }
+        }
+        catch (error) {
+            try {
+                await fs.unlink(tempPath);
+            }
+            catch { }
             throw error;
         }
     }
     return formattedDiff;
 }
-
 export function countOccurrences(text, search) {
     let count = 0;
     let pos = 0;
@@ -252,18 +229,19 @@ export function countOccurrences(text, search) {
     const normSearch = normalizeLineEndings(search);
     while (true) {
         const idx = normText.indexOf(normSearch, pos);
-        if (idx === -1) break;
+        if (idx === -1)
+            break;
         count++;
         pos = idx + normSearch.length;
     }
     return count;
 }
-
 export async function tailFile(filePath, numLines) {
     const CHUNK_SIZE = 1024;
     const stats = await fs.stat(filePath);
     const fileSize = stats.size;
-    if (fileSize === 0) return '';
+    if (fileSize === 0)
+        return '';
     const fileHandle = await fs.open(filePath, 'r');
     try {
         const lines = [];
@@ -275,7 +253,8 @@ export async function tailFile(filePath, numLines) {
             const size = Math.min(CHUNK_SIZE, position);
             position -= size;
             const { bytesRead } = await fileHandle.read(chunk, 0, size, position);
-            if (!bytesRead) break;
+            if (!bytesRead)
+                break;
             const readData = chunk.slice(0, bytesRead).toString('utf-8');
             const chunkText = readData + remainingText;
             const chunkLines = normalizeLineEndings(chunkText).split('\n');
@@ -289,11 +268,11 @@ export async function tailFile(filePath, numLines) {
             }
         }
         return lines.join('\n');
-    } finally {
+    }
+    finally {
         await fileHandle.close();
     }
 }
-
 export async function headFile(filePath, numLines) {
     const fileHandle = await fs.open(filePath, 'r');
     try {
@@ -303,7 +282,8 @@ export async function headFile(filePath, numLines) {
         const chunk = Buffer.alloc(1024);
         while (lines.length < numLines) {
             const result = await fileHandle.read(chunk, 0, chunk.length, bytesRead);
-            if (result.bytesRead === 0) break;
+            if (result.bytesRead === 0)
+                break;
             bytesRead += result.bytesRead;
             buffer += chunk.slice(0, result.bytesRead).toString('utf-8');
             const newLineIndex = buffer.lastIndexOf('\n');
@@ -312,7 +292,8 @@ export async function headFile(filePath, numLines) {
                 buffer = buffer.slice(newLineIndex + 1);
                 for (const line of completeLines) {
                     lines.push(line);
-                    if (lines.length >= numLines) break;
+                    if (lines.length >= numLines)
+                        break;
                 }
             }
         }
@@ -320,11 +301,11 @@ export async function headFile(filePath, numLines) {
             lines.push(buffer);
         }
         return lines.join('\n');
-    } finally {
+    }
+    finally {
         await fileHandle.close();
     }
 }
-
 export async function offsetReadFile(filePath, offset, length) {
     return new Promise((resolveP, rejectP) => {
         const stream = createReadStream(filePath, { encoding: 'utf-8' });
@@ -332,7 +313,6 @@ export async function offsetReadFile(filePath, offset, length) {
         let lineNum = 0;
         const collected = [];
         let totalLines = 0;
-
         rl.on('line', (line) => {
             totalLines++;
             if (lineNum >= offset && collected.length < length) {
@@ -344,16 +324,13 @@ export async function offsetReadFile(filePath, offset, length) {
                 stream.destroy();
             }
         });
-
         rl.on('close', () => {
             resolveP({ content: collected.join('\n'), totalLines, linesReturned: collected.length });
         });
-
         rl.on('error', rejectP);
         stream.on('error', rejectP);
     });
 }
-
 export async function searchFilesWithValidation(rootPath, pattern, allowedDirectories, options = {}) {
     const { excludePatterns = [] } = options;
     const results = [];
@@ -365,14 +342,16 @@ export async function searchFilesWithValidation(rootPath, pattern, allowedDirect
                 await validatePath(fullPath);
                 const relativePath = path.relative(rootPath, fullPath);
                 const shouldExclude = excludePatterns.some(excludePattern => minimatch(relativePath, excludePattern, { dot: true }));
-                if (shouldExclude) continue;
+                if (shouldExclude)
+                    continue;
                 if (minimatch(relativePath, pattern, { dot: true })) {
                     results.push(fullPath);
                 }
                 if (entry.isDirectory()) {
                     await search(fullPath);
                 }
-            } catch {
+            }
+            catch {
                 continue;
             }
         }
@@ -380,3 +359,4 @@ export async function searchFilesWithValidation(rootPath, pattern, allowedDirect
     await search(rootPath);
     return results;
 }
+//# sourceMappingURL=lib.js.map
