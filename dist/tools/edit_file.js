@@ -364,15 +364,15 @@ export function register(server) {
                 continue;
             }
 
-            // Apply cumulative line delta to nearLine if provided
-            const adjustedNearLine = typeof edit.nearLine === 'number'
-                ? edit.nearLine + lineDelta
-                : undefined;
-
             if (resolvedNewText === undefined) {
                 errors.push(`${tag}newText required.`);
                 continue;
             }
+
+            // Apply cumulative line delta to nearLine if provided
+            const adjustedNearLine = typeof edit.nearLine === 'number'
+                ? edit.nearLine + lineDelta
+                : undefined;
 
             const match = findMatch(workingContent, edit.oldText, adjustedNearLine);
 
