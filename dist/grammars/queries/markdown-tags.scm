@@ -1,11 +1,29 @@
-; Markdown — heading definitions (structural symbols)
-; Grammar: ikatyang/tree-sitter-markdown
-;
-; Headings are the primary navigational structure in markdown.
-; We capture the heading content text as the "name" and the full
-; atx_heading node as the "definition" to get the line range.
-;
-; The heading level can be derived from atx_heading_marker text length.
+; Tree-sitter Markdown definitions
+; Captures heading sections as definition anchors.
 
+; --- ATX headings (# Heading) ---
 (atx_heading
-  (heading_content) @name.definition.section) @definition.section
+  (inline) @name.definition.section) @definition.section
+
+; --- Setext headings (underline style) ---
+(setext_heading
+  (paragraph
+    (inline) @name.definition.section)) @definition.section
+
+; Tree-sitter Markdown references
+; Captures links and image references.
+
+; --- Inline links ---
+(inline_link
+  (link_destination) @name.reference.link) @reference.link
+
+; --- Reference links ---
+(full_reference_link
+  (link_label) @name.reference.link) @reference.link
+
+(collapsed_reference_link
+  (link_label) @name.reference.link) @reference.link
+
+; --- Images ---
+(image
+  (link_destination) @name.reference.link) @reference.link

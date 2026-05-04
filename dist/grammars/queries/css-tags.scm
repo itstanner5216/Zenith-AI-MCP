@@ -1,19 +1,50 @@
-; CSS — selectors and @-rules (structural symbols)
-; Grammar: tree-sitter/tree-sitter-css
-;
-; CSS "symbols" are:
-;   - Rule selectors (class, id, tag, etc.)
-;   - @keyframes names
-;   - @media rules
-;   - Custom property (variable) declarations
+; Tree-sitter CSS definitions
+; Captures rule sets (by selector), keyframe animations, and media queries.
 
-; Selectors in rule sets — capture the full selectors text
+; --- Class selectors (.foo) ---
 (rule_set
-  (selectors) @name.definition.selector) @definition.selector
+  (selectors
+    (class_selector
+      (class_name) @name.definition.class))) @definition.class
 
-; @keyframes — capture the keyframe name
+; --- ID selectors (#foo) ---
+(rule_set
+  (selectors
+    (id_selector
+      (id_name) @name.definition.id))) @definition.id
+
+; --- Tag/element selectors (div, span, etc.) ---
+(rule_set
+  (selectors
+    (tag_name) @name.definition.tag)) @definition.tag
+
+; --- Keyframe animations ---
 (keyframes_statement
-  name: (keyframes_name) @name.definition.keyframes) @definition.keyframes
+  (keyframes_name) @name.definition.keyframes) @definition.keyframes
 
-; @media — capture the whole media rule for navigation
-(media_statement) @name.definition.media @definition.media
+; --- Media queries ---
+(media_statement) @definition.media
+
+; Tree-sitter CSS references
+; Captures @import, property names, and references to classes/IDs.
+
+; --- @import statements ---
+(import_statement
+  (string_value) @name.reference.import) @reference.import
+
+; --- Property names ---
+(declaration
+  (property_name) @name.reference.property) @reference.property
+
+; --- Tag names in selectors ---
+(tag_name) @name.reference.tag
+
+; --- Class names in selectors ---
+(class_name) @name.reference.class
+
+; --- ID names in selectors ---
+(id_name) @name.reference.id
+
+; --- Function calls (e.g., url(), rgb(), var()) ---
+(call_expression
+  (function_name) @name.reference.call) @reference.call
