@@ -534,7 +534,7 @@ export async function findSymbol(source, langName, symbolName, options = {}) {
     }
 
     // Sort by proximity to nearLine if specified
-    if (matches.length > 1 && options.nearLine) {
+    if (matches.length > 1 && typeof options.nearLine === 'number') {
         matches.sort((a, b) =>
             Math.abs(a.line - options.nearLine) - Math.abs(b.line - options.nearLine)
         );

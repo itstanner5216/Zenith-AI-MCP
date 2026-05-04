@@ -60,8 +60,8 @@ function findMatch(content, oldText, nearLine) {
     const contentLines = content.split('\n');
     const strippedOld = oldLines.map(l => l.trim());
 
-    const searchStart = nearLine ? Math.max(0, nearLine - 50) : 0;
-    const searchEnd = nearLine ? Math.min(contentLines.length, nearLine + 50) : contentLines.length;
+    const searchStart = typeof nearLine === 'number' ? Math.max(0, nearLine - 50) : 0;
+    const searchEnd = typeof nearLine === 'number' ? Math.min(contentLines.length, nearLine + 50) : contentLines.length;
 
     for (let i = searchStart; i <= searchEnd - strippedOld.length; i++) {
         let isMatch = true;
@@ -84,7 +84,7 @@ function findMatch(content, oldText, nearLine) {
 }
 
 function findOccurrence(haystack, needle, nearLine) {
-    if (!nearLine) {
+    if (typeof nearLine !== 'number') {
         return haystack.indexOf(needle);
     }
 
@@ -322,7 +322,9 @@ export function register(server) {
                 }
 
                 // Apply cumulative line delta to nearLine if provided
-                const adjustedNearLine = edit.nearLine ? edit.nearLine + lineDelta : undefined;
+                const adjustedNearLine = typeof edit.nearLine === 'number'
+                    ? edit.nearLine + lineDelta
+                    : undefined;
 
                 const symbolMatches = await findSymbol(workingContent, langName, edit.symbol, {
                     kindFilter: 'def',
@@ -334,7 +336,7 @@ export function register(server) {
                     continue;
                 }
 
-                if (symbolMatches.length > 1 && !edit.nearLine) {
+                if (symbolMatches.length > 1 && typeof edit.nearLine !== 'number') {
                     errors.push(`${tag}Multiple matches. Use nearLine.`);
                     continue;
                 }
@@ -362,8 +364,15 @@ export function register(server) {
                 continue;
             }
 
+            if (resolvedNewText === undefined) {
+                errors.push(`${tag}newText required.`);
+                continue;
+            }
+
             // Apply cumulative line delta to nearLine if provided
-            const adjustedNearLine = edit.nearLine ? edit.nearLine + lineDelta : undefined;
+            const adjustedNearLine = typeof edit.nearLine === 'number'
+                ? edit.nearLine + lineDelta
+                : undefined;
 
             const match = findMatch(workingContent, edit.oldText, adjustedNearLine);
 
