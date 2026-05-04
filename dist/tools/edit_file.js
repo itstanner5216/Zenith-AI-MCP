@@ -60,8 +60,8 @@ function findMatch(content, oldText, nearLine) {
     const contentLines = content.split('\n');
     const strippedOld = oldLines.map(l => l.trim());
 
-    const searchStart = nearLine ? Math.max(0, nearLine - 50) : 0;
-    const searchEnd = nearLine ? Math.min(contentLines.length, nearLine + 50) : contentLines.length;
+    const searchStart = typeof nearLine === 'number' ? Math.max(0, nearLine - 50) : 0;
+    const searchEnd = typeof nearLine === 'number' ? Math.min(contentLines.length, nearLine + 50) : contentLines.length;
 
     for (let i = searchStart; i <= searchEnd - strippedOld.length; i++) {
         let isMatch = true;
@@ -84,7 +84,7 @@ function findMatch(content, oldText, nearLine) {
 }
 
 function findOccurrence(haystack, needle, nearLine) {
-    if (!nearLine) {
+    if (typeof nearLine !== 'number') {
         return haystack.indexOf(needle);
     }
 
@@ -369,15 +369,15 @@ export function register(server) {
                 ? edit.nearLine + lineDelta
                 : undefined;
 
+            if (resolvedNewText === undefined) {
+                errors.push(`${tag}newText required.`);
+                continue;
+            }
+
             const match = findMatch(workingContent, edit.oldText, adjustedNearLine);
 
             if (!match) {
                 errors.push(generateDiagnostic(workingContent, edit.oldText, i, isBatch));
-                continue;
-            }
-
-            if (resolvedNewText === undefined) {
-                errors.push(`${tag}newText required.`);
                 continue;
             }
 
