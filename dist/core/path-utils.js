@@ -33,7 +33,7 @@ export function convertToWindowsPath(p) {
  */
 export function normalizePath(p) {
     // Remove any surrounding quotes and whitespace
-    p = p.trim().replace(/^["']|["']$/g, '');
+    p = p.trim().replace(/^['"]|['"]$/g, '');
     // Check if this is a Unix path that should not be converted
     // WSL paths (/mnt/) should ALWAYS be preserved as they work correctly in WSL with Node.js fs
     // Regular Unix paths should also be preserved
@@ -52,10 +52,9 @@ export function normalizePath(p) {
     // Convert Unix-style Windows paths (/c/, /d/) to Windows format if on Windows
     // This function will now leave /mnt/ paths unchanged
     p = convertToWindowsPath(p);
-    // Handle double backslashes, preserving leading UNC \\
+    // Handle double backslashes, preserving leading UNC \\ 
     if (p.startsWith('\\\\')) {
-        // For UNC paths, first normalize any excessive leading backslashes to exactly \\
-        // Then normalize double backslashes in the rest of the path
+        // For UNC paths, first normalize any excessive leading backslashes to exactly \\\n        // Then normalize double backslashes in the rest of the path
         let uncPath = p;
         // Replace multiple leading backslashes with exactly two
         uncPath = uncPath.replace(/^\\{2,}/, '\\\\');
@@ -101,3 +100,4 @@ export function expandHome(filepath) {
     }
     return filepath;
 }
+//# sourceMappingURL=path-utils.js.map

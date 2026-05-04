@@ -1,7 +1,6 @@
 import { z } from "zod";
 import path from "path";
 import { readFileAsBase64Stream } from '../core/shared.js';
-
 const MIME_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -15,7 +14,6 @@ const MIME_TYPES = {
     ".ogg": "audio/ogg",
     ".flac": "audio/flac",
 };
-
 export function register(server, ctx) {
     server.registerTool("read_media_file", {
         title: "Read Media File",
@@ -29,10 +27,12 @@ export function register(server, ctx) {
         const data = await readFileAsBase64Stream(validPath);
         const type = mimeType.startsWith("image/") ? "image"
             : mimeType.startsWith("audio/") ? "audio"
-            : "blob";
+                : "blob";
         const contentItem = { type, data, mimeType };
         return {
             content: [contentItem],
         };
     });
 }
+//# sourceMappingURL=read_media_file.js.map
+//# sourceMappingURL=read_media_file.js.map

@@ -1,57 +1,112 @@
+; --- Functions ---
+
+(function_declaration
+  name: (identifier) @name.definition.function
+) @definition.function
+
+(function_expression
+  name: (identifier) @name.definition.function
+) @definition.function
+
+(generator_function_declaration
+  name: (identifier) @name.definition.function
+) @definition.function
+
+(generator_function
+  name: (identifier) @name.definition.function
+) @definition.function
+
+; --- Arrow functions via variable declarator ---
+
+(variable_declarator
+  name: (identifier) @name.definition.function
+  value: (arrow_function)
+) @definition.function
+
+(variable_declarator
+  name: (identifier) @name.definition.function
+  value: (function_expression)
+) @definition.function
+
+; --- Classes ---
+
+(class_declaration
+  name: (identifier) @name.definition.class
+) @definition.class
+
+(class
+  name: (identifier) @name.definition.class
+) @definition.class
+
+; --- Methods ---
+
 (method_definition
-  name: (property_identifier) @name.definition.method) @definition.method
+  name: (property_identifier) @name.definition.method
+) @definition.method
 
-[
-  (class
-    name: (_) @name.definition.class)
-  (class_declaration
-    name: (_) @name.definition.class)
-] @definition.class
-
-[
-  (function_expression
-    name: (identifier) @name.definition.function)
-  (function_declaration
-    name: (identifier) @name.definition.function)
-  (generator_function
-    name: (identifier) @name.definition.function)
-  (generator_function_declaration
-    name: (identifier) @name.definition.function)
-] @definition.function
+; --- Variables / Constants ---
 
 (lexical_declaration
   (variable_declarator
-    name: (identifier) @name.definition.function
-    value: [(arrow_function) (function_expression)])) @definition.function
+    name: (identifier) @name.definition.variable
+  )
+) @definition.variable
 
 (variable_declaration
   (variable_declarator
-    name: (identifier) @name.definition.function
-    value: [(arrow_function) (function_expression)])) @definition.function
+    name: (identifier) @name.definition.variable
+  )
+) @definition.variable
+
+; --- Assignments (module.exports style) ---
 
 (assignment_expression
-  left: [
-    (identifier) @name.definition.function
-    (member_expression
-      property: (property_identifier) @name.definition.function)
-  ]
-  right: [(arrow_function) (function_expression)]
-) @definition.function
+  left: (identifier) @name.definition.variable
+) @definition.variable
+
+; --- Object method shorthand ---
 
 (pair
-  key: (property_identifier) @name.definition.function
-  value: [(arrow_function) (function_expression)]) @definition.function
+  key: (property_identifier) @name.definition.method
+  value: [(function_expression) (arrow_function)]
+) @definition.method
 
-(
-  (call_expression
-    function: (identifier) @name.reference.call) @reference.call
-  (#not-match? @name.reference.call "^(require)$")
-)
+; --- Function/method calls ---
+
+(call_expression
+  function: (identifier) @name.reference.call
+) @reference.call
 
 (call_expression
   function: (member_expression
     property: (property_identifier) @name.reference.call)
-  arguments: (_) @reference.call)
+) @reference.call
+
+; --- Constructor calls ---
 
 (new_expression
-  constructor: (_) @name.reference.class) @reference.class
+  constructor: (identifier) @name.reference.class
+) @reference.class
+
+(new_expression
+  constructor: (member_expression
+    property: (property_identifier) @name.reference.class)
+) @reference.class
+
+; --- Imports ---
+
+(import_statement
+  source: (string) @name.reference.module
+) @reference.module
+
+; --- Member access ---
+
+(member_expression
+  property: (property_identifier) @name.reference.property
+) @reference.property
+
+; --- Exports ---
+
+(export_statement
+  declaration: (identifier) @name.reference.export
+) @reference.export

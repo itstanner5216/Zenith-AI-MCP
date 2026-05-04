@@ -2,11 +2,6 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { normalizePath } from './path-utils.js';
-/**
- * Converts a root URI to a normalized directory path with basic security validation.
- * @param rootUri - File URI (file://...) or plain directory path
- * @returns Promise resolving to validated path or null if invalid
- */
 async function parseRootUri(rootUri) {
     try {
         const rawPath = rootUri.startsWith('file://') ? rootUri.slice(7) : rootUri;
@@ -18,16 +13,9 @@ async function parseRootUri(rootUri) {
         return normalizePath(resolvedPath);
     }
     catch {
-        return null; // Path doesn't exist or other error
+        return null;
     }
 }
-/**
- * Formats error message for directory validation failures.
- * @param dir - Directory path that failed validation
- * @param error - Error that occurred during validation
- * @param reason - Specific reason for failure
- * @returns Formatted error message
- */
 function formatDirectoryError(dir, error, reason) {
     if (reason) {
         return `Skipping ${reason}: ${dir}`;
@@ -35,16 +23,6 @@ function formatDirectoryError(dir, error, reason) {
     const message = error instanceof Error ? error.message : String(error);
     return `Skipping invalid directory: ${dir} due to error: ${message}`;
 }
-/**
- * Resolves requested root directories from MCP root specifications.
- *
- * Converts root URI specifications (file:// URIs or plain paths) into normalized
- * directory paths, validating that each path exists and is a directory.
- * Includes symlink resolution for security.
- *
- * @param requestedRoots - Array of root specifications with URI and optional name
- * @returns Promise resolving to array of validated directory paths
- */
 export async function getValidRootDirectories(requestedRoots) {
     const validatedDirectories = [];
     for (const requestedRoot of requestedRoots) {
@@ -68,3 +46,4 @@ export async function getValidRootDirectories(requestedRoots) {
     }
     return validatedDirectories;
 }
+//# sourceMappingURL=roots-utils.js.map

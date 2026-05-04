@@ -4,18 +4,16 @@ import { createInterface } from "readline";
 import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
 import { CHAR_BUDGET } from '../core/shared.js';
 import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
-
 function countLines(str) {
-    if (!str) return 0;
+    if (!str)
+        return 0;
     const n = (str.match(/\n/g) || []).length;
     return str.endsWith('\n') ? n : n + 1;
 }
-
 export function register(server, ctx) {
     const handler = async (args) => {
         const validPath = await ctx.validatePath(args.path);
         const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
-
         if (args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0)) {
             const windows = [];
             if (args.aroundLine !== undefined) {
@@ -30,86 +28,76 @@ export function register(server, ctx) {
                     windows.push({ startLine: Math.max(1, r.startLine), endLine: r.endLine });
                 }
             }
-
             windows.sort((a, b) => a.startLine - b.startLine);
             const merged = [];
             for (const w of windows) {
                 if (merged.length === 0 || w.startLine > merged[merged.length - 1].endLine + 1) {
                     merged.push({ ...w });
-                } else {
+                }
+                else {
                     merged[merged.length - 1].endLine = Math.max(merged[merged.length - 1].endLine, w.endLine);
                 }
             }
-
             const outputLines = [];
             let totalLines = 0;
             let charCount = 0;
             let windowIdx = 0;
             let lastCollectedLine = -1;
             let budgetExhausted = false;
-
             await new Promise((resolve, reject) => {
                 const stream = createReadStream(validPath, { encoding: 'utf-8' });
                 const rl = createInterface({ input: stream, crlfDelay: Infinity });
-
                 rl.on('line', (line) => {
                     totalLines++;
-                    if (budgetExhausted) return;
-
+                    if (budgetExhausted)
+                        return;
                     while (windowIdx < merged.length && totalLines > merged[windowIdx].endLine) {
                         windowIdx++;
                     }
-                    if (windowIdx >= merged.length) return;
-
+                    if (windowIdx >= merged.length)
+                        return;
                     const currentWindow = merged[windowIdx];
-                    if (totalLines < currentWindow.startLine) return;
-
+                    if (totalLines < currentWindow.startLine)
+                        return;
                     if (lastCollectedLine !== -1 && totalLines > lastCollectedLine + 1) {
                         outputLines.push('---');
                         charCount += 4;
                     }
-
                     const formatted = `${totalLines}:${line}`;
                     if (charCount + formatted.length + 1 <= maxChars) {
                         outputLines.push(formatted);
                         charCount += formatted.length + 1;
                         lastCollectedLine = totalLines;
-                    } else {
+                    }
+                    else {
                         budgetExhausted = true;
                     }
                 });
-
                 rl.on('close', resolve);
                 rl.on('error', reject);
                 stream.on('error', reject);
             });
-
             const text = (budgetExhausted ? '[truncated]\n' : '') + outputLines.join('\n');
             return {
                 content: [{ type: "text", text }],
             };
         }
-
         let standardReadContent = null;
         let standardReadBudget = maxChars;
-
         if (args.compression) {
             standardReadContent = await readFileContent(validPath);
-
             const compressed = await compressTextFile(validPath, standardReadContent, maxChars);
             if (compressed !== null) {
                 return { content: [{ type: "text", text: compressed.text }] };
             }
-
             standardReadBudget = computeCompressionBudget(standardReadContent.length, maxChars);
         }
-
         let content;
         let meta = {};
-
         if (args.tail) {
             content = await tailFile(validPath, args.tail);
-        } else if (typeof args.offset === 'number' && args.offset >= 0) {
+        }
+        else if (typeof args.offset === 'number' && args.offset >= 0) {
             const length = args.head || 200;
             const result = await offsetReadFile(validPath, args.offset, length);
             content = result.content;
@@ -118,12 +106,13 @@ export function register(server, ctx) {
                 linesReturned: result.linesReturned,
                 hasMore: (args.offset + result.linesReturned) < result.totalLines,
             };
-        } else if (args.head) {
+        }
+        else if (args.head) {
             content = await headFile(validPath, args.head);
-        } else {
+        }
+        else {
             content = standardReadContent ?? await readFileContent(validPath);
         }
-
         let truncated = false;
         if (content && content.length > standardReadBudget) {
             if (!meta.totalLines) {
@@ -135,14 +124,13 @@ export function register(server, ctx) {
             const truncLines = countLines(content);
             meta.truncatedAt = truncLines;
         }
-
         if (args.showLineNumbers && content) {
             const startLine = (typeof args.offset === 'number' && args.offset >= 0) ? args.offset + 1 : 1;
             const lines = content.split('\n');
-            if (lines[lines.length - 1] === '') lines.pop();
+            if (lines[lines.length - 1] === '')
+                lines.pop();
             content = lines.map((line, i) => `${startLine + i}:${line}`).join('\n');
         }
-
         let metaHeader = '';
         if (truncated && !args.compression) {
             metaHeader = `[truncated offset=${meta.truncatedAt}]\n`;
@@ -150,13 +138,11 @@ export function register(server, ctx) {
         if (!truncated && meta.hasMore && !args.compression) {
             metaHeader = `[offset=${args.offset + meta.linesReturned}]\n`;
         }
-
         const text = metaHeader + content;
         return {
             content: [{ type: "text", text }],
         };
     };
-
     server.registerTool("read_file", {
         title: "Read File",
         description: "Read file content.",
@@ -175,3 +161,5 @@ export function register(server, ctx) {
         annotations: { readOnlyHint: true }
     }, handler);
 }
+//# sourceMappingURL=read_file.js.map
+//# sourceMappingURL=read_file.js.map

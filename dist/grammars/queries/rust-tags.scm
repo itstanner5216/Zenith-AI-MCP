@@ -1,53 +1,126 @@
-; ADT definitions
+; --- Functions ---
+
+(function_item
+  name: (identifier) @name.definition.function
+) @definition.function
+
+; --- Structs ---
+
 (struct_item
-    name: (type_identifier) @name.definition.class) @definition.class
+  name: (type_identifier) @name.definition.struct
+) @definition.struct
+
+; --- Enums ---
 
 (enum_item
-    name: (type_identifier) @name.definition.class) @definition.class
+  name: (type_identifier) @name.definition.enum
+) @definition.enum
+
+; --- Enum variants ---
+
+(enum_variant
+  name: (identifier) @name.definition.variant
+) @definition.variant
+
+; --- Traits ---
+
+(trait_item
+  name: (type_identifier) @name.definition.trait
+) @definition.trait
+
+; --- Impl blocks ---
+
+(impl_item
+  type: (type_identifier) @name.definition.impl
+) @definition.impl
+
+; --- Type aliases ---
+
+(type_item
+  name: (type_identifier) @name.definition.type
+) @definition.type
+
+; --- Modules ---
+
+(mod_item
+  name: (identifier) @name.definition.module
+) @definition.module
+
+; --- Constants ---
+
+(const_item
+  name: (identifier) @name.definition.constant
+) @definition.constant
+
+; --- Statics ---
+
+(static_item
+  name: (identifier) @name.definition.static
+) @definition.static
+
+; --- Unions ---
 
 (union_item
-    name: (type_identifier) @name.definition.class) @definition.class
+  name: (type_identifier) @name.definition.union
+) @definition.union
 
-; type aliases
-(type_item
-    name: (type_identifier) @name.definition.class) @definition.class
+; --- Macros ---
 
-; method definitions
-(declaration_list
-    (function_item
-        name: (identifier) @name.definition.method)) @definition.method
-
-; function definitions
-(function_item
-    name: (identifier) @name.definition.function) @definition.function
-
-; trait definitions
-(trait_item
-    name: (type_identifier) @name.definition.interface) @definition.interface
-
-; module definitions
-(mod_item
-    name: (identifier) @name.definition.module) @definition.module
-
-; macro definitions
 (macro_definition
-    name: (identifier) @name.definition.macro) @definition.macro
+  name: (identifier) @name.definition.macro
+) @definition.macro
 
-; references
-(call_expression
-    function: (identifier) @name.reference.call) @reference.call
+; --- Struct/union fields ---
+
+(field_declaration
+  name: (field_identifier) @name.definition.field
+) @definition.field
+
+; --- Function calls ---
 
 (call_expression
-    function: (field_expression
-        field: (field_identifier) @name.reference.call)) @reference.call
+  function: (identifier) @name.reference.call
+) @reference.call
+
+(call_expression
+  function: (field_expression
+    field: (field_identifier) @name.reference.call)
+) @reference.call
+
+(call_expression
+  function: (scoped_identifier
+    name: (identifier) @name.reference.call)
+) @reference.call
+
+; --- Macro invocations ---
 
 (macro_invocation
-    macro: (identifier) @name.reference.call) @reference.call
+  macro: (identifier) @name.reference.macro
+) @reference.macro
 
-; implementations
-(impl_item
-    trait: (type_identifier) @name.reference.implementation) @reference.implementation
+; --- Use declarations ---
 
-(impl_item
-    type: (type_identifier) @name.reference.implementation
-    !trait) @reference.implementation
+(use_declaration
+  argument: (scoped_identifier
+    name: (identifier) @name.reference.import)
+) @reference.import
+
+(use_declaration
+  argument: (identifier) @name.reference.import
+) @reference.import
+
+; --- Type references ---
+
+(type_identifier) @name.reference.type @reference.type
+
+; --- Field access ---
+
+(field_expression
+  field: (field_identifier) @name.reference.field
+) @reference.field
+
+; --- Scoped identifiers (path references) ---
+
+(scoped_identifier
+  path: (identifier) @name.reference.module
+) @reference.module

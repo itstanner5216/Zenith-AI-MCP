@@ -1,35 +1,38 @@
-; YAML — key definitions (structural symbols)
-; Grammar: ikatyang/tree-sitter-yaml (or tree-sitter-grammars/tree-sitter-yaml)
-;
-; YAML keys at all nesting levels are the meaningful structural elements.
-; block_mapping_pair has field `key` which is a flow_node or block_node.
-; The actual key text is inside plain_scalar > string_scalar (unquoted),
-; double_quote_scalar (double-quoted), or single_quote_scalar (single-quoted).
+; Tree-sitter YAML definitions (ikatyang grammar)
+; Captures mapping keys as property definitions.
+; Anchors are captured as reusable definitions.
 
-; Unquoted keys (most common): name: value
+; --- Block mapping pairs (key: value) ---
 (block_mapping_pair
   key: (flow_node
-    (plain_scalar) @name.definition.key)) @definition.key
+    (plain_scalar
+      (string_scalar) @name.definition.property)) @definition.property)
 
-; Double-quoted keys: "name": value
 (block_mapping_pair
   key: (flow_node
-    (double_quote_scalar) @name.definition.key)) @definition.key
+    (double_quote_scalar) @name.definition.property) @definition.property)
 
-; Single-quoted keys: 'name': value
 (block_mapping_pair
   key: (flow_node
-    (single_quote_scalar) @name.definition.key)) @definition.key
+    (single_quote_scalar) @name.definition.property) @definition.property)
 
-; Flow mapping keys (inline): {name: value}
+; --- Flow mapping pairs ---
 (flow_pair
   key: (flow_node
-    (plain_scalar) @name.definition.key)) @definition.key
+    (plain_scalar
+      (string_scalar) @name.definition.property)) @definition.property)
 
-(flow_pair
-  key: (flow_node
-    (double_quote_scalar) @name.definition.key)) @definition.key
+; --- Anchor definitions (&anchor_name) ---
+(anchor
+  (anchor_name) @name.definition.anchor) @definition.anchor
 
-(flow_pair
-  key: (flow_node
-    (single_quote_scalar) @name.definition.key)) @definition.key
+; Tree-sitter YAML references
+; Captures alias references (*anchor_name) and anchor definitions.
+
+; --- Alias references (*anchor_name) ---
+(alias
+  (alias_name) @name.reference.anchor) @reference.anchor
+
+; --- Anchor as definition target (also a reference point) ---
+(anchor
+  (anchor_name) @name.reference.anchor) @reference.anchor
