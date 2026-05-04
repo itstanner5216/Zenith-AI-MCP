@@ -336,7 +336,7 @@ export function register(server) {
                     continue;
                 }
 
-                if (symbolMatches.length > 1 && !edit.nearLine) {
+                if (symbolMatches.length > 1 && typeof edit.nearLine !== 'number') {
                     errors.push(`${tag}Multiple matches. Use nearLine.`);
                     continue;
                 }
