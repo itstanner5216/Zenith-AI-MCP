@@ -16,10 +16,12 @@
 
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { createFilesystemContext } from '../core/lib.js';
+import { createFilesystemContext, type FilesystemContext } from '../core/lib.js';
 import {
     createFilesystemServer,
     attachRootsHandlers,
@@ -34,7 +36,7 @@ import { ripgrepAvailable } from '../core/shared.js';
 const args = process.argv.slice(2);
 let port = 3100;
 let host = '0.0.0.0';
-const dirArgs = [];
+const dirArgs: string[] = [];
 const API_KEY = process.env.ZENITH_MCP_API_KEY || process.env.MCP_BRIDGE_API_KEY || process.env.COMMANDER_API_KEY;
 
 if (!API_KEY) {
@@ -64,10 +66,25 @@ if (baselineAllowedDirs.length > 0) {
 // Session storage — keyed by session ID, stores transport + cleanup handles.
 // Transports from different protocol types are never mixed.
 // ---------------------------------------------------------------------------
-const sessions = new Map();
+interface StreamableSession {
+    type: 'streamable';
+    transport: StreamableHTTPServerTransport;
+    server: McpServer;
+    ctx: FilesystemContext;
+    lastSeenAt: number;
+}
+interface SSESession {
+    type: 'sse';
+    transport: SSEServerTransport;
+    server: McpServer;
+    ctx: FilesystemContext;
+    lastSeenAt: number;
+}
+type SessionEntry = StreamableSession | SSESession;
+const sessions = new Map<string, SessionEntry>();
 // session id -> { type: 'streamable'|'sse', transport, server, ctx }
 
-function removeSession(sessionId) {
+function removeSession(sessionId: string): void {
     const entry = sessions.get(sessionId);
     if (entry) {
         sessions.delete(sessionId);
@@ -109,11 +126,11 @@ function createSessionPair() {
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
-function unauthorized(res) {
+function unauthorized(res: Response) {
     return res.status(401).json({ error: 'Unauthorized' });
 }
 
-app.use((req, res, next) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Bearer ')) {
         return unauthorized(res);
@@ -143,7 +160,7 @@ app.post('/mcp', async (req, res) => {
 
     // ── Existing session: forward the message ──
     if (sessionId) {
-        const entry = sessions.get(sessionId);
+        const entry = sessions.get(sessionId as string);
         if (!entry || entry.type !== 'streamable') {
             res.status(400).json({ error: 'Unknown or mismatched session' });
             return;
@@ -152,7 +169,7 @@ app.post('/mcp', async (req, res) => {
             entry.lastSeenAt = Date.now();
             await entry.transport.handleRequest(req, res, req.body);
         } catch (err) {
-            console.error(`[session:${sessionId.slice(0, 8)}] POST error:`, err);
+            console.error(`[session:${(sessionId as string).slice(0, 8)}] POST error:`, err);
             if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
         }
         return;
@@ -197,7 +214,7 @@ app.get('/mcp', async (req, res) => {
         res.status(400).json({ error: 'Missing Mcp-Session-Id header' });
         return;
     }
-    const entry = sessions.get(sessionId);
+    const entry = sessions.get(sessionId as string);
     if (!entry || entry.type !== 'streamable') {
         res.status(400).json({ error: 'Unknown or mismatched session' });
         return;
@@ -206,7 +223,7 @@ app.get('/mcp', async (req, res) => {
         entry.lastSeenAt = Date.now();
         await entry.transport.handleRequest(req, res);
     } catch (err) {
-        console.error(`[session:${sessionId.slice(0, 8)}] GET error:`, err);
+        console.error(`[session:${(sessionId as string).slice(0, 8)}] GET error:`, err);
         if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
     }
 });
@@ -218,7 +235,7 @@ app.delete('/mcp', async (req, res) => {
         res.status(400).json({ error: 'Missing Mcp-Session-Id header' });
         return;
     }
-    const entry = sessions.get(sessionId);
+    const entry = sessions.get(sessionId as string);
     if (!entry || entry.type !== 'streamable') {
         res.status(404).json({ error: 'Session not found' });
         return;
@@ -226,7 +243,7 @@ app.delete('/mcp', async (req, res) => {
     try {
         await entry.transport.close();
     } catch { /* already closed */ }
-    removeSession(sessionId);
+    removeSession(sessionId as string);
     res.status(200).json({ status: 'session closed' });
 });
 
@@ -257,8 +274,8 @@ app.get('/sse', async (req, res) => {
 
 // ── Legacy SSE: POST /messages ────────────────────────────────────────────────
 app.post('/messages', async (req, res) => {
-    const sessionId = req.query.sessionId;
-    if (!sessionId) {
+    const sessionId = req.query['sessionId'];
+    if (!sessionId || typeof sessionId !== 'string') {
         res.status(400).json({ error: 'Missing sessionId query parameter' });
         return;
     }

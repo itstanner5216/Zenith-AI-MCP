@@ -32,9 +32,4 @@
   property: (property_identifier) @name.reference.property
 ) @reference.property
 
-; --- Exports ---
-
-(export_statement
-  declaration: (identifier) @name.reference.export
-) @reference.export
 

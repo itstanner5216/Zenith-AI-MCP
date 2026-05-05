@@ -1,6 +1,6 @@
 export declare function findRepoRoot(filePath: any): string | null;
 export declare function getDb(repoRoot: any): any;
-export declare function getSessionId(clientSessionId: any): any;
+export declare function getSessionId(clientSessionId?: string): string;
 export declare function pruneOldSessions(db: any, currentSessionId: any): void;
 export declare function indexFile(db: any, repoRoot: any, absFilePath: any): Promise<void>;
 export declare function indexDirectory(db: any, repoRoot: any, dirPath: any, opts?: {}): Promise<void>;

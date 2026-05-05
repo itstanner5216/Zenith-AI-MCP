@@ -4,6 +4,7 @@ import path from "path";
 import { randomBytes } from 'crypto';
 import { normalizeLineEndings } from '../core/lib.js';
 import { stashWrite } from '../core/stash.js';
+import { errorMessage } from './types.js';
 function findResumeOffset(existingTailLines, incomingLines) {
     if (!existingTailLines.length || !incomingLines.length)
         return 0;
@@ -53,8 +54,9 @@ export function register(server, ctx) {
             await fs.mkdir(parentDir, { recursive: true });
         }
         catch (err) {
-            if (err.code !== 'EEXIST') {
-                throw new Error(`Cannot create parent directory: ${err.message}`);
+            const nodeError = err;
+            if (nodeError.code !== 'EEXIST') {
+                throw new Error(`Cannot create parent directory: ${errorMessage(err)}`);
             }
         }
         let finalContent = normalizedContent;
@@ -78,7 +80,7 @@ export function register(server, ctx) {
                 finalContent = existing + separator + appendContent;
             }
             catch (err) {
-                throw new Error(`Cannot read existing file for append: ${err.message}`);
+                throw new Error(`Cannot read existing file for append: ${errorMessage(err)}`);
             }
         }
         const tempPath = `${validPath}.${randomBytes(16).toString('hex')}.tmp`;

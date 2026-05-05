@@ -4,6 +4,8 @@ import fs from "fs/promises";
 import path from "path";
 import { normalizePath, expandHome } from './path-utils.js';
 import { getValidRootDirectories } from './roots-utils.js';
+import { type ToolServer, type ToolContext } from '../tools/types.js';
+import { type FilesystemContext } from './lib.js';
 
 import { register as registerReadFile } from '../tools/read_file.js';
 import { register as registerSearchFile } from '../tools/search_file.js';
@@ -22,8 +24,8 @@ import { onRootsChanged } from './project-context.js';
 import { createRetrievalPipelineForZenith, ZenithToolRegistry } from '../retrieval/index.js';
 import { defaultRetrievalConfig } from '../retrieval/models.js';
 
-export async function resolveInitialAllowedDirectories(args) {
-  return Promise.all(args.map(async (dir) => {
+export async function resolveInitialAllowedDirectories(args: string[]): Promise<string[]> {
+  return Promise.all(args.map(async (dir: string) => {
     const expanded = expandHome(dir);
     const absolute = path.resolve(expanded);
     try {
@@ -35,9 +37,9 @@ export async function resolveInitialAllowedDirectories(args) {
   }));
 }
 
-export async function validateDirectories(directories) {
-  const errors = [];
-  await Promise.all(directories.map(async (dir) => {
+export async function validateDirectories(directories: string[]): Promise<void> {
+  const errors: string[] = [];
+  await Promise.all(directories.map(async (dir: string) => {
     try {
       const stats = await fs.stat(dir);
       if (!stats.isDirectory()) {
@@ -53,7 +55,7 @@ export async function validateDirectories(directories) {
   }
 }
 
-function registerAllTools(server, ctx) {
+function registerAllTools(server: ToolServer, ctx: ToolContext): void {
   registerReadFile(server, ctx);
   registerSearchFile(server, ctx);
   registerReadMediaFile(server, ctx);
@@ -67,7 +69,7 @@ function registerAllTools(server, ctx) {
   registerRefactorBatch(server, ctx);
 }
 
-export function createFilesystemServer(ctx) {
+export function createFilesystemServer(ctx: FilesystemContext): McpServer {
   const server = new McpServer(
   { name: "zenith-mcp", version: "0.3.0" },
   {
@@ -88,16 +90,16 @@ export function createFilesystemServer(ctx) {
   ctx._retrievalPipeline = pipeline;
   ctx._toolRegistry = toolRegistry;
 
-  registerAllTools(server, ctx);
+  registerAllTools(server as ToolServer, ctx);
   return server;
 }
 
-export function attachRootsHandlers(server, ctx) {
-  async function updateAllowedDirectoriesFromRoots(requestedRoots) {
+export function attachRootsHandlers(server: McpServer, ctx: FilesystemContext): void {
+  async function updateAllowedDirectoriesFromRoots(requestedRoots: Array<{ uri: string; name?: string }>): Promise<void> {
     const validatedRootDirs = await getValidRootDirectories(requestedRoots);
     if (validatedRootDirs.length > 0) {
       ctx.setAllowedDirectories(validatedRootDirs);
-      onRootsChanged(ctx);
+      onRootsChanged({ getAllowedDirectories: ctx.getAllowedDirectories });
       console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories`);
     } else {
       console.error("No valid root directories provided by client");

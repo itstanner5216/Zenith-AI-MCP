@@ -65,10 +65,3 @@
   name: (member_expression
     property: (property_identifier) @name.reference.component)
 ) @reference.component
-
-; --- Exports ---
-
-(export_statement
-  declaration: (identifier) @name.reference.export
-) @reference.export
-

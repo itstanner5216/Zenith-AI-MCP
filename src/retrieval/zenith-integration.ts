@@ -6,7 +6,7 @@
  * HAZARD 2: Session IDs always passed in by caller.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Root, Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   CallToolRequestSchema,
@@ -90,6 +90,12 @@ function sessionIdFromExtra(extra: unknown): string {
 
 // ── Tool registration hook ───────────────────────────────────────────────────
 
+type RegisterToolArgs = [
+  name: string,
+  config: Parameters<McpServer["registerTool"]>[1],
+  cb: Parameters<McpServer["registerTool"]>[2],
+];
+
 export function createRetrievalAwareToolRegistrar(
   server: McpServer,
   registry: ZenithToolRegistry,
@@ -97,9 +103,12 @@ export function createRetrievalAwareToolRegistrar(
 ): { registerTool: McpServer["registerTool"] } {
   return {
     registerTool(
-      ...args: Parameters<McpServer["registerTool"]>
-    ): ReturnType<McpServer["registerTool"]> {
-      const [name, , handler] = args;
+      name: string,
+      config: Parameters<McpServer["registerTool"]>[1],
+      cb: Parameters<McpServer["registerTool"]>[2],
+    ): RegisteredTool {
+      const args: RegisterToolArgs = [name, config, cb];
+      const handler = cb;
 
       // Real MCP registration first
       const result = server.registerTool(...args);

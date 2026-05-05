@@ -84,7 +84,9 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                 const sessionId = ctx.sessionId || getSessionId();
                 const relPath = path.relative(repoRoot, validPath);
                 for (const snap of pendingSnapshots) {
-                    snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                    if (snap.symbol !== undefined) {
+                        snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                    }
                 }
             }
             catch { /* versioning is best-effort; never fail an edit because of it */ }

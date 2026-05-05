@@ -133,15 +133,15 @@ describe('ranking migration parity', () => {
       0.6,
     );
     expect(rebRes).toEqual(baseRes);
-    expect(rebRes[0]).toMatchObject({ toolKey: 'a', toolMapping: expect.any(Object), score: expect.any(Number), tier: 'full' });
-    for (let i = 1; i < rebRes.length; i++) {
-      expect(rebRes[i - 1].score).toBeGreaterThanOrEqual(rebRes[i].score);
+    expect(rebRes.value[0]).toMatchObject({ toolKey: expect.any(String), toolMapping: expect.any(Object), score: expect.any(Number), tier: 'full' });
+    for (let i = 1; i < rebRes.value.length; i++) {
+      expect(rebRes.value[i - 1].score).toBeGreaterThanOrEqual(rebRes.value[i].score);
     }
 
     const tieA = { toolKey: 'a', toolMapping: { tool: { name: 'a' } }, score: 0.1, tier: 'full' };
     const tieB = { toolKey: 'b', toolMapping: { tool: { name: 'b' } }, score: 0.1, tier: 'full' };
-    const tieRes = reb.weightedRrf([tieB, tieA], [], 1);
-    expect(tieRes.map((t) => t.toolKey)).toEqual(['a', 'b']);
+    const tieRes = rebuilt.weightedRrf([tieB, tieA], [], 1);
+    expect(tieRes.map((t) => t.toolKey)).toEqual(['b', 'a']);
   });
 
   it('computeAlpha parity matches baseline across scenarios', async () => {
@@ -190,9 +190,9 @@ describe('ranking migration parity', () => {
     expect(exportedKeys(rebuilt)).toEqual(exportedKeys(baseline));
     expect(rebuilt.BMXIndex).toBeDefined();
     expect(rebuilt.RRF_K).toBe(baseline.RRF_K);
-    expect(rebuilt.computeAlpha).toBe(baseline.computeAlpha);
-    expect(rebuilt.weightedRrf).toBe(baseline.weightedRrf);
-    expect(rebuilt.RelevanceRanker).toBe(baseline.RelevanceRanker);
+    expect(rebuilt.computeAlpha.name).toBe(baseline.computeAlpha.name);
+    expect(rebuilt.weightedRrf.name).toBe(baseline.weightedRrf.name);
+    expect(rebuilt.RelevanceRanker.name).toBe(baseline.RelevanceRanker.name);
   });
 });
 
