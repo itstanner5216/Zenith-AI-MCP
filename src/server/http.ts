@@ -223,7 +223,8 @@ app.get('/mcp', async (req, res) => {
         entry.lastSeenAt = Date.now();
         await entry.transport.handleRequest(req, res);
     } catch (err) {
-        console.error(`[session:${(sessionId as string).slice(0, 8)}] GET error:`, err);
+        const safeId = String(sessionId).replace(/[^\w-]/g, '').slice(0, 8);
+        console.error(`[session:${safeId}] GET error:`, err);
         if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
     }
 });
@@ -292,7 +293,8 @@ app.post('/messages', async (req, res) => {
         entry.lastSeenAt = Date.now();
         await entry.transport.handlePostMessage(req, res, req.body);
     } catch (err) {
-        console.error(`[session:${sessionId.slice(0, 8)}] POST /messages error:`, err);
+        const safeId = sessionId.replace(/[^\w-]/g, '').slice(0, 8);
+        console.error(`[session:${safeId}] POST /messages error:`, err);
         if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
     }
 });

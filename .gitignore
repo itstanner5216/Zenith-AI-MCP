@@ -3,11 +3,10 @@ coverage/
 *.log
 .DS_Store
 
-# tsc-compiled output (source lives in src/)
-# Do NOT add dist/ — dist/core/ and dist/tools/ are hand-authored source
-dist/adapters/
-dist/config/
-dist/retrieval/
+# Compiled output (source lives in src/)
+dist/
+
+# Prevent accidentally committing compiled TS artifacts in src/
 src/**/*.js
 src/**/*.js.map
 src/**/*.d.ts

@@ -22,8 +22,7 @@
     "dist"
   ],
   "scripts": {
-    "prebuild": "node -e \"if(!require('fs').existsSync('dist/core/server.js')){console.error('ABORT: dist/ contains hand-authored source. Refusing to build into corrupted dist.');process.exit(1)}\"",
-    "build": "npm run prebuild && tsc && shx chmod +x dist/cli/*.js dist/server/*.js dist/config/adapter-cli.js dist/config/zenith-mcp/admin-cli.js",
+    "build": "tsc && shx chmod +x dist/cli/*.js dist/server/*.js dist/config/adapter-cli.js dist/config/zenith-mcp/admin-cli.js",
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "test": "vitest run --coverage",
