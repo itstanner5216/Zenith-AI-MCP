@@ -1,53 +1,50 @@
-// toon_bridge.js
-// Accepts a file path and budget (chars) via CLI args.
-// Runs tree-sitter to extract code structure, then calls toon's
-// --structured mode via subprocess, returning the compressed result.
-//
-// Usage: node toon_bridge.js <filepath> <budget_chars>
+// toon_bridge.ts
+// In-process bridge: tree-sitter structure extraction → toon compression.
+// No subprocess, no CLI — called directly by compression.ts.
 
-import { readFileSync } from 'fs';
-import { execFileSync } from 'child_process';
 import { getCompressionStructure, getLangForFile } from './tree-sitter.js';
+import { compressSourceStructured, compressString } from '../toon/string-codec.js';
+import type { StructureBlock } from '../toon/types.js';
 
-const inputPath = process.argv[2];
-const budget    = parseInt(process.argv[3], 10);
+/**
+ * Compress source text using tree-sitter structure + toon codec.
+ * Falls back to unstructured compression when tree-sitter can't parse.
+ *
+ * @param content  - raw file text
+ * @param budget   - target character budget
+ * @param filePath - optional, used to detect language for tree-sitter
+ * @returns compressed text, or original if already within budget
+ */
+export async function compressToon(
+    content: string,
+    budget: number,
+    filePath?: string,
+): Promise<string> {
+    if (content.length <= budget) return content;
 
-if (!inputPath || isNaN(budget)) {
-    process.stderr.write('Usage: node toon_bridge.js <filepath> <budget_chars>\n');
-    process.exit(1);
-}
+    let structure: StructureBlock[] | null = null;
+    const langName = filePath ? getLangForFile(filePath) : null;
 
-const content = readFileSync(inputPath, 'utf8');
-
-if (content.length <= budget) {
-    process.stdout.write(content);
-    process.exit(0);
-}
-
-let structure = null;
-const langName = getLangForFile(inputPath);
-
-if (langName) {
-    try {
-        const defs = await getCompressionStructure(content, langName);
-        if (defs && defs.length > 0) {
-            structure = defs;
+    if (langName) {
+        try {
+            const defs = await getCompressionStructure(content, langName);
+            if (defs && defs.length > 0) {
+                structure = defs.map((d: { name: string; type: string; startLine: number; endLine: number; exported: boolean; anchors: Array<{ startLine: number; endLine: number; kind: string; priority: number }> }) => ({
+                    name: d.name,
+                    kind: d.type,
+                    type: d.type,
+                    startLine: d.startLine,
+                    endLine: d.endLine,
+                    exported: d.exported ?? false,
+                    anchors: d.anchors ?? [],
+                }));
+            }
+        } catch {
+            // tree-sitter unavailable or parse failed — fall through to unstructured
         }
-    } catch (e: any) {
-        process.stderr.write(`tree-sitter parse failed for ${inputPath}: ${e.message}\n`);
     }
+
+    return structure
+        ? compressSourceStructured(content, budget, structure)
+        : compressString(content, budget);
 }
-
-const payload = JSON.stringify({ content, budget, structure });
-
-const toonProjectDir = process.env.TOON_PROJECT_DIR || '/home/tanner/Projects/toon';
-
-const result = execFileSync('python3', ['-m', 'toon', '--structured'], {
-    input:     payload,
-    encoding:  'utf8',
-    maxBuffer: 10 * 1024 * 1024,
-    timeout:   30_000,
-    cwd:       toonProjectDir,
-});
-
-process.stdout.write(result);

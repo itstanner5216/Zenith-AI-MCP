@@ -1,10 +1,6 @@
-import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
-import path from 'path';
+import { compressToon } from './toon_bridge.js';
 
 export const DEFAULT_COMPRESSION_KEEP_RATIO = 0.70;
-
-const _BRIDGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'toon_bridge.js');
 
 export function computeCompressionBudget(rawLength: number, maxChars: number, keepRatio = DEFAULT_COMPRESSION_KEEP_RATIO): number {
     if (!Number.isFinite(rawLength) || rawLength <= 0) return 0;
@@ -41,47 +37,25 @@ export function truncateToBudget(text: unknown, budget: number): { text: string;
     };
 }
 
-export async function runToonBridge(validPath: string, budget: number): Promise<string | null> {
-    return new Promise((resolve) => {
-        const child = spawn(process.execPath, [_BRIDGE, validPath, String(budget)], {
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-
-        let out = '';
-        child.stdout.on('data', d => out += d);
-
-        const timer = setTimeout(() => {
-            child.kill();
-            resolve(null);
-        }, 30_000);
-
-        child.on('close', code => {
-            clearTimeout(timer);
-            resolve(code === 0 && out.length > 0 ? out : null);
-        });
-
-        child.on('error', () => {
-            clearTimeout(timer);
-            resolve(null);
-        });
-    });
-}
-
 export async function compressTextFile(validPath: string, rawText: string, maxChars: number, keepRatio = DEFAULT_COMPRESSION_KEEP_RATIO): Promise<{ text: string; targetBudget: number; rawLength: number; compressedLength: number } | null> {
     const targetBudget = computeCompressionBudget(rawText.length, maxChars, keepRatio);
     if (targetBudget <= 0 || targetBudget >= rawText.length) {
         return null;
     }
 
-    const compressed = await runToonBridge(validPath, targetBudget);
-    if (!isCompressionUseful(rawText, compressed, maxChars, keepRatio)) {
+    try {
+        const compressed = await compressToon(rawText, targetBudget, validPath);
+        if (!isCompressionUseful(rawText, compressed, maxChars, keepRatio)) {
+            return null;
+        }
+
+        return {
+            text: compressed,
+            targetBudget,
+            rawLength: rawText.length,
+            compressedLength: compressed.length,
+        };
+    } catch {
         return null;
     }
-
-    return {
-        text: compressed!,
-        targetBudget,
-        rawLength: rawText.length,
-        compressedLength: compressed!.length,
-    };
 }
