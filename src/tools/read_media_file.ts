@@ -1,7 +1,9 @@
 import { z } from "zod";
 import path from "path";
 import { readFileAsBase64Stream } from '../core/shared.js';
-const MIME_TYPES = {
+import type { ToolServer, ToolContext } from './types.js';
+
+const MIME_TYPES: Record<string, string> = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -14,8 +16,11 @@ const MIME_TYPES = {
     ".ogg": "audio/ogg",
     ".flac": "audio/flac",
 };
-export function register(server, ctx) {
-    server.registerTool("read_media_file", {
+
+type MediaArgs = { path: string };
+
+export function register(server: ToolServer, ctx: ToolContext) {
+    server.registerTool<MediaArgs>("read_media_file", {
         title: "Read Media File",
         description: "Read an image or audio file. Returns base64 data and MIME type.",
         inputSchema: { path: z.string() },
@@ -23,9 +28,10 @@ export function register(server, ctx) {
     }, async (args) => {
         const validPath = await ctx.validatePath(args.path);
         const extension = path.extname(validPath).toLowerCase();
-        const mimeType = MIME_TYPES[extension] || "application/octet-stream";
-        const data = await readFileAsBase64Stream(validPath);
-        const type = mimeType.startsWith("image/") ? "image"
+        const mimeType = MIME_TYPES[extension] ?? "application/octet-stream";
+        const rawData = await readFileAsBase64Stream(validPath);
+        const data = typeof rawData === 'string' ? rawData : String(rawData);
+        const type: "image" | "audio" | "blob" = mimeType.startsWith("image/") ? "image"
             : mimeType.startsWith("audio/") ? "audio"
                 : "blob";
         const contentItem = { type, data, mimeType };

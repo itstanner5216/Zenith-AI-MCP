@@ -1,1 +1,2 @@
-export declare function register(server: any, ctx: any): void;
+import type { ToolContext, ToolServer } from './types.js';
+export declare function register(server: ToolServer, ctx: ToolContext): void;

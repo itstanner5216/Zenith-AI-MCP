@@ -98,10 +98,13 @@ describe('compression isCompressionUseful', () => {
     });
 
     it('respects custom keepRatio', () => {
+        // keepRatio scales the target budget (budget = raw.length * keepRatio when below maxChars).
+        // Same compressed/raw values flip useful vs. not-useful based on whether keepRatio
+        // produces a budget the compressed text fits inside.
         const raw = 'a'.repeat(1000);
-        const compressed = 'a'.repeat(400);
-        expect(isCompressionUseful(raw, compressed, 10000, 0.5)).toBe(false);
-        expect(isCompressionUseful(raw, compressed, 10000, 0.8)).toBe(true);
+        const compressed = 'a'.repeat(600);
+        expect(isCompressionUseful(raw, compressed, 10000, 0.5)).toBe(false); // budget=500, 600 > 500
+        expect(isCompressionUseful(raw, compressed, 10000, 0.7)).toBe(true);  // budget=700, 600 <= 700
     });
 
     it('returns false when raw length equals target budget', () => {

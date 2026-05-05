@@ -4,10 +4,22 @@ import path from 'path';
 import { randomBytes } from 'crypto';
 import { normalizeLineEndings, createMinimalDiff } from '../core/lib.js';
 import { getStashEntry, consumeAttempt, clearStash, listStash } from '../core/stash.js';
-import { getProjectContext } from '../core/project-context.js';
 import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
 import { findRepoRoot, getDb, snapshotSymbol, getSessionId, } from '../core/symbol-index.js';
-export function register(server, ctx) {
+import type { ToolServer, ToolContext } from './types.js';
+import { errorMessage } from './types.js';
+
+type StashRestoreArgs = {
+    mode: 'apply' | 'restore' | 'list' | 'read';
+    stashId?: number;
+    corrections?: Array<{ index: number; startLine?: number; nearLine?: number }>;
+    newPath?: string;
+    dryRun?: boolean;
+    file?: string;
+    type?: 'edit' | 'write';
+};
+
+export function register(server: ToolServer, ctx: ToolContext) {
     server.registerTool("stashRestore", {
         title: "Stash Restore",
         description: "Retry failed edits/writes or browse cached stash entries. For symbol version restore/history, use refactor_batch instead.",
@@ -25,8 +37,7 @@ export function register(server, ctx) {
             type: z.enum(['edit', 'write']).optional().describe("list: filter entries by type."),
         }),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
-    }, async (args) => {
-        const pc = getProjectContext(ctx);
+    }, async (args: StashRestoreArgs) => {
         // =================================================================
         // LIST
         // =================================================================
@@ -34,13 +45,13 @@ export function register(server, ctx) {
             const { entries, isGlobal } = listStash(ctx, args.file);
             let filtered = entries;
             if (args.type) {
-                filtered = entries.filter(e => e.type === args.type);
+                filtered = entries.filter((e: { type: string }) => e.type === args.type);
             }
             if (!filtered.length) {
                 const msg = isGlobal ? 'Empty. (global)' : 'Empty.';
                 return { content: [{ type: 'text', text: msg }] };
             }
-            const lines = filtered.map(e => `#${e.id} [${e.type}] ${e.filePath} (attempt ${e.attempts}/2)`);
+            const lines = filtered.map((e: { id: number; type: string; filePath: string; attempts: number }) => `#${e.id} [${e.type}] ${e.filePath} (attempt ${e.attempts}/2)`);
             if (isGlobal)
                 lines.unshift('(global stash — no project detected)');
             return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -57,7 +68,7 @@ export function register(server, ctx) {
             if (entry.type === 'edit') {
                 const edits = entry.payload.edits;
                 const failed = entry.payload.failedIndices;
-                const lines = edits.map((e, i) => {
+                const lines = edits.map((e: { symbol?: string; block_start?: number; block_end?: number }, i: number) => {
                     const status = failed.includes(i) ? 'FAILED' : 'ok';
                     const mode = e.symbol ? `symbol:${e.symbol}` : e.block_start ? `block:${e.block_start}...${e.block_end}` : `content`;
                     return `#${i + 1} [${status}] ${mode}`;
@@ -113,7 +124,7 @@ export function register(server, ctx) {
                     disambiguations,
                 });
                 if (errors.length > 0) {
-                    const failMsg = errors.map(e => e.msg).join('\n');
+                    const failMsg = errors.map((e: { msg: string }) => e.msg).join('\n');
                     throw new Error(`${errors.length} failed.\n${failMsg}`);
                 }
                 if (args.dryRun) {
@@ -137,10 +148,12 @@ export function register(server, ctx) {
                     try {
                         const repoRoot = findRepoRoot(validPath) || path.dirname(validPath);
                         const db = getDb(repoRoot);
-                        const sessionId = ctx.sessionId || getSessionId();
+                        const sessionId = ctx.sessionId ?? getSessionId();
                         const relPath = path.relative(repoRoot, validPath);
                         for (const snap of pendingSnapshots) {
-                            snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                            if (snap.symbol !== undefined) {
+                                snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                            }
                         }
                     }
                     catch { /* best-effort */ }
@@ -158,8 +171,9 @@ export function register(server, ctx) {
                     await fs.mkdir(parentDir, { recursive: true });
                 }
                 catch (err) {
-                    if (err.code !== 'EEXIST')
-                        throw new Error(`Cannot create directory: ${err.message}`);
+                    const e = err as NodeJS.ErrnoException;
+                    if (e.code !== 'EEXIST')
+                        throw new Error(`Cannot create directory: ${e.message}`);
                 }
                 if (args.dryRun) {
                     return { content: [{ type: 'text', text: `${Buffer.byteLength(content, 'utf-8')} bytes` }] };
@@ -181,7 +195,7 @@ export function register(server, ctx) {
                             const tailLines = existingLines.slice(-500);
                             let overlap = 0;
                             if (tailLines.length && incomingLines.length) {
-                                const trim = s => s.trimEnd();
+                                const trim = (s: string) => s.trimEnd();
                                 const first = trim(incomingLines[0]);
                                 for (let i = 0; i < tailLines.length; i++) {
                                     if (trim(tailLines[i]) !== first)
@@ -217,7 +231,7 @@ export function register(server, ctx) {
                         await fs.unlink(tempPath);
                     }
                     catch { }
-                    throw new Error(`Write retry failed: ${error.message}`);
+                    throw new Error(`Write retry failed: ${errorMessage(error)}`);
                 }
                 clearStash(ctx, args.stashId, entry.filePath);
                 return { content: [{ type: 'text', text: `Applied.` }] };

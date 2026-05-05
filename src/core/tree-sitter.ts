@@ -20,7 +20,7 @@
 // Parsed symbols are cached by source hash (LRU, 100 entries).
 // ---------------------------------------------------------------------------
 
-import { Parser, Language, Query } from 'web-tree-sitter';
+import { Parser, Language, Query, Node } from 'web-tree-sitter';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -41,7 +41,7 @@ const TS_WASM_PATH = path.join(__dirname, '..', 'grammars', 'tree-sitter.wasm');
 // Extension → language mapping
 // ---------------------------------------------------------------------------
 
-const EXT_TO_LANG = {
+const EXT_TO_LANG: Record<string, string> = {
     // JavaScript / TypeScript
     '.js':   'javascript',
     '.mjs':  'javascript',
@@ -104,22 +104,22 @@ const EXT_TO_LANG = {
  * Get the tree-sitter language name for a file path.
  * Returns null if the extension is not supported.
  */
-export function getLangForFile(filePath?: string) {
-    const ext = path.extname(filePath).toLowerCase();
-    return EXT_TO_LANG[ext] || null;
+export function getLangForFile(filePath?: string): string | null {
+    const ext = path.extname(filePath ?? '').toLowerCase();
+    return EXT_TO_LANG[ext] ?? null;
 }
 
 /**
  * Get all supported file extensions.
  */
-export function getSupportedExtensions() {
+export function getSupportedExtensions(): string[] {
     return Object.keys(EXT_TO_LANG);
 }
 
 /**
  * Check if a file can be parsed by tree-sitter.
  */
-export function isSupported(filePath) {
+export function isSupported(filePath: string): boolean {
     return getLangForFile(filePath) !== null;
 }
 
@@ -127,19 +127,25 @@ export function isSupported(filePath) {
 // Initialization & caching
 // ---------------------------------------------------------------------------
 
-let _initPromise = null;
-const _languageCache = new Map();       // lang name → Language object (or null)
-const _queryStringCache = new Map();    // lang name → raw .scm string (or null)
-const _compiledQueryCache = new Map();  // lang name → Query object (or null)
+let _initPromise: Promise<void> | null = null;
+const _languageCache: Map<string, Language | null> = new Map();
+const _queryStringCache: Map<string, string | null> = new Map();
+const _compiledQueryCache: Map<string, Query | null> = new Map();
 
 // Symbol cache: hash(source) → Symbol[]
 const SYMBOL_CACHE_MAX = 100;
-const _symbolCache = new Map();         // hash → { symbols, ts }
+
+interface SymbolCacheEntry {
+    symbols: SymbolInfo[];
+    ts: number;
+}
+
+const _symbolCache: Map<string, SymbolCacheEntry> = new Map();
 
 /**
  * Initialize the tree-sitter WASM runtime. Idempotent.
  */
-async function ensureInit() {
+async function ensureInit(): Promise<void> {
     if (!_initPromise) {
         _initPromise = Parser.init({
             locateFile: () => TS_WASM_PATH,
@@ -152,9 +158,9 @@ async function ensureInit() {
  * Load a Language grammar (WASM), cached permanently.
  * Returns null if the grammar file doesn't exist.
  */
-async function loadLanguage(langName) {
+async function loadLanguage(langName: string): Promise<Language | null> {
     if (_languageCache.has(langName)) {
-        return _languageCache.get(langName);
+        return _languageCache.get(langName) ?? null;
     }
 
     await ensureInit();
@@ -172,7 +178,8 @@ async function loadLanguage(langName) {
         _languageCache.set(langName, language);
         return language;
     } catch (err) {
-        console.error(`Failed to load grammar for ${langName}:`, err.message);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`Failed to load grammar for ${langName}:`, message);
         _languageCache.set(langName, null);
         return null;
     }
@@ -181,9 +188,9 @@ async function loadLanguage(langName) {
 /**
  * Load the .scm query string for a language. Cached permanently.
  */
-async function loadQueryString(langName) {
+async function loadQueryString(langName: string): Promise<string | null> {
     if (_queryStringCache.has(langName)) {
-        return _queryStringCache.get(langName);
+        return _queryStringCache.get(langName) ?? null;
     }
 
     const scmPath = path.join(QUERIES_DIR, `${langName}-tags.scm`);
@@ -201,9 +208,9 @@ async function loadQueryString(langName) {
  * Get a compiled Query object for a language. Cached permanently.
  * Returns null if language or query unavailable.
  */
-async function getCompiledQuery(langName) {
+async function getCompiledQuery(langName: string): Promise<Query | null> {
     if (_compiledQueryCache.has(langName)) {
-        return _compiledQueryCache.get(langName);
+        return _compiledQueryCache.get(langName) ?? null;
     }
 
     const language = await loadLanguage(langName);
@@ -223,7 +230,8 @@ async function getCompiledQuery(langName) {
         _compiledQueryCache.set(langName, query);
         return query;
     } catch (err) {
-        console.error(`Failed to compile query for ${langName}:`, err.message);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`Failed to compile query for ${langName}:`, message);
         _compiledQueryCache.set(langName, null);
         return null;
     }
@@ -233,11 +241,11 @@ async function getCompiledQuery(langName) {
 // Symbol cache helpers
 // ---------------------------------------------------------------------------
 
-function sourceHash(source) {
+function sourceHash(source: string): string {
     return createHash('md5').update(source).digest('hex');
 }
 
-function getCachedSymbols(hash) {
+function getCachedSymbols(hash: string): SymbolInfo[] | null {
     const entry = _symbolCache.get(hash);
     if (entry) {
         entry.ts = Date.now(); // touch for LRU
@@ -246,10 +254,11 @@ function getCachedSymbols(hash) {
     return null;
 }
 
-function setCachedSymbols(hash, symbols) {
+function setCachedSymbols(hash: string, symbols: SymbolInfo[]): void {
     // Evict oldest if at capacity
     if (_symbolCache.size >= SYMBOL_CACHE_MAX) {
-        let oldestKey = null, oldestTs = Infinity;
+        let oldestKey: string | null = null;
+        let oldestTs = Infinity;
         for (const [key, val] of _symbolCache) {
             if (val.ts < oldestTs) {
                 oldestTs = val.ts;
@@ -262,20 +271,29 @@ function setCachedSymbols(hash, symbols) {
 }
 
 // ---------------------------------------------------------------------------
-// Core API
+// Core types
 // ---------------------------------------------------------------------------
 
-/**
- * @typedef {Object} Symbol
- * @property {string}  name     - Symbol identifier (e.g. 'sendMessage')
- * @property {string}  kind     - 'def' or 'ref'
- * @property {string}  type     - Symbol type: 'function', 'class', 'method',
- *                                'interface', 'type', 'enum', 'module',
- *                                'call', 'key', 'section', 'selector', etc.
- * @property {number}  line     - 1-based start line of the identifier
- * @property {number}  endLine  - 1-based end line of the full definition body
- * @property {number}  column   - 0-based column of the identifier
- */
+export interface SymbolInfo {
+    name: string;
+    kind: string;
+    type: string;
+    line: number;
+    endLine: number;
+    column: number;
+}
+
+export interface SymbolFilterOptions {
+    nameFilter?: string;
+    kindFilter?: string;
+    typeFilter?: string;
+    excludeNames?: string[];
+    nearLine?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Core API
+// ---------------------------------------------------------------------------
 
 /**
  * Extract all symbols from source code.
@@ -284,16 +302,12 @@ function setCachedSymbols(hash, symbols) {
  * their sibling @definition.* captures, giving us both the symbol name
  * and its full body extent.
  *
- * @param {string} source   - the source code
- * @param {string} langName - tree-sitter language name
- * @param {Object} [options]
- * @param {string} [options.nameFilter]   - substring filter on symbol name (case-insensitive)
- * @param {string} [options.kindFilter]   - 'def' or 'ref'
- * @param {string} [options.typeFilter]   - 'function', 'class', 'method', etc.
- * @param {string[]} [options.excludeNames] - exact names to exclude
- * @returns {Promise<Symbol[] | null>} null if language not supported or no query
+ * @param source   - the source code
+ * @param langName - tree-sitter language name
+ * @param options  - optional filters
+ * @returns null if language not supported or no query
  */
-export async function getSymbols(source, langName, options = {}) {
+export async function getSymbols(source: string, langName: string, options: SymbolFilterOptions = {}): Promise<SymbolInfo[] | null> {
     // Check cache first
     const hash = sourceHash(langName + ':' + source);
     const cached = getCachedSymbols(hash);
@@ -311,11 +325,13 @@ export async function getSymbols(source, langName, options = {}) {
     parser.setLanguage(language);
     const tree = parser.parse(source);
 
+    if (!tree) return null;
+
     // Use matches() to get grouped captures per pattern match.
     // Each match contains both @name.definition.X and @definition.X captures.
     const matches = query.matches(tree.rootNode);
-    const symbols = [];
-    const seen = new Set();
+    const symbols: SymbolInfo[] = [];
+    const seen = new Set<string>();
 
     for (const match of matches) {
         const { captures } = match;
@@ -335,7 +351,8 @@ export async function getSymbols(source, langName, options = {}) {
         if (!nameCapture) continue;
 
         const tag = nameCapture.name;
-        let kind, type;
+        let kind: string;
+        let type: string;
         if (tag.startsWith('name.definition.')) {
             kind = 'def';
             type = tag.slice('name.definition.'.length);
@@ -352,7 +369,7 @@ export async function getSymbols(source, langName, options = {}) {
 
         // endLine comes from the body capture if available, otherwise from
         // the name capture's own end (single-line symbol)
-        let endLine;
+        let endLine: number;
         if (bodyCapture) {
             endLine = bodyCapture.node.endPosition.row + 1;
         } else {
@@ -383,7 +400,7 @@ export async function getSymbols(source, langName, options = {}) {
 /**
  * Apply optional filters to a symbol list.
  */
-function applyFilters(symbols, options) {
+function applyFilters(symbols: SymbolInfo[], options: SymbolFilterOptions): SymbolInfo[] {
     if (!options.kindFilter && !options.nameFilter && !options.typeFilter && !options.excludeNames) {
         return symbols;
     }
@@ -401,11 +418,36 @@ function applyFilters(symbols, options) {
  * Get only definitions from source code.
  * Convenience wrapper around getSymbols with kindFilter='def'.
  */
-export async function getDefinitions(source, langName, options = {}) {
+export async function getDefinitions(source: string, langName: string, options: SymbolFilterOptions = {}): Promise<SymbolInfo[] | null> {
     return getSymbols(source, langName, { ...options, kindFilter: 'def' });
 }
 
-const COMPRESSION_ANCHOR_RULES = {
+interface AnchorRule {
+    kind: string;
+    priority: number;
+}
+
+interface AnchorRuleMap {
+    [nodeType: string]: AnchorRule;
+}
+
+interface AnchorEntry {
+    startLine: number;
+    endLine: number;
+    kind: string;
+    priority: number;
+}
+
+interface BlockEntry {
+    type: string;
+    name: string;
+    startLine: number;
+    endLine: number;
+    exported: boolean;
+    anchors: AnchorEntry[];
+}
+
+const COMPRESSION_ANCHOR_RULES: Record<string, AnchorRuleMap> = {
     javascript: {
         return_statement: { kind: 'return', priority: 400 },
         throw_statement: { kind: 'throw', priority: 380 },
@@ -463,11 +505,11 @@ const COMPRESSION_ANCHOR_RULES = {
     },
 };
 
-function maybeAddAnchor(block, anchor) {
+function maybeAddAnchor(block: BlockEntry, anchor: AnchorEntry): void {
     if (!block.anchors) block.anchors = [];
 
     const existing = block.anchors.find(
-        item => item.startLine === anchor.startLine && item.endLine === anchor.endLine
+        (item: AnchorEntry) => item.startLine === anchor.startLine && item.endLine === anchor.endLine
     );
 
     if (existing) {
@@ -481,8 +523,8 @@ function maybeAddAnchor(block, anchor) {
     block.anchors.push(anchor);
 }
 
-function assignAnchorToInnermostBlock(blocks, startLine, endLine, kind, priority) {
-    let target = null;
+function assignAnchorToInnermostBlock(blocks: BlockEntry[], startLine: number, endLine: number, kind: string, priority: number): void {
+    let target: BlockEntry | null = null;
 
     for (const block of blocks) {
         if (block.startLine > startLine || block.endLine < endLine) continue;
@@ -496,7 +538,7 @@ function assignAnchorToInnermostBlock(blocks, startLine, endLine, kind, priority
     maybeAddAnchor(target, { startLine, endLine, kind, priority });
 }
 
-function shouldCaptureAnchor(node, parent, rule) {
+function shouldCaptureAnchor(node: Node, parent: Node | null, rule: AnchorRule | undefined): boolean {
     if (node.type === 'call_expression' && parent && (
         parent.type === 'call_expression' ||
         parent.type === 'await_expression' ||
@@ -512,11 +554,12 @@ function shouldCaptureAnchor(node, parent, rule) {
     return !!rule;
 }
 
-export async function getCompressionStructure(source?: string, langName?: string) {
-    const defs = await getDefinitions(source, langName);
-    if (!defs || defs.length === 0) return defs;
+export async function getCompressionStructure(source?: string, langName?: string): Promise<BlockEntry[] | null> {
+    const defs = await getDefinitions(source ?? '', langName ?? '');
+    if (!defs) return null;
+    if (defs.length === 0) return [];
 
-    const blocks = defs.map(d => ({
+    const blocks: BlockEntry[] = defs.map((d: SymbolInfo) => ({
         type: d.type,
         name: d.name,
         startLine: d.line - 1,
@@ -525,18 +568,21 @@ export async function getCompressionStructure(source?: string, langName?: string
         anchors: [],
     }));
 
-    const rules = COMPRESSION_ANCHOR_RULES[langName];
-    if (!rules) return blocks;
+    const rulesOrUndef = langName !== undefined ? COMPRESSION_ANCHOR_RULES[langName] : undefined;
+    if (!rulesOrUndef) return blocks;
+    const rules: AnchorRuleMap = rulesOrUndef;
 
-    const language = await loadLanguage(langName);
+    const language = await loadLanguage(langName ?? '');
     if (!language) return blocks;
 
     const parser = new Parser();
     parser.setLanguage(language);
-    const tree = parser.parse(source);
+    const tree = parser.parse(source ?? '');
+
+    if (!tree) return blocks;
 
     try {
-        function walk(node, parent = null) {
+        function walk(node: Node, parent: Node | null = null): void {
             const rule = rules[node.type];
             if (shouldCaptureAnchor(node, parent, rule)) {
                 const startLine = node.startPosition.row;
@@ -546,7 +592,8 @@ export async function getCompressionStructure(source?: string, langName?: string
             }
 
             for (let i = 0; i < node.childCount; i++) {
-                walk(node.child(i), node);
+                const child = node.child(i);
+                if (child) walk(child, node);
             }
         }
 
@@ -558,7 +605,7 @@ export async function getCompressionStructure(source?: string, langName?: string
 
     for (const block of blocks) {
         if (block.anchors.length > 0) {
-            block.anchors.sort((a, b) => b.priority - a.priority || a.startLine - b.startLine);
+            block.anchors.sort((a: AnchorEntry, b: AnchorEntry) => b.priority - a.priority || a.startLine - b.startLine);
             block.anchors = block.anchors.slice(0, 16);
         }
     }
@@ -569,24 +616,23 @@ export async function getCompressionStructure(source?: string, langName?: string
 /**
  * Get a summary count of symbols by type for a file.
  *
- * @param {string} source   - the source code
- * @param {string} langName - tree-sitter language name
- * @returns {Promise<{ defs: Object, refs: Object, defTotal: number, refTotal: number } | null>}
+ * @param source   - the source code
+ * @param langName - tree-sitter language name
  */
-export async function getSymbolSummary(source, langName) {
+export async function getSymbolSummary(source: string, langName: string): Promise<{ defs: Record<string, number>; refs: Record<string, number>; defTotal: number; refTotal: number } | null> {
     const symbols = await getSymbols(source, langName);
     if (!symbols) return null;
 
-    const defs = {};
-    const refs = {};
+    const defs: Record<string, number> = {};
+    const refs: Record<string, number> = {};
     let defTotal = 0, refTotal = 0;
 
     for (const sym of symbols) {
         if (sym.kind === 'def') {
-            defs[sym.type] = (defs[sym.type] || 0) + 1;
+            defs[sym.type] = (defs[sym.type] ?? 0) + 1;
             defTotal++;
         } else {
-            refs[sym.type] = (refs[sym.type] || 0) + 1;
+            refs[sym.type] = (refs[sym.type] ?? 0) + 1;
             refTotal++;
         }
     }
@@ -599,17 +645,17 @@ export async function getSymbolSummary(source, langName) {
  * E.g. "3 functions, 1 class, 2 methods" — definitions only.
  * Returns null if no definitions found or language not supported.
  */
-export async function getSymbolSummaryString(source, langName) {
+export async function getSymbolSummaryString(source: string, langName: string): Promise<string | null> {
     const summary = await getSymbolSummary(source, langName);
     if (!summary || summary.defTotal === 0) return null;
 
-    const parts = [];
+    const parts: string[] = [];
     // Ordered by typical importance
     const order = ['class', 'interface', 'type', 'enum', 'function', 'method', 'module',
                    'key', 'section', 'selector', 'keyframes', 'media',
                    'variable', 'constant', 'property', 'object', 'mixin', 'extension',
                    'macro', 'resource', 'output', 'provider', 'local'];
-    const used = new Set();
+    const used = new Set<string>();
 
     for (const t of order) {
         if (summary.defs[t]) {
@@ -630,7 +676,7 @@ export async function getSymbolSummaryString(source, langName) {
     return parts.length > 0 ? parts.join(', ') : null;
 }
 
-function pluralize(type) {
+function pluralize(type: string): string {
     if (type.endsWith('s')) return type + 'es';
     if (type.endsWith('y')) return type.slice(0, -1) + 'ies';
     return type + 's';
@@ -646,16 +692,13 @@ function pluralize(type) {
  * If multiple matches exist and nearLine is provided, sorts by proximity.
  * Otherwise returns all matches (caller decides whether to reject or pick).
  *
- * @param {string} source      - the source code
- * @param {string} langName    - tree-sitter language name
- * @param {string} symbolName  - exact name or dot-qualified name
- * @param {Object} [options]
- * @param {string} [options.kindFilter] - 'def' or 'ref' (default: 'def')
- * @param {number} [options.nearLine]   - prefer match closest to this line
- * @returns {Promise<Symbol[] | null>}  matched symbols sorted by relevance, or null
+ * @param source      - the source code
+ * @param langName    - tree-sitter language name
+ * @param symbolName  - exact name or dot-qualified name
+ * @param options     - optional filters
  */
-export async function findSymbol(source, langName, symbolName, options = {}) {
-    const kindFilter = options.kindFilter || 'def';
+export async function findSymbol(source: string, langName: string, symbolName: string, options: SymbolFilterOptions = {}): Promise<SymbolInfo[] | null> {
+    const kindFilter = options.kindFilter ?? 'def';
 
     // Handle dot-qualified names: "MyClass.sendMessage"
     const parts = symbolName.split('.');
@@ -666,7 +709,7 @@ export async function findSymbol(source, langName, symbolName, options = {}) {
     if (!allSymbols) return null;
 
     // Find direct matches on the target name
-    let matches = allSymbols.filter(s => s.name === targetName);
+    let matches = allSymbols.filter((s: SymbolInfo) => s.name === targetName);
 
     // If qualified, filter to only those nested inside the parent symbol(s)
     if (parentNames.length > 0 && matches.length > 0) {
@@ -675,13 +718,13 @@ export async function findSymbol(source, langName, symbolName, options = {}) {
             await getSymbols(source, langName, { kindFilter: 'def' });
         if (!allDefs) return matches; // can't verify parents, return unfiltered
 
-        matches = matches.filter(sym => {
-            let current = sym;
+        matches = matches.filter((sym: SymbolInfo) => {
+            let current: SymbolInfo = sym;
             // Walk outward through parent qualifiers
             for (let i = parentNames.length - 1; i >= 0; i--) {
                 const parentName = parentNames[i];
                 // Find a definition that contains current's line range
-                const parent = allDefs.find(d =>
+                const parent = allDefs.find((d: SymbolInfo) =>
                     d.name === parentName &&
                     d.line <= current.line &&
                     d.endLine >= current.endLine &&
@@ -695,9 +738,10 @@ export async function findSymbol(source, langName, symbolName, options = {}) {
     }
 
     // Sort by proximity to nearLine if specified
-    if (matches.length > 1 && options.nearLine) {
-        matches.sort((a, b) =>
-            Math.abs(a.line - options.nearLine) - Math.abs(b.line - options.nearLine)
+    if (matches.length > 1 && options.nearLine !== undefined) {
+        const nearLine = options.nearLine;
+        matches.sort((a: SymbolInfo, b: SymbolInfo) =>
+            Math.abs(a.line - nearLine) - Math.abs(b.line - nearLine)
         );
     }
 
@@ -708,15 +752,14 @@ export async function findSymbol(source, langName, symbolName, options = {}) {
  * Get symbols for a file by path. Reads the file, detects language, parses.
  * Convenience wrapper that handles the full file → symbols pipeline.
  *
- * @param {string} filePath - absolute path to the file
- * @param {Object} [options] - same options as getSymbols
- * @returns {Promise<Symbol[] | null>}
+ * @param filePath - absolute path to the file
+ * @param options  - same options as getSymbols
  */
-export async function getFileSymbols(filePath, options = {}) {
+export async function getFileSymbols(filePath: string, options: SymbolFilterOptions = {}): Promise<SymbolInfo[] | null> {
     const langName = getLangForFile(filePath);
     if (!langName) return null;
 
-    let source;
+    let source: string;
     try {
         source = await fs.readFile(filePath, 'utf-8');
     } catch {
@@ -730,11 +773,11 @@ export async function getFileSymbols(filePath, options = {}) {
  * Get symbol summary string for a file by path.
  * Returns null if unsupported or no definitions found.
  */
-export async function getFileSymbolSummary(filePath) {
+export async function getFileSymbolSummary(filePath: string): Promise<string | null> {
     const langName = getLangForFile(filePath);
     if (!langName) return null;
 
-    let source;
+    let source: string;
     try {
         const stat = await fs.stat(filePath);
         // Skip large files — parsing a 2MB file for a directory listing isn't worth it
@@ -750,7 +793,7 @@ export async function getFileSymbolSummary(filePath) {
 /**
  * Check if tree-sitter is available (runtime can init, grammars exist).
  */
-export async function treeSitterAvailable() {
+export async function treeSitterAvailable(): Promise<boolean> {
     try {
         await ensureInit();
         const files = await fs.readdir(GRAMMARS_DIR);
@@ -766,11 +809,10 @@ export async function treeSitterAvailable() {
  * Returns null if the language is not supported.
  * Returns empty array if no errors detected.
  *
- * @param {string} source   - the source code to check
- * @param {string} langName - tree-sitter language name
- * @returns {Promise<Array<{line: number, column: number}> | null>}
+ * @param source   - the source code to check
+ * @param langName - tree-sitter language name
  */
-export async function checkSyntaxErrors(source, langName) {
+export async function checkSyntaxErrors(source: string, langName: string): Promise<Array<{ line: number; column: number }> | null> {
     const language = await loadLanguage(langName);
     if (!language) return null;
 
@@ -778,21 +820,28 @@ export async function checkSyntaxErrors(source, langName) {
     parser.setLanguage(language);
     const tree = parser.parse(source);
 
+    if (!tree) return null;
+
     try {
+        // Compat shim for older web-tree-sitter where hasError was a method, not a getter
         const rootHasError = typeof tree.rootNode.hasError === 'function'
-            ? tree.rootNode.hasError()
+            ? (tree.rootNode.hasError as unknown as () => boolean)()
             : tree.rootNode.hasError;
         if (!rootHasError) {
             return [];
         }
 
-        const errors = [];
+        const errors: Array<{ line: number; column: number }> = [];
         const MAX_ERRORS = 10;
 
-        function walk(node) {
+        function walk(node: Node): void {
             if (errors.length >= MAX_ERRORS) return;
-            const nodeMissing = typeof node.isMissing === 'function'
-                ? node.isMissing()
+            // Compat shim for older web-tree-sitter where isMissing was a method, not a getter.
+            // Symmetric to the hasError shim above. Required for runtime correctness on legacy
+            // versions where reading the property would yield a function reference (always truthy)
+            // rather than the actual missing-node boolean.
+            const nodeMissing: boolean = typeof node.isMissing === 'function'
+                ? (node.isMissing as unknown as () => boolean)()
                 : node.isMissing;
             if (node.type === 'ERROR' || nodeMissing) {
                 errors.push({
@@ -802,7 +851,8 @@ export async function checkSyntaxErrors(source, langName) {
             }
             for (let i = 0; i < node.childCount; i++) {
                 if (errors.length >= MAX_ERRORS) return;
-                walk(node.child(i));
+                const child = node.child(i);
+                if (child) walk(child);
             }
         }
 
@@ -819,13 +869,12 @@ export async function checkSyntaxErrors(source, langName) {
  * Returns an ordered array of AST node types for all nodes whose start row
  * falls within [startLine-1, endLine-1].
  *
- * @param {string} source    - full source code
- * @param {string} langName  - tree-sitter language name
- * @param {number} startLine - 1-based start line
- * @param {number} endLine   - 1-based end line
- * @returns {Promise<string[]>}
+ * @param source    - full source code
+ * @param langName  - tree-sitter language name
+ * @param startLine - 1-based start line
+ * @param endLine   - 1-based end line
  */
-export async function getStructuralFingerprint(source, langName, startLine, endLine) {
+export async function getStructuralFingerprint(source: string, langName: string, startLine: number, endLine: number): Promise<string[]> {
     const language = await loadLanguage(langName);
     if (!language) return [];
 
@@ -833,17 +882,20 @@ export async function getStructuralFingerprint(source, langName, startLine, endL
     parser.setLanguage(language);
     const tree = parser.parse(source);
 
+    if (!tree) return [];
+
     try {
-        const nodeTypes = [];
+        const nodeTypes: string[] = [];
         const startRow = startLine - 1;
         const endRow = endLine - 1;
 
-        function walk(node) {
+        function walk(node: Node): void {
             if (node.startPosition.row >= startRow && node.startPosition.row <= endRow) {
                 nodeTypes.push(node.type);
             }
             for (let i = 0; i < node.childCount; i++) {
-                walk(node.child(i));
+                const child = node.child(i);
+                if (child) walk(child);
             }
         }
 
@@ -859,13 +911,12 @@ export async function getStructuralFingerprint(source, langName, startLine, endL
  * Compute Jaccard similarity between two structural fingerprints using 3-grams.
  * Returns a score from 0.0 to 1.0.
  *
- * @param {string[]} fingerprintA
- * @param {string[]} fingerprintB
- * @returns {number}
+ * @param fingerprintA
+ * @param fingerprintB
  */
-export function computeStructuralSimilarity(fingerprintA, fingerprintB) {
-    function buildNgrams(arr, n) {
-        const set = new Set();
+export function computeStructuralSimilarity(fingerprintA: string[], fingerprintB: string[]): number {
+    function buildNgrams(arr: string[], n: number): Set<string> {
+        const set = new Set<string>();
         for (let i = 0; i <= arr.length - n; i++) {
             set.add(arr.slice(i, i + n).join('\x00'));
         }
@@ -887,6 +938,14 @@ export function computeStructuralSimilarity(fingerprintA, fingerprintB) {
     return union === 0 ? 0.0 : intersection / union;
 }
 
+interface SymbolStructure {
+    params: string[];
+    returnKind: string | null;
+    parentKind: string | null;
+    decorators: string[];
+    modifiers: string[];
+}
+
 /**
  * Extract a structural signature for the symbol whose definition spans
  * `startLine`..`endLine` (1-based, inclusive). Used by refactor_batch outlier
@@ -895,13 +954,15 @@ export function computeStructuralSimilarity(fingerprintA, fingerprintB) {
  *
  * Returns null if the language cannot be loaded or no matching def node is found.
  */
-export async function getSymbolStructure(source, langName, startLine, endLine) {
+export async function getSymbolStructure(source: string, langName: string, startLine: number, endLine: number): Promise<SymbolStructure | null> {
     const language = await loadLanguage(langName);
     if (!language) return null;
 
     const parser = new Parser();
     parser.setLanguage(language);
     const tree = parser.parse(source);
+
+    if (!tree) return null;
 
     try {
         const startRow = startLine - 1;
@@ -915,8 +976,8 @@ export async function getSymbolStructure(source, langName, startLine, endLine) {
             'lexical_declaration', 'variable_declaration',
         ]);
 
-        let defNode = null;
-        function findDef(node) {
+        let defNode: Node | null = null;
+        function findDef(node: Node): boolean {
             if (DEF_TYPES.has(node.type) &&
                 node.startPosition.row === startRow &&
                 node.endPosition.row === endRow) {
@@ -924,42 +985,49 @@ export async function getSymbolStructure(source, langName, startLine, endLine) {
                 return true;
             }
             for (let i = 0; i < node.childCount; i++) {
-                if (findDef(node.child(i))) return true;
+                const child = node.child(i);
+                if (child && findDef(child)) return true;
             }
             return false;
         }
         findDef(tree.rootNode);
         if (!defNode) return null;
 
-        const params = [];
-        function collectParams(node) {
+        // defNode is Node here (TypeScript narrowed it above via null check)
+        const foundNode: Node = defNode;
+
+        const params: string[] = [];
+        function collectParams(node: Node): boolean {
             if (/parameters?$/.test(node.type) || node.type === 'formal_parameters') {
                 for (let i = 0; i < node.childCount; i++) {
                     const c = node.child(i);
+                    if (!c) continue;
                     if (c.type === '(' || c.type === ')' || c.type === ',') continue;
                     params.push(c.type);
                 }
                 return true;
             }
             for (let i = 0; i < node.childCount; i++) {
-                if (collectParams(node.child(i))) return true;
+                const child = node.child(i);
+                if (child && collectParams(child)) return true;
             }
             return false;
         }
-        collectParams(defNode);
+        collectParams(foundNode);
 
-        let returnKind = null;
-        for (let i = 0; i < defNode.childCount; i++) {
-            const c = defNode.child(i);
-            const fieldName = defNode.fieldNameForChild ? defNode.fieldNameForChild(i) : null;
+        let returnKind: string | null = null;
+        for (let i = 0; i < foundNode.childCount; i++) {
+            const c = foundNode.child(i);
+            if (!c) continue;
+            const fieldName = foundNode.fieldNameForChild ? foundNode.fieldNameForChild(i) : null;
             if (fieldName === 'return_type' || /^type_annotation$|^return_type$/.test(c.type)) {
                 returnKind = c.type;
                 break;
             }
         }
 
-        let parentKind = null;
-        let p = defNode.parent;
+        let parentKind: string | null = null;
+        let p: Node | null = foundNode.parent;
         while (p) {
             if (DEF_TYPES.has(p.type) || p.type === 'program' || p.type === 'module' || p.type === 'source_file') {
                 parentKind = p.type;
@@ -968,28 +1036,37 @@ export async function getSymbolStructure(source, langName, startLine, endLine) {
             p = p.parent;
         }
 
-        const decorators = [];
-        if (defNode.parent) {
-            const siblings = [];
-            for (let i = 0; i < defNode.parent.childCount; i++) siblings.push(defNode.parent.child(i));
-            const idx = siblings.indexOf(defNode);
+        const decorators: string[] = [];
+        if (foundNode.parent) {
+            const siblings: Node[] = [];
+            for (let i = 0; i < foundNode.parent.childCount; i++) {
+                const sibling = foundNode.parent.child(i);
+                if (sibling) siblings.push(sibling);
+            }
+            const idx = siblings.indexOf(foundNode);
             for (let i = idx - 1; i >= 0; i--) {
                 if (siblings[i].type === 'decorator') decorators.unshift(siblings[i].type);
                 else break;
             }
         }
-        for (let i = 0; i < defNode.childCount; i++) {
-            const c = defNode.child(i);
-            if (c.type === 'decorator') decorators.push(c.type);
+        for (let i = 0; i < foundNode.childCount; i++) {
+            const c = foundNode.child(i);
+            if (c && c.type === 'decorator') decorators.push(c.type);
         }
 
         const MODIFIER_TYPES = new Set(['async', 'static', 'public', 'private', 'protected', 'readonly', '*']);
-        const modifiers = new Set();
-        function collectModifiers(node) {
+        const modifiers = new Set<string>();
+        function collectModifiers(node: Node): void {
             if (MODIFIER_TYPES.has(node.type)) modifiers.add(node.type);
-            for (let i = 0; i < node.childCount; i++) collectModifiers(node.child(i));
+            for (let i = 0; i < node.childCount; i++) {
+                const child = node.child(i);
+                if (child) collectModifiers(child);
+            }
         }
-        for (let i = 0; i < defNode.childCount; i++) collectModifiers(defNode.child(i));
+        for (let i = 0; i < foundNode.childCount; i++) {
+            const child = foundNode.child(i);
+            if (child) collectModifiers(child);
+        }
 
         return {
             params,

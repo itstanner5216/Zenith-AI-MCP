@@ -233,7 +233,23 @@ export async function ripgrepAvailable() {
     } catch { return false; }
 }
 
-export async function ripgrepSearch(rootPath: string, options: any = {}) {
+export interface RipgrepResult {
+    file: string;
+    line: number;
+    content: string;
+}
+
+export async function ripgrepSearch(rootPath: string, options: {
+    contentQuery?: string;
+    filePattern?: string | null;
+    ignoreCase?: boolean;
+    maxResults?: number;
+    excludePatterns?: string[];
+    contextLines?: number;
+    literalSearch?: boolean;
+    includeHidden?: boolean;
+    fileList?: string[] | null;
+} = {}): Promise<RipgrepResult[] | null> {
     const { contentQuery, filePattern = null, ignoreCase = true, maxResults = 50, excludePatterns = [], contextLines = 0, literalSearch = false, includeHidden = false, fileList = null } = options;
     const rgArgs = ['--json', '--max-count', '100', '-m', '500'];
     if (ignoreCase) rgArgs.push('-i');
@@ -245,10 +261,10 @@ export async function ripgrepSearch(rootPath: string, options: any = {}) {
         const includeGlob = filePattern.includes('/') ? filePattern : `**/${filePattern}`;
         rgArgs.push('--glob', includeGlob);
     }
-    rgArgs.push('--', contentQuery);
+    rgArgs.push('--', contentQuery ?? '');
     if (fileList && fileList.length > 0) for (const f of fileList) rgArgs.push(f); else rgArgs.push(rootPath);
-    return new Promise((resolveP) => {
-        const results: any[] = [];
+    return new Promise<RipgrepResult[] | null>((resolveP) => {
+        const results: RipgrepResult[] = [];
         let stderr = '';
         const proc = spawn(RG_PATH, rgArgs, { timeout: 30000 });
         let buffer = '';
@@ -283,7 +299,12 @@ export async function ripgrepSearch(rootPath: string, options: any = {}) {
     });
 }
 
-export async function ripgrepFindFiles(rootPath: string, options: any = {}) {
+export async function ripgrepFindFiles(rootPath: string, options: {
+    namePattern?: string | null;
+    pathContains?: string | null;
+    maxResults?: number;
+    excludePatterns?: string[];
+} = {}): Promise<string[] | null> {
     const { namePattern = null, pathContains = null, maxResults = 100, excludePatterns = [] } = options;
     const rgArgs = ['--files'];
     for (const p of DEFAULT_EXCLUDES) {
@@ -293,7 +314,7 @@ export async function ripgrepFindFiles(rootPath: string, options: any = {}) {
     for (const pat of excludePatterns) rgArgs.push('--glob', `!${pat}`);
     if (namePattern) rgArgs.push('--glob', namePattern);
     rgArgs.push(rootPath);
-    return new Promise((resolveP) => {
+    return new Promise<string[] | null>((resolveP) => {
         const results: string[] = [];
         let buffer = '';
         const proc = spawn(RG_PATH, rgArgs, { timeout: 30000 });

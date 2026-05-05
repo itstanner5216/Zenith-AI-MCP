@@ -3,10 +3,54 @@ import { normalizeLineEndings } from '../core/lib.js';
 import { getLangForFile, findSymbol, checkSyntaxErrors } from '../core/tree-sitter.js';
 
 // ---------------------------------------------------------------------------
+// Edit interfaces
+// ---------------------------------------------------------------------------
+
+export interface Edit {
+    filePath?: string;
+    oldText?: string;
+    newText?: string;
+    isBatch?: boolean;
+    disambiguations?: Map<number, { startLine?: number; nearLine?: number }>;
+    mode?: 'block' | 'symbol' | 'content';
+    block_start?: string;
+    block_end?: string;
+    replacement_block?: string;
+    nearLine?: number;
+    symbol?: string;
+    oldContent?: string;
+    newContent?: string;
+}
+
+interface ApplyEditListOptions {
+    filePath?: string;
+    isBatch?: boolean;
+    disambiguations?: Map<number, { startLine?: number; nearLine?: number }>;
+}
+
+interface MatchResult {
+    index: number;
+    matchedText: string;
+    strategy: 'exact' | 'trim-trailing' | 'indent-stripped';
+}
+
+interface PendingSnapshot {
+    symbol: string | undefined;
+    originalText: string;
+    line: number;
+    filePath: string | undefined;
+}
+
+interface EditError {
+    i: number;
+    msg: string;
+}
+
+// ---------------------------------------------------------------------------
 // Content-match helpers (lifted verbatim from edit_file.js lines 283-409)
 // ---------------------------------------------------------------------------
 
-function findMatch(content, oldText, nearLine) {
+function findMatch(content: string, oldText: string, nearLine: number | undefined): MatchResult | null {
     const normalizedOld = normalizeLineEndings(oldText);
 
     // Strategy 1: Exact match
@@ -16,8 +60,8 @@ function findMatch(content, oldText, nearLine) {
     }
 
     // Strategy 2: Trimmed trailing whitespace match
-    const contentLinesTrimmed = content.split('\n').map(l => l.trimEnd());
-    const oldLinesTrimmed = normalizedOld.split('\n').map(l => l.trimEnd());
+    const contentLinesTrimmed = content.split('\n').map((l: string) => l.trimEnd());
+    const oldLinesTrimmed = normalizedOld.split('\n').map((l: string) => l.trimEnd());
     const trimmedContent = contentLinesTrimmed.join('\n');
     const trimmedOld = oldLinesTrimmed.join('\n');
     const trimIdx = findOccurrence(trimmedContent, trimmedOld, nearLine);
@@ -32,7 +76,7 @@ function findMatch(content, oldText, nearLine) {
     // Strategy 3: Indentation-stripped match
     const oldLines = normalizedOld.split('\n');
     const contentLines = content.split('\n');
-    const strippedOld = oldLines.map(l => l.trim());
+    const strippedOld = oldLines.map((l: string) => l.trim());
 
     const searchStart = nearLine ? Math.max(0, nearLine - 50) : 0;
     const searchEnd = nearLine ? Math.min(contentLines.length, nearLine + 50) : contentLines.length;
@@ -56,12 +100,12 @@ function findMatch(content, oldText, nearLine) {
     return null;
 }
 
-function findOccurrence(haystack, needle, nearLine) {
+function findOccurrence(haystack: string, needle: string, nearLine: number | undefined): number {
     if (!nearLine) {
         return haystack.indexOf(needle);
     }
 
-    const occurrences = [];
+    const occurrences: number[] = [];
     let pos = 0;
     while (true) {
         const idx = haystack.indexOf(needle, pos);
@@ -86,7 +130,7 @@ function findOccurrence(haystack, needle, nearLine) {
     return best;
 }
 
-function mapTrimmedIndex(original, trimmed, trimmedIdx, trimmedLen) {
+function mapTrimmedIndex(original: string, trimmed: string, trimmedIdx: number, trimmedLen: number): number {
     const trimmedBefore = trimmed.slice(0, trimmedIdx);
     const lineNum = trimmedBefore.split('\n').length - 1;
     const normalizedOrig = normalizeLineEndings(original);
@@ -98,7 +142,7 @@ function mapTrimmedIndex(original, trimmed, trimmedIdx, trimmedLen) {
     return origIdx;
 }
 
-function findOriginalEnd(content, startIdx, numLines) {
+function findOriginalEnd(content: string, startIdx: number, numLines: number): number {
     let pos = startIdx;
     for (let i = 0; i < numLines; i++) {
         const nextNewline = content.indexOf('\n', pos);
@@ -108,7 +152,7 @@ function findOriginalEnd(content, startIdx, numLines) {
     return pos - 1;
 }
 
-function generateDiagnostic(content, oldText, editIndex, isBatch) {
+function generateDiagnostic(content: string, oldText: string, editIndex: number, isBatch: boolean | undefined): string {
     const tag = isBatch ? `Edit #${editIndex + 1}: ` : '';
     const oldLines = normalizeLineEndings(oldText).split('\n');
     const firstOldLine = oldLines[0].trim();
@@ -138,10 +182,10 @@ function generateDiagnostic(content, oldText, editIndex, isBatch) {
 // applyEditList — pure function, no I/O
 // ---------------------------------------------------------------------------
 
-async function applyEditList(content, edits, { filePath, isBatch, disambiguations } = {}) {
+async function applyEditList(content: string, edits: Edit[], { filePath, isBatch, disambiguations }: ApplyEditListOptions = {}): Promise<{ workingContent: string; errors: EditError[]; pendingSnapshots: PendingSnapshot[] }> {
     let workingContent = content;
-    const errors = [];
-    const pendingSnapshots = [];
+    const errors: EditError[] = [];
+    const pendingSnapshots: PendingSnapshot[] = [];
 
     for (let i = 0; i < edits.length; i++) {
         const edit = edits[i];
@@ -150,10 +194,10 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
         // BLOCK mode
         if (edit.mode === 'block') {
             const lines = workingContent.split('\n');
-            const expectedStart = edit.block_start.trim();
-            const expectedEnd = edit.block_end.trim();
+            const expectedStart = edit.block_start!.trim();
+            const expectedEnd = edit.block_end!.trim();
 
-            const candidates = [];
+            const candidates: Array<{ start: number; end: number }> = [];
             for (let s = 0; s < lines.length; s++) {
                 if (lines[s].trim() !== expectedStart) continue;
                 for (let e = s; e < lines.length; e++) {
@@ -168,14 +212,14 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
                 continue;
             }
 
-            let chosen;
+            let chosen: { start: number; end: number } | undefined;
             if (candidates.length === 1) {
                 chosen = candidates[0];
             } else {
                 // Check disambiguations map
                 const dis = disambiguations?.get(i);
                 if (dis?.startLine !== undefined) {
-                    chosen = candidates.find(c => c.start === dis.startLine - 1);
+                    chosen = candidates.find(c => c.start === dis.startLine! - 1);
                     if (!chosen) {
                         errors.push({ i, msg: `${tag}no match at line ${dis.startLine}.` });
                         continue;
@@ -187,7 +231,7 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
                 }
             }
 
-            const normalizedNew = normalizeLineEndings(edit.replacement_block);
+            const normalizedNew = normalizeLineEndings(edit.replacement_block!);
             lines.splice(chosen.start, chosen.end - chosen.start + 1, ...normalizedNew.split('\n'));
             workingContent = lines.join('\n');
             continue;
@@ -202,7 +246,7 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
                 errors.push({ i, msg: `${tag}Unsupported file type.` });
                 continue;
             }
-            const symbolMatches = await findSymbol(workingContent, langName, edit.symbol, {
+            const symbolMatches = await findSymbol(workingContent, langName, edit.symbol!, {
                 kindFilter: 'def', nearLine,
             });
             if (!symbolMatches?.length) {
@@ -216,11 +260,11 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
             const sym = symbolMatches[0];
             const lines = workingContent.split('\n');
             const originalText = lines.slice(sym.line - 1, sym.endLine).join('\n');
-            const normalizedNew = normalizeLineEndings(edit.newText);
+            const normalizedNew = normalizeLineEndings(edit.newText!);
             lines.splice(sym.line - 1, sym.endLine - (sym.line - 1), ...normalizedNew.split('\n'));
             workingContent = lines.join('\n');
             pendingSnapshots.push({
-                symbol: edit.symbol,
+                symbol: edit.symbol!,
                 originalText,
                 line: sym.line,
                 filePath: filePath,
@@ -232,17 +276,17 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
         if (edit.mode === 'content') {
             const dis = disambiguations?.get(i);
             const nearLine = dis?.nearLine ?? edit.nearLine;
-            const match = findMatch(workingContent, edit.oldContent, nearLine);
+            const match = findMatch(workingContent, edit.oldContent!, nearLine);
             if (!match) {
-                errors.push({ i, msg: generateDiagnostic(workingContent, edit.oldContent, i, isBatch) });
+                errors.push({ i, msg: generateDiagnostic(workingContent, edit.oldContent!, i, isBatch) });
                 continue;
             }
-            const normalizedNew = normalizeLineEndings(edit.newContent);
+            const normalizedNew = normalizeLineEndings(edit.newContent!);
             if (match.strategy === 'indent-stripped') {
                 const matchedLines = match.matchedText.split('\n');
                 const newLines = normalizedNew.split('\n');
                 const originalIndent = matchedLines[0].match(/^\s*/)?.[0] || '';
-                const oldIndent = normalizeLineEndings(edit.oldContent).split('\n')[0].match(/^\s*/)?.[0] || '';
+                const oldIndent = normalizeLineEndings(edit.oldContent!).split('\n')[0].match(/^\s*/)?.[0] || '';
                 const reindentedNew = newLines.map((line, j) => {
                     if (j === 0) return originalIndent + line.trimStart();
                     const lineIndent = line.match(/^\s*/)?.[0] || '';
@@ -264,7 +308,7 @@ async function applyEditList(content, edits, { filePath, isBatch, disambiguation
 // syntaxWarn — pure computation, no I/O
 // ---------------------------------------------------------------------------
 
-async function syntaxWarn(filePath, content) {
+async function syntaxWarn(filePath: string, content: string): Promise<string> {
     try {
         const ext = path.extname(filePath).toLowerCase();
         if (['.scss', '.mdx', '.jsonc'].includes(ext)) return '';

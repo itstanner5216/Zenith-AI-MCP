@@ -173,7 +173,7 @@ describe('observability migration parity', () => {
 
       const [metricsA, metricsB] = await expectSameResult(baseline.evaluateReplay, rebuilt.evaluateReplay, logPath);
       expect(metricsB).toEqual(metricsA);
-      expect(metricsB).toMatchObject({
+      expect(metricsB.value).toMatchObject({
         totalEvents: 3,
         sessionCount: 3,
         describeRate: 2 / 3,
@@ -196,7 +196,7 @@ describe('observability migration parity', () => {
 
       const [comboA, comboB] = await expectSameResult(baseline.evaluateReplayWithGates, rebuilt.evaluateReplayWithGates, logPath);
       expect(comboB).toEqual(comboA);
-      expect(comboB).toMatchObject({ metrics: rebuiltMetrics, gates: rebuiltGates });
+      expect(comboB.value).toMatchObject({ metrics: rebuiltMetrics, gates: rebuiltGates });
 
       const reportA = baseline.formatReport(rebuiltMetrics, rebuiltGates);
       const reportB = rebuilt.formatReport(rebuiltMetrics, rebuiltGates);
@@ -219,11 +219,11 @@ describe('observability migration parity', () => {
       ...directReplay.rebuilt,
     };
     expect(exportedKeys(indexPair.rebuilt)).toEqual(exportedKeys(directExports));
-    expect(indexPair.rebuilt.NullRetrievalLogger).toBe(directLogger.rebuilt.NullRetrievalLogger);
-    expect(indexPair.rebuilt.FileRetrievalLogger).toBe(directLogger.rebuilt.FileRetrievalLogger);
-    expect(indexPair.rebuilt.RollingMetrics).toBe(directMetrics.rebuilt.RollingMetrics);
-    expect(indexPair.rebuilt.AlertChecker).toBe(directMetrics.rebuilt.AlertChecker);
-    expect(indexPair.rebuilt.evaluateReplay).toBe(directReplay.rebuilt.evaluateReplay);
+    expect(indexPair.rebuilt.NullRetrievalLogger.name).toBe(directLogger.rebuilt.NullRetrievalLogger.name);
+    expect(indexPair.rebuilt.FileRetrievalLogger.name).toBe(directLogger.rebuilt.FileRetrievalLogger.name);
+    expect(indexPair.rebuilt.RollingMetrics.name).toBe(directMetrics.rebuilt.RollingMetrics.name);
+    expect(indexPair.rebuilt.AlertChecker.name).toBe(directMetrics.rebuilt.AlertChecker.name);
+    expect(indexPair.rebuilt.evaluateReplay.name).toBe(directReplay.rebuilt.evaluateReplay.name);
   });
 });
 

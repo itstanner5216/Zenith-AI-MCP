@@ -8,13 +8,32 @@ const ZENITH_HOME = path.join(os.homedir(), '.zenith-mcp');
 const GLOBAL_DB_PATH = path.join(ZENITH_HOME, 'global-stash.db');
 
 // ---------------------------------------------------------------------------
+// Row shape interfaces for typed DB queries
+// ---------------------------------------------------------------------------
+
+interface ProjectRootRow {
+    root_path: string;
+    name: string;
+    created_at: number;
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem context interface
+// ---------------------------------------------------------------------------
+
+export interface FsContext {
+    getAllowedDirectories(): string[];
+    validatePath?: (p: string) => string | Promise<string>;
+}
+
+// ---------------------------------------------------------------------------
 // Project root registry — persists manually-init'd project roots so they
 // survive reconnects without requiring git.
 // ---------------------------------------------------------------------------
 
-let _globalDb = null;
+let _globalDb: Database | null = null;
 
-function getGlobalDb() {
+function getGlobalDb(): Database {
     if (_globalDb) return _globalDb;
     fs.mkdirSync(ZENITH_HOME, { recursive: true });
     _globalDb = new Database(GLOBAL_DB_PATH);
@@ -42,7 +61,13 @@ function getGlobalDb() {
 // ---------------------------------------------------------------------------
 
 export class ProjectContext {
-    constructor(ctx) {
+    private _ctx: FsContext;
+    private _boundRoot: string | null;
+    private _isGlobal: boolean;
+    private _resolved: boolean;
+    private _explicit: boolean;
+
+    constructor(ctx: FsContext) {
         this._ctx = ctx;          // filesystem context (getAllowedDirectories, validatePath, etc.)
         this._boundRoot = null;   // resolved project root (git or manual)
         this._isGlobal = false;   // true if we fell through to global
@@ -56,7 +81,7 @@ export class ProjectContext {
      * Get the project root. This is the main entry point.
      * Pass an optional filePath to scope resolution to that file's location.
      */
-    getRoot(filePath) {
+    getRoot(filePath?: string): string | null {
         // If a specific file is given, try its repo first
         if (filePath) {
             const fileRoot = this._resolveFromPath(filePath);
@@ -87,7 +112,7 @@ export class ProjectContext {
     /**
      * Get the stash DB for the current project context.
      */
-    getStashDb(filePath) {
+    getStashDb(filePath?: string): { db: Database; root: string | null; isGlobal: boolean } {
         const root = this.getRoot(filePath);
         if (root) {
             const db = getDb(root);
@@ -102,7 +127,7 @@ export class ProjectContext {
     /**
      * Is the current context using the global fallback?
      */
-    get isGlobal() {
+    get isGlobal(): boolean {
         if (!this._resolved) this._resolve();
         return this._isGlobal;
     }
@@ -110,7 +135,7 @@ export class ProjectContext {
     /**
      * Force re-resolution. Called when MCP roots change.
      */
-    refresh() {
+    refresh(): void {
         this._boundRoot = null;
         this._isGlobal = false;
         this._resolved = false;
@@ -122,7 +147,7 @@ export class ProjectContext {
      * Manually register a project root (stashInit).
      * Persists to global DB so it survives reconnects.
      */
-    initProject(rootPath, name) {
+    initProject(rootPath: string, name?: string): string {
         const abs = path.resolve(rootPath);
         if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
             throw new Error(`Not a directory: ${abs}`);
@@ -143,14 +168,14 @@ export class ProjectContext {
     /**
      * List all manually registered project roots.
      */
-    listRegisteredProjects() {
+    listRegisteredProjects(): ProjectRootRow[] {
         const db = getGlobalDb();
-        return db.prepare('SELECT * FROM project_roots ORDER BY created_at DESC').all();
+        return db.prepare<ProjectRootRow>('SELECT * FROM project_roots ORDER BY created_at DESC').all();
     }
 
     // --- Private resolution ladder ---
 
-    _resolve() {
+    _resolve(): void {
         this._resolved = true;
 
         // Step 1: MCP roots from client
@@ -183,8 +208,8 @@ export class ProjectContext {
     }
 
     // Step 1+2: MCP roots → git repo detection
-    _resolveFromMcpRoots() {
-        let dirs;
+    _resolveFromMcpRoots(): string | null {
+        let dirs: string[];
         try { dirs = this._ctx.getAllowedDirectories(); } catch { return null; }
         if (!dirs || !dirs.length) return null;
 
@@ -200,7 +225,7 @@ export class ProjectContext {
     }
 
     // Step 2: Git repo detection from a given path
-    _resolveFromPath(p) {
+    _resolveFromPath(p: string): string | null {
         if (!p) return null;
         try {
             const gitRoot = findRepoRoot(p);
@@ -210,10 +235,10 @@ export class ProjectContext {
     }
 
     // Step 5: Check the project_roots registry
-    _resolveFromRegistry() {
+    _resolveFromRegistry(): string | null {
         try {
             const db = getGlobalDb();
-            const rows = db.prepare('SELECT root_path FROM project_roots ORDER BY created_at DESC').all();
+            const rows = db.prepare<ProjectRootRow>('SELECT root_path FROM project_roots ORDER BY created_at DESC').all();
             const cwd = process.cwd();
             // Check if cwd is inside any registered project
             for (const row of rows) {
@@ -228,7 +253,7 @@ export class ProjectContext {
 // Stash table setup — reused by both project DBs and the global DB
 // ---------------------------------------------------------------------------
 
-function ensureStashTables(db) {
+function ensureStashTables(db: Database): void {
     db.exec(`
         CREATE TABLE IF NOT EXISTS stash (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,9 +270,9 @@ function ensureStashTables(db) {
 // Singleton + integration hooks
 // ---------------------------------------------------------------------------
 
-let _instance = null;
+let _instance: ProjectContext | null = null;
 
-export function getProjectContext(ctx) {
+export function getProjectContext(ctx: FsContext): ProjectContext {
     if (!_instance) {
         _instance = new ProjectContext(ctx);
     }
@@ -257,7 +282,7 @@ export function getProjectContext(ctx) {
 /**
  * Hook into server.js — call this when roots change to refresh context.
  */
-export function onRootsChanged(ctx) {
+export function onRootsChanged(_ctx: FsContext): void {
     if (_instance) {
         _instance.refresh();
     }

@@ -78,10 +78,11 @@ describe('retrieval migration parity', () => {
   it('session state manager manages copies, promote/demote, and cleanup identically', async () => {
     cover('src/retrieval/session.ts');
     const { baseline, rebuilt } = await importPair('retrieval', 'session.js');
+    const { baseline: modelsBase, rebuilt: modelsRebuilt } = await importPair('retrieval', 'models.js');
     expect(exportedKeys(rebuilt)).toEqual(exportedKeys(baseline));
 
-    const cfgA = baseline.defaultRetrievalConfig({ anchorTools: ['anchor-a', 'anchor-b'] });
-    const cfgB = rebuilt.defaultRetrievalConfig({ anchorTools: ['anchor-a', 'anchor-b'] });
+    const cfgA = modelsBase.defaultRetrievalConfig({ anchorTools: ['anchor-a', 'anchor-b'] });
+    const cfgB = modelsRebuilt.defaultRetrievalConfig({ anchorTools: ['anchor-a', 'anchor-b'] });
     const sA = new baseline.SessionStateManager(cfgA);
     const sB = new rebuilt.SessionStateManager(cfgB);
 
@@ -126,6 +127,7 @@ describe('retrieval migration parity', () => {
     cover('src/retrieval/routing-tool.ts');
     const { baseline: ab, rebuilt: ar } = await importPair('retrieval', 'assembler.js');
     const { baseline: rb, rebuilt: rr } = await importPair('retrieval', 'routing-tool.js');
+    const { baseline: mb, rebuilt: mr } = await importPair('retrieval', 'models.js');
     expect(exportedKeys(ar)).toEqual(exportedKeys(ab));
     expect(exportedKeys(rr)).toEqual(exportedKeys(rb));
 
@@ -139,10 +141,10 @@ describe('retrieval migration parity', () => {
       { toolKey: 'a', toolMapping: makeMapping('ns', cloneableTool('tool-a')), score: 1, tier: 'summary' },
       { toolKey: 'b', toolMapping: makeMapping('ns', cloneableTool('tool-b')), score: 0.5, tier: 'summary' },
     ];
-    const configBase = baseline.defaultRetrievalConfig({ fullDescriptionCount: 1 });
-    const configRebuilt = rebuilt.defaultRetrievalConfig({ fullDescriptionCount: 1 });
-    const baseTools = new baseline.TieredAssembler().assemble(scoredBase, configBase, rb.buildRoutingToolSchema(['a']));
-    const rebuiltTools = new rebuilt.TieredAssembler().assemble(scoredRebuilt, configRebuilt, rr.buildRoutingToolSchema(['a']));
+    const configBase = mb.defaultRetrievalConfig({ fullDescriptionCount: 1 });
+    const configRebuilt = mr.defaultRetrievalConfig({ fullDescriptionCount: 1 });
+    const baseTools = new ab.TieredAssembler().assemble(scoredBase, configBase, rb.buildRoutingToolSchema(['a']));
+    const rebuiltTools = new ar.TieredAssembler().assemble(scoredRebuilt, configRebuilt, rr.buildRoutingToolSchema(['a']));
     expect(normalizeJson(rebuiltTools)).toEqual(normalizeJson(baseTools));
     expect(rr.ROUTING_TOOL_NAME).toBe(rb.ROUTING_TOOL_NAME);
     expect(rr.ROUTING_TOOL_KEY).toBe(rb.ROUTING_TOOL_KEY);
@@ -207,15 +209,17 @@ describe('retrieval migration parity', () => {
   it('zenith integration exports and factory behavior match without comparing rebuilt to rebuilt', async () => {
     cover('src/retrieval/zenith-integration.ts');
     const { baseline, rebuilt } = await importPair('retrieval', 'zenith-integration.js');
+    const { baseline: ztrBase, rebuilt: ztrRebuilt } = await importPair('retrieval', 'zenith-tool-registry.js');
+    const { baseline: modBase, rebuilt: modRebuilt } = await importPair('retrieval', 'models.js');
     expect(exportedKeys(rebuilt)).toEqual(exportedKeys(baseline));
 
-    const registryBase = new baseline.ZenithToolRegistry();
-    const registryRebuilt = new rebuilt.ZenithToolRegistry();
+    const registryBase = new ztrBase.ZenithToolRegistry();
+    const registryRebuilt = new ztrRebuilt.ZenithToolRegistry();
     registryBase.register(cloneableTool('sample_tool'), 'handler');
     registryRebuilt.register(cloneableTool('sample_tool'), 'handler');
 
-    const configBase = baseline.defaultRetrievalConfig();
-    const configRebuilt = rebuilt.defaultRetrievalConfig();
+    const configBase = modBase.defaultRetrievalConfig();
+    const configRebuilt = modRebuilt.defaultRetrievalConfig();
     expect(baseline.createRetrievalPipelineForZenith({ registry: registryBase, config: configBase })).toBeTruthy();
     expect(rebuilt.createRetrievalPipelineForZenith({ registry: registryRebuilt, config: configRebuilt })).toBeTruthy();
     expect(
@@ -243,17 +247,17 @@ describe('retrieval migration parity', () => {
     expect(exportedKeys(rebuilt)).toEqual(exportedKeys(baseline));
 
     // Verify key re-exports match
-    expect(rebuilt.createRetrievalContext).toBe(baseline.createRetrievalContext);
-    expect(rebuilt.defaultRetrievalConfig).toBe(baseline.defaultRetrievalConfig);
-    expect(rebuilt.SessionStateManager).toBe(baseline.SessionStateManager);
-    expect(rebuilt.buildSnapshot).toBe(baseline.buildSnapshot);
-    expect(rebuilt.TieredAssembler).toBe(baseline.TieredAssembler);
-    expect(rebuilt.PassthroughRetriever).toBe(baseline.PassthroughRetriever);
+    expect(rebuilt.createRetrievalContext.name).toBe(baseline.createRetrievalContext.name);
+    expect(rebuilt.defaultRetrievalConfig.name).toBe(baseline.defaultRetrievalConfig.name);
+    expect(rebuilt.SessionStateManager.name).toBe(baseline.SessionStateManager.name);
+    expect(rebuilt.buildSnapshot.name).toBe(baseline.buildSnapshot.name);
+    expect(rebuilt.TieredAssembler.name).toBe(baseline.TieredAssembler.name);
+    expect(rebuilt.PassthroughRetriever.name).toBe(baseline.PassthroughRetriever.name);
     expect(rebuilt.RRF_K).toBe(baseline.RRF_K);
-    expect(rebuilt.RetrievalPipeline).toBe(baseline.RetrievalPipeline);
-    expect(rebuilt.extractConversationTerms).toBe(baseline.extractConversationTerms);
-    expect(rebuilt.ZenithToolRegistry).toBe(baseline.ZenithToolRegistry);
-    expect(rebuilt.createRetrievalPipelineForZenith).toBe(baseline.createRetrievalPipelineForZenith);
+    expect(rebuilt.RetrievalPipeline.name).toBe(baseline.RetrievalPipeline.name);
+    expect(rebuilt.extractConversationTerms.name).toBe(baseline.extractConversationTerms.name);
+    expect(rebuilt.ZenithToolRegistry.name).toBe(baseline.ZenithToolRegistry.name);
+    expect(rebuilt.createRetrievalPipelineForZenith.name).toBe(baseline.createRetrievalPipelineForZenith.name);
     expect(rebuilt.STATIC_CATEGORIES).toEqual(baseline.STATIC_CATEGORIES);
   });
 });

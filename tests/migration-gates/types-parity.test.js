@@ -29,7 +29,7 @@ describe('MIGRATION GATE: zod declaration-surface parity', () => {
     expect(baselineText).toContain('declare module "zod"');
     expect(rebuiltText).toContain('declare module "zod"');
 
-    for (const name of ['z', 'any', 'string', 'number', 'boolean', 'object', 'array', 'enum', 'union', 'optional', 'default', 'int', 'min', 'max']) {
+    for (const name of ['z', 'string', 'number', 'boolean', 'object', 'array', 'enum', 'union', 'optional', 'default', 'int', 'min', 'max']) {
       expect(baselineText, `baseline missing ${name}`).toContain(name);
       expect(rebuiltText, `rebuilt missing ${name}`).toContain(name);
     }

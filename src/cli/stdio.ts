@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @ts-nocheck
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import fs from "fs/promises";
 import { fileURLToPath } from 'url';

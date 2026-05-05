@@ -120,10 +120,6 @@ let _initPromise = null;
 const _languageCache = new Map(); // lang name → Language object (or null)
 const _queryStringCache = new Map(); // lang name → raw .scm string (or null)
 const _compiledQueryCache = new Map(); // lang name → Query object (or null)
-const _localsQueryCache = new Map();      // lang → raw locals .scm string
-const _injectionsQueryCache = new Map();  // lang → raw injections .scm string
-const _compiledLocalsCache = new Map();   // lang → compiled locals Query
-const _compiledInjectionsCache = new Map(); // lang → compiled injections Query
 // Symbol cache: hash(source) → Symbol[]
 const SYMBOL_CACHE_MAX = 100;
 const _symbolCache = new Map(); // hash → { symbols, ts }
@@ -167,35 +163,12 @@ async function loadLanguage(langName) {
     }
 }
 /**
- * Load the combined tags query string for a language.
- * Tries new subdirectory structure first (definitions.scm + references.scm),
- * falls back to flat {lang}-tags.scm. Cached permanently.
+ * Load the .scm query string for a language. Cached permanently.
  */
 async function loadQueryString(langName) {
     if (_queryStringCache.has(langName)) {
         return _queryStringCache.get(langName);
     }
-    // Try new subdirectory structure first
-    const langDir = path.join(QUERIES_DIR, langName);
-    try {
-        const parts = [];
-        for (const file of ['definitions.scm', 'references.scm']) {
-            try {
-                const content = await fs.readFile(path.join(langDir, file), 'utf-8');
-                parts.push(content.trim());
-            } catch {
-                // File doesn't exist, skip
-            }
-        }
-        if (parts.length > 0) {
-            const combined = parts.join('\n\n') + '\n';
-            _queryStringCache.set(langName, combined);
-            return combined;
-        }
-    } catch {
-        // Directory doesn't exist, fall through
-    }
-    // Fallback: flat {lang}-tags.scm
     const scmPath = path.join(QUERIES_DIR, `${langName}-tags.scm`);
     try {
         const content = await fs.readFile(scmPath, 'utf-8');
@@ -204,78 +177,6 @@ async function loadQueryString(langName) {
     }
     catch {
         _queryStringCache.set(langName, null);
-        return null;
-    }
-}
-/**
- * Load a specific query file (locals.scm or injections.scm) from subdirectory.
- */
-async function loadQueryFile(langName, queryType) {
-    const cache = queryType === 'locals' ? _localsQueryCache : _injectionsQueryCache;
-    if (cache.has(langName)) {
-        return cache.get(langName);
-    }
-    const scmPath = path.join(QUERIES_DIR, langName, `${queryType}.scm`);
-    try {
-        const content = await fs.readFile(scmPath, 'utf-8');
-        cache.set(langName, content);
-        return content;
-    } catch {
-        cache.set(langName, null);
-        return null;
-    }
-}
-/**
- * Get a compiled locals Query object. Cached permanently.
- */
-async function getCompiledLocalsQuery(langName) {
-    if (_compiledLocalsCache.has(langName)) {
-        return _compiledLocalsCache.get(langName);
-    }
-    const language = await loadLanguage(langName);
-    if (!language) {
-        _compiledLocalsCache.set(langName, null);
-        return null;
-    }
-    const queryString = await loadQueryFile(langName, 'locals');
-    if (!queryString) {
-        _compiledLocalsCache.set(langName, null);
-        return null;
-    }
-    try {
-        const query = new Query(language, queryString);
-        _compiledLocalsCache.set(langName, query);
-        return query;
-    } catch (err) {
-        console.error(`Failed to compile locals query for ${langName}:`, err.message);
-        _compiledLocalsCache.set(langName, null);
-        return null;
-    }
-}
-/**
- * Get a compiled injections Query object. Cached permanently.
- */
-async function getCompiledInjectionsQuery(langName) {
-    if (_compiledInjectionsCache.has(langName)) {
-        return _compiledInjectionsCache.get(langName);
-    }
-    const language = await loadLanguage(langName);
-    if (!language) {
-        _compiledInjectionsCache.set(langName, null);
-        return null;
-    }
-    const queryString = await loadQueryFile(langName, 'injections');
-    if (!queryString) {
-        _compiledInjectionsCache.set(langName, null);
-        return null;
-    }
-    try {
-        const query = new Query(language, queryString);
-        _compiledInjectionsCache.set(langName, query);
-        return query;
-    } catch (err) {
-        console.error(`Failed to compile injections query for ${langName}:`, err.message);
-        _compiledInjectionsCache.set(langName, null);
         return null;
     }
 }
@@ -1025,118 +926,6 @@ export async function getSymbolStructure(source, langName, startLine, endLine) {
             decorators,
             modifiers: [...modifiers].sort(),
         };
-    }
-    finally {
-        tree.delete();
-        parser.delete();
-    }
-}
-/**
- * @typedef {Object} ScopeInfo
- * @property {number} startLine - 1-based start line
- * @property {number} endLine   - 1-based end line
- * @property {string} type      - node type that creates the scope
- * @property {Array<{name: string, line: number, column: number, kind: string}>} bindings
- */
-/**
- * Extract scope and local binding information from source code.
- * Uses locals.scm query if available for the language.
- *
- * @param {string} source   - the source code
- * @param {string} langName - tree-sitter language name
- * @returns {Promise<ScopeInfo[]|null>}
- */
-export async function getScopes(source, langName) {
-    const language = await loadLanguage(langName);
-    if (!language) return null;
-    const query = await getCompiledLocalsQuery(langName);
-    if (!query) return null;
-    const parser = new Parser();
-    parser.setLanguage(language);
-    const tree = parser.parse(source);
-    try {
-        const captures = query.captures(tree.rootNode);
-        const scopes = [];
-        const scopeMap = new Map();
-        for (const { name, node } of captures) {
-            if (name === 'scope') {
-                const scope = {
-                    startLine: node.startPosition.row + 1,
-                    endLine: node.endPosition.row + 1,
-                    type: node.type,
-                    bindings: [],
-                };
-                scopes.push(scope);
-                scopeMap.set(node.id, scope);
-            }
-        }
-        // Second pass: assign bindings to innermost containing scope
-        for (const { name, node } of captures) {
-            if (name === 'scope') continue;
-            const line = node.startPosition.row + 1;
-            const column = node.startPosition.column;
-            const text = node.text;
-            let kind;
-            if (name === 'local.definition') kind = 'definition';
-            else if (name === 'local.parameter') kind = 'parameter';
-            else if (name === 'local.reference') kind = 'reference';
-            else continue;
-            let target = null;
-            for (const scope of scopes) {
-                if (scope.startLine <= line && scope.endLine >= line) {
-                    if (!target || (scope.endLine - scope.startLine) < (target.endLine - target.startLine)) {
-                        target = scope;
-                    }
-                }
-            }
-            if (target) {
-                target.bindings.push({ name: text, line, column, kind });
-            }
-        }
-        return scopes;
-    }
-    finally {
-        tree.delete();
-        parser.delete();
-    }
-}
-/**
- * Get language injections from source code.
- * Uses injections.scm query if available for the language.
- *
- * @param {string} source   - the source code
- * @param {string} langName - tree-sitter language name
- * @returns {Promise<Array<{language: string, startLine: number, endLine: number, content: string}>|null>}
- */
-export async function getInjections(source, langName) {
-    const language = await loadLanguage(langName);
-    if (!language) return null;
-    const query = await getCompiledInjectionsQuery(langName);
-    if (!query) return null;
-    const parser = new Parser();
-    parser.setLanguage(language);
-    const tree = parser.parse(source);
-    try {
-        const matches = query.matches(tree.rootNode);
-        const injections = [];
-        for (const match of matches) {
-            const { captures } = match;
-            let langNode = null;
-            let contentNode = null;
-            for (const cap of captures) {
-                if (cap.name === 'injection.language') langNode = cap.node;
-                else if (cap.name === 'injection.content') contentNode = cap.node;
-            }
-            if (contentNode) {
-                injections.push({
-                    language: langNode ? langNode.text.toLowerCase() : null,
-                    startLine: contentNode.startPosition.row + 1,
-                    endLine: contentNode.endPosition.row + 1,
-                    content: contentNode.text,
-                });
-            }
-        }
-        return injections;
     }
     finally {
         tree.delete();

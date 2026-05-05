@@ -2,9 +2,11 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
-import { DEFAULT_EXCLUDES, isSensitive, ripgrepAvailable, ripgrepSearch, ripgrepFindFiles, bm25RankResults, bm25PreFilterFiles, CHAR_BUDGET, RANK_THRESHOLD, } from '../core/shared.js';
+import { DEFAULT_EXCLUDES, isSensitive, ripgrepAvailable, ripgrepSearch, ripgrepFindFiles, bm25RankResults, bm25PreFilterFiles, CHAR_BUDGET, RANK_THRESHOLD } from '../core/shared.js';
+import { RipgrepResult } from '../core/shared.js';
 import { isSupported, getLangForFile, getDefinitions, getStructuralFingerprint, computeStructuralSimilarity, } from '../core/tree-sitter.js';
 import { findRepoRoot, getDb, indexDirectory } from '../core/symbol-index.js';
+import { ToolServer, ToolContext } from './types.js';
 // Smaller budget for content-search results (match snippets, not full files).
 // Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
 const SEARCH_CHAR_BUDGET = (() => {
@@ -12,8 +14,38 @@ const SEARCH_CHAR_BUDGET = (() => {
     return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
 })();
 const DEFAULT_EXCLUDE_GLOBS = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
-export function register(server, ctx) {
-    server.registerTool("search_files", {
+
+interface SymbolDbRow {
+    file_path: string;
+    line: number;
+    end_line: number;
+    kind: string;
+    type: string | null;
+    name: string;
+}
+
+interface SearchFilesArgs {
+    mode: "content" | "files" | "symbol" | "structural" | "definition";
+    path: string;
+    maxResults?: number;
+    contentQuery?: string;
+    pattern?: string;
+    contextLines?: number;
+    literalSearch?: boolean;
+    countOnly?: boolean;
+    includeHidden?: boolean;
+    pathContains?: string;
+    extensions?: string[];
+    namePattern?: string;
+    includeMetadata?: boolean;
+    symbolQuery?: string;
+    symbolKind?: 'function' | 'class' | 'method' | 'interface' | 'type' | 'enum' | 'module' | 'any';
+    structuralQuery?: string;
+    definesSymbol?: string;
+}
+
+export function register(server: ToolServer, ctx: ToolContext) {
+    server.registerTool<SearchFilesArgs>("search_files", {
         title: "Search Files",
         description: "Search file contents, find files, or search symbols.",
         inputSchema: z.object({
@@ -36,7 +68,7 @@ export function register(server, ctx) {
             definesSymbol: z.string().optional().describe("Symbol to find."),
         }),
         annotations: { readOnlyHint: true }
-    }, async (args) => {
+    }, async (args: SearchFilesArgs) => {
         const rootPath = await ctx.validatePath(args.path);
         // ---- SYMBOL SEARCH / LIST MODE ----
         if (args.mode === "symbol") {
@@ -44,7 +76,7 @@ export function register(server, ctx) {
             const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
             // Discover files — reuse ripgrep for speed
             const hasRg = await ripgrepAvailable();
-            let filePaths = [];
+            let filePaths: string[] = [];
             if (hasRg) {
                 const results = await ripgrepFindFiles(rootPath, {
                     namePattern: args.pattern || null,
@@ -56,7 +88,7 @@ export function register(server, ctx) {
             }
             // JS fallback
             if (filePaths.length === 0) {
-                async function walk(dir) {
+                async function walk(dir: string) {
                     if (filePaths.length >= 2000)
                         return;
                     let entries;
@@ -87,13 +119,13 @@ export function register(server, ctx) {
             // Filter to supported files
             const supportedFiles = filePaths.filter(f => isSupported(f));
             if (supportedFiles.length === 0) {
-                return { content: [{ type: "text", text: 'No supported files found.' }] };
+                return { content: [{ type: "text" as const, text: 'No supported files found.' }] };
             }
             const MAX_FILE_SIZE = 512 * 1024;
             const BATCH_SIZE = 50;
-            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : null;
+            const typeFilter = args.symbolKind && args.symbolKind !== 'any' ? args.symbolKind : undefined;
             if (listAll) {
-                const outputLines = [];
+                const outputLines: string[] = [];
                 for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
                     const batch = supportedFiles.slice(i, i + BATCH_SIZE);
                     const results = await Promise.all(batch.map(async (filePath) => {
@@ -124,7 +156,7 @@ export function register(server, ctx) {
                         outputLines.push(`${result.rel}: ${result.names.join(', ')}`);
                     }
                 }
-                const budgetLines = [];
+                const budgetLines: string[] = [];
                 let charCount = 0;
                 for (const line of outputLines) {
                     if (charCount + line.length + 1 > CHAR_BUDGET)
@@ -132,12 +164,12 @@ export function register(server, ctx) {
                     budgetLines.push(line);
                     charCount += line.length + 1;
                 }
-                return { content: [{ type: "text", text: budgetLines.join('\n') }] };
+                return { content: [{ type: "text" as const, text: budgetLines.join('\n') }] };
             }
             else {
                 // ---- SYMBOL QUERY MODE ----
                 const symbolQuery = args.symbolQuery;
-                const outputLines = [];
+                const outputLines: string[] = [];
                 for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
                     const batch = supportedFiles.slice(i, i + BATCH_SIZE);
                     const results = await Promise.all(batch.map(async (filePath) => {
@@ -177,7 +209,7 @@ export function register(server, ctx) {
                     if (outputLines.length >= userMaxResults)
                         break;
                 }
-                const budgetLines = [];
+                const budgetLines: string[] = [];
                 let charCount = 0;
                 for (const line of outputLines.slice(0, userMaxResults)) {
                     if (charCount + line.length + 1 > CHAR_BUDGET)
@@ -186,14 +218,14 @@ export function register(server, ctx) {
                     charCount += line.length + 1;
                 }
                 const text = budgetLines.length > 0 ? budgetLines.join('\n') : 'No matches.';
-                return { content: [{ type: "text", text }] };
+                return { content: [{ type: "text" as const, text }] };
             }
         }
         // ---- STRUCTURAL SIMILARITY MODE ----
         if (args.mode === "structural") {
             const repoRoot = findRepoRoot(rootPath);
             if (!repoRoot) {
-                return { content: [{ type: 'text', text: 'Not in a git repository.' }] };
+                return { content: [{ type: 'text' as const, text: 'Not in a git repository.' }] };
             }
             const db = getDb(repoRoot);
             await indexDirectory(db, repoRoot, rootPath, { maxFiles: 2000 });
@@ -201,36 +233,37 @@ export function register(server, ctx) {
             const qBaseQuery = scopePrefix
                 ? 'SELECT file_path, line, end_line, kind, type FROM symbols WHERE name = ? AND kind = ? AND file_path LIKE ?'
                 : 'SELECT file_path, line, end_line, kind, type FROM symbols WHERE name = ? AND kind = ?';
-            const qBaseParams = scopePrefix
+            const qBaseParams: unknown[] = scopePrefix
                 ? [args.structuralQuery, 'def', `${scopePrefix}%`]
                 : [args.structuralQuery, 'def'];
-            const qRows = db.prepare(qBaseQuery).all(...qBaseParams);
+            const qRows = db.prepare<SymbolDbRow>(qBaseQuery).all(...qBaseParams);
             if (qRows.length === 0) {
-                return { content: [{ type: 'text', text: `Symbol "${args.structuralQuery}" not found in index.` }] };
+                return { content: [{ type: 'text' as const, text: `Symbol "${args.structuralQuery}" not found in index.` }] };
             }
             if (qRows.length > 1) {
                 const candidates = qRows.map((r, i) => `${String.fromCharCode(97 + i)}) ${r.file_path}:${r.line}`);
-                return { content: [{ type: 'text', text: `Multiple definitions for "${args.structuralQuery}":\n${candidates.join('\n')}\nNarrow with path.` }] };
+                return { content: [{ type: 'text' as const, text: `Multiple definitions for "${args.structuralQuery}":\n${candidates.join('\n')}\nNarrow with path.` }] };
             }
             const qRow = qRows[0];
             const qAbsPath = path.resolve(repoRoot, qRow.file_path); // nosemgrep
             const qLang = getLangForFile(qAbsPath);
             if (!qLang) {
-                return { content: [{ type: 'text', text: 'Unsupported language.' }] };
+                return { content: [{ type: 'text' as const, text: 'Unsupported language.' }] };
             }
             let qSource;
             try {
                 qSource = await fs.readFile(qAbsPath, 'utf-8');
             }
             catch { // nosemgrep
-                return { content: [{ type: 'text', text: 'Could not read source file.' }] };
+                return { content: [{ type: 'text' as const, text: 'Could not read source file.' }] };
             }
             const queryFp = await getStructuralFingerprint(qSource, qLang, qRow.line, qRow.end_line);
             if (!queryFp || queryFp.length === 0) {
-                return { content: [{ type: 'text', text: 'Could not compute fingerprint.' }] };
+                return { content: [{ type: 'text' as const, text: 'Could not compute fingerprint.' }] };
             }
             const candType = (args.symbolKind && args.symbolKind !== 'any') ? args.symbolKind : (qRow.type || null);
-            let candQuery, candParams;
+            let candQuery: string;
+            let candParams: unknown[];
             if (scopePrefix && candType) {
                 candQuery = `SELECT name, file_path, line, end_line FROM symbols WHERE kind = 'def' AND type = ? AND file_path LIKE ? ORDER BY name`;
                 candParams = [candType, `${scopePrefix}%`];
@@ -247,10 +280,10 @@ export function register(server, ctx) {
                 candQuery = `SELECT name, file_path, line, end_line FROM symbols WHERE kind = 'def' ORDER BY name`;
                 candParams = [];
             }
-            const candidates = db.prepare(candQuery).all(...candParams);
+            const candidates = db.prepare<SymbolDbRow>(candQuery).all(...candParams);
             const userMax = Math.min(50, args.maxResults ?? 20);
-            const matches = [];
-            const fileCache = new Map();
+            const matches: Array<{ name: string; filePath: string; line: number; score: number }> = [];
+            const fileCache = new Map<string, string | null>();
             let charCount = 0;
             for (const cand of candidates) {
                 if (cand.name === args.structuralQuery && cand.file_path === qRow.file_path)
@@ -282,9 +315,9 @@ export function register(server, ctx) {
             matches.sort((a, b) => b.score - a.score);
             const top = matches.slice(0, userMax);
             if (top.length === 0) {
-                return { content: [{ type: 'text', text: 'No structurally similar symbols found.' }] };
+                return { content: [{ type: 'text' as const, text: 'No structurally similar symbols found.' }] };
             }
-            const outLines = [];
+            const outLines: string[] = [];
             charCount = 0;
             for (const r of top) {
                 const line = `${r.filePath}:${r.line}  [${(r.score * 100).toFixed(0)}%] ${r.name}`;
@@ -293,15 +326,15 @@ export function register(server, ctx) {
                 outLines.push(line);
                 charCount += line.length + 1;
             }
-            return { content: [{ type: 'text', text: outLines.join('\n') }] };
+            return { content: [{ type: 'text' as const, text: outLines.join('\n') }] };
         }
         // ---- DEFINITION MODE (find files defining a symbol) ----
         if (args.mode === "definition") {
             const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 100));
             const hasRg = await ripgrepAvailable();
-            let rawResults = [];
+            let rawResults: string[] = [];
             if (hasRg) {
-                const extGlobs = args.extensions?.length ? args.extensions.map(e => `*${e}`) : null;
+                const extGlobs = args.extensions?.length ? args.extensions.map((e: string) => `*${e}`) : null;
                 const effectivePattern = (extGlobs?.length === 1 && !args.namePattern)
                     ? extGlobs[0]
                     : (args.namePattern || null);
@@ -318,7 +351,7 @@ export function register(server, ctx) {
                 const nameRegex = args.namePattern
                     ? new RegExp(args.namePattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.'), 'i')
                     : null;
-                async function walk(dir) {
+                async function walk(dir: string) {
                     if (rawResults.length >= userMaxResults * 5)
                         return;
                     let entries;
@@ -356,17 +389,23 @@ export function register(server, ctx) {
                 await walk(rootPath);
             }
             if (args.extensions?.length) {
-                const extSet = new Set(args.extensions.map(e => e.toLowerCase()));
+                const extSet = new Set(args.extensions.map((e: string) => e.toLowerCase()));
                 rawResults = rawResults.filter(f => extSet.has(path.extname(f).toLowerCase()));
             }
             const supportedFiles = rawResults.filter(f => isSupported(f));
             if (supportedFiles.length === 0) {
-                return { content: [{ type: "text", text: 'No supported files found for symbol search.' }] };
+                return { content: [{ type: "text" as const, text: 'No supported files found for symbol search.' }] };
             }
             const BATCH_SIZE = 50;
             const MAX_FILE_SIZE = 512 * 1024;
-            const symbolName = args.definesSymbol;
-            const symbolMatches = [];
+            const symbolName = args.definesSymbol!;
+            interface DefinitionSymbol {
+                name: string;
+                type: string;
+                line: number;
+                endLine: number;
+            }
+            const symbolMatches: Array<{ filePath: string; matches: DefinitionSymbol[] }> = [];
             for (let i = 0; i < supportedFiles.length; i += BATCH_SIZE) {
                 const batch = supportedFiles.slice(i, i + BATCH_SIZE);
                 const results = await Promise.all(batch.map(async (filePath) => {
@@ -418,23 +457,23 @@ export function register(server, ctx) {
                     break;
             }
             if (symbolMatches.length === 0) {
-                return { content: [{ type: "text", text: 'No matches.' }] };
+                return { content: [{ type: "text" as const, text: 'No matches.' }] };
             }
-            const outputLines = [];
+            const outputLines: string[] = [];
             for (const { filePath, matches } of symbolMatches.slice(0, userMaxResults)) {
                 for (const sym of matches) {
                     outputLines.push(`${filePath}:${sym.line}  [${sym.type}] ${sym.name} (lines ${sym.line}-${sym.endLine})`);
                 }
             }
-            return { content: [{ type: "text", text: outputLines.join('\n') }] };
+            return { content: [{ type: "text" as const, text: outputLines.join('\n') }] };
         }
         // ---- FILES MODE ----
         if (args.mode === "files") {
             const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 100));
             const hasRg = await ripgrepAvailable();
-            let rawResults = [];
+            let rawResults: string[] = [];
             if (hasRg) {
-                const extGlobs = args.extensions?.length ? args.extensions.map(e => `*${e}`) : null;
+                const extGlobs = args.extensions?.length ? args.extensions.map((e: string) => `*${e}`) : null;
                 const effectivePattern = args.pattern
                     || ((extGlobs?.length === 1 && !args.namePattern) ? extGlobs[0] : (args.namePattern || null));
                 const results = await ripgrepFindFiles(rootPath, {
@@ -450,7 +489,7 @@ export function register(server, ctx) {
                 const nameRegex = args.namePattern
                     ? new RegExp(args.namePattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.'), 'i')
                     : null;
-                async function walk(dir) {
+                async function walk(dir: string) {
                     if (rawResults.length >= userMaxResults)
                         return;
                     let entries;
@@ -490,12 +529,12 @@ export function register(server, ctx) {
                 await walk(rootPath);
             }
             if (args.extensions?.length) {
-                const extSet = new Set(args.extensions.map(e => e.toLowerCase()));
+                const extSet = new Set(args.extensions.map((e: string) => e.toLowerCase()));
                 rawResults = rawResults.filter(f => extSet.has(path.extname(f).toLowerCase()));
             }
             rawResults = rawResults.slice(0, userMaxResults);
             rawResults.sort();
-            let outputLines;
+            let outputLines: string[];
             if (args.includeMetadata && rawResults.length > 0) {
                 outputLines = await Promise.all(rawResults.map(async (filePath) => {
                     try {
@@ -512,7 +551,7 @@ export function register(server, ctx) {
             else {
                 outputLines = rawResults;
             }
-            const budgetLines = [];
+            const budgetLines: string[] = [];
             let charCount = 0;
             for (const line of outputLines) {
                 if (charCount + line.length + 1 > CHAR_BUDGET)
@@ -521,7 +560,7 @@ export function register(server, ctx) {
                 charCount += line.length + 1;
             }
             const text = budgetLines.length > 0 ? budgetLines.join('\n') : 'No files found.';
-            return { content: [{ type: "text", text }] };
+            return { content: [{ type: "text" as const, text }] };
         }
         // ---- CONTENT SEARCH MODE ----
         const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
@@ -529,18 +568,18 @@ export function register(server, ctx) {
         const allExcludes = DEFAULT_EXCLUDE_GLOBS;
         const flags = 'gi';
         const contentRegex = args.literalSearch
-            ? new RegExp(args.contentQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags) // nosemgrep
-            : new RegExp(args.contentQuery, flags); // nosemgrep
+            ? new RegExp(args.contentQuery!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags) // nosemgrep
+            : new RegExp(args.contentQuery!, flags); // nosemgrep
         // ---- RIPGREP PATH ----
         const hasRg = await ripgrepAvailable();
         if (hasRg) {
-            let rgResults = null;
-            if (args.contentQuery.length > 2) {
+            let rgResults: RipgrepResult[] | null = null;
+            if (args.contentQuery!.length > 2) {
                 try {
-                    const candidateFiles = await bm25PreFilterFiles(rootPath, args.contentQuery, 100, allExcludes);
+                    const candidateFiles = await bm25PreFilterFiles(rootPath, args.contentQuery!, 100, allExcludes);
                     if (candidateFiles.length > 0) {
                         rgResults = await ripgrepSearch(rootPath, {
-                            contentQuery: args.contentQuery,
+                            contentQuery: args.contentQuery!,
                             filePattern: args.pattern || null,
                             ignoreCase: true,
                             maxResults: Math.max(userMaxResults, 500),
@@ -557,7 +596,7 @@ export function register(server, ctx) {
             }
             if (rgResults === null) {
                 rgResults = await ripgrepSearch(rootPath, {
-                    contentQuery: args.contentQuery,
+                    contentQuery: args.contentQuery!,
                     filePattern: args.pattern || null,
                     ignoreCase: true,
                     maxResults: Math.max(userMaxResults, 500),
@@ -569,16 +608,16 @@ export function register(server, ctx) {
             }
             if (rgResults !== null) {
                 if (rgResults.length === 0) {
-                    return { content: [{ type: "text", text: 'No matches.' }] };
+                    return { content: [{ type: "text" as const, text: 'No matches.' }] };
                 }
                 if (args.countOnly) {
                     const fileSet = new Set(rgResults.map(r => r.file));
-                    return { content: [{ type: "text", text: `matches: ${rgResults.length}\nfiles: ${fileSet.size}` }] };
+                    return { content: [{ type: "text" as const, text: `matches: ${rgResults.length}\nfiles: ${fileSet.size}` }] };
                 }
                 const rawLines = rgResults.map(r => `${r.file}:${r.line}: ${r.content}`);
-                let outputLines;
+                let outputLines: string[];
                 if (rawLines.length > RANK_THRESHOLD) {
-                    const { ranked } = bm25RankResults(rawLines, args.contentQuery, SEARCH_CHAR_BUDGET);
+                    const { ranked } = bm25RankResults(rawLines, args.contentQuery!, SEARCH_CHAR_BUDGET);
                     outputLines = ranked;
                 }
                 else {
@@ -591,15 +630,15 @@ export function register(server, ctx) {
                         charCount += line.length + 1;
                     }
                 }
-                return { content: [{ type: "text", text: outputLines.join('\n') }] };
+                return { content: [{ type: "text" as const, text: outputLines.join('\n') }] };
             }
         }
         // ------------------------------------------------------------------
         // JS fallback (content mode)
         // ------------------------------------------------------------------
-        const contentResults = [];
+        const contentResults: string[] = [];
         const maxJsFallback = Math.min(200, userMaxResults);
-        async function grepFile(filePath) {
+        async function grepFile(filePath: string) {
             if (contentResults.length >= maxJsFallback)
                 return;
             try {
@@ -615,7 +654,7 @@ export function register(server, ctx) {
             }
             catch { /* skip binary/unreadable */ }
         }
-        async function walk(dir) {
+        async function walk(dir: string) {
             if (contentResults.length >= maxJsFallback)
                 return;
             let entries;
@@ -646,11 +685,11 @@ export function register(server, ctx) {
         await walk(rootPath);
         if (args.countOnly) {
             const fileSet = new Set(contentResults.map(r => r.split(':')[0]));
-            return { content: [{ type: "text", text: `matches: ${contentResults.length}\nfiles: ${fileSet.size}` }] };
+            return { content: [{ type: "text" as const, text: `matches: ${contentResults.length}\nfiles: ${fileSet.size}` }] };
         }
-        let finalOutput;
+        let finalOutput: string[];
         if (contentResults.length > RANK_THRESHOLD) {
-            const { ranked } = bm25RankResults(contentResults, args.contentQuery, SEARCH_CHAR_BUDGET);
+            const { ranked } = bm25RankResults(contentResults, args.contentQuery!, SEARCH_CHAR_BUDGET);
             finalOutput = ranked;
         }
         else {
@@ -664,6 +703,6 @@ export function register(server, ctx) {
             }
         }
         const text = finalOutput.length > 0 ? finalOutput.join('\n') : 'No matches.';
-        return { content: [{ type: "text", text }] };
+        return { content: [{ type: "text" as const, text }] };
     });
 }

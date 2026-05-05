@@ -1,13 +1,35 @@
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
+import { Dirent } from "fs";
 import { minimatch } from "minimatch";
 import { formatSize } from '../core/lib.js';
 import { DEFAULT_EXCLUDES } from '../core/shared.js';
 import { isSupported, getFileSymbolSummary, getFileSymbols } from '../core/tree-sitter.js';
+import type { ToolServer, ToolContext } from './types.js';
+
 const LIST_CAP = 250;
 const TREE_MAX_ENTRIES = 500;
-export function register(server, ctx) {
+
+interface FileTreeEntry {
+    name: string;
+    children?: FileTreeEntry[];
+    symbols?: string;
+    symbolNames?: string[];
+}
+
+interface DirectoryArgs {
+    mode: "list" | "tree";
+    path?: string;
+    depth?: number;
+    includeSizes?: boolean;
+    sortBy?: "name" | "size";
+    excludePatterns?: string[];
+    showSymbols?: boolean;
+    showSymbolNames?: boolean;
+}
+
+export function register(server: ToolServer, ctx: ToolContext): void {
     server.registerTool("directory", {
         title: "Directory",
         description: "List directory contents or show a recursive tree.",
@@ -22,15 +44,15 @@ export function register(server, ctx) {
             showSymbolNames: z.boolean().optional().default(false).describe("Show symbol names."),
         }),
         annotations: { readOnlyHint: true }
-    }, async (args) => {
+    }, async (args: DirectoryArgs) => {
         if (args.mode === "list") {
-            const validPath = await ctx.validatePath(args.path);
+            const validPath = await ctx.validatePath(args.path ?? '');
             const depth = Math.max(1, Math.min(args.depth || 1, 10));
             const includeSizes = args.includeSizes || false;
             const sortBy = args.sortBy || "name";
-            async function listRecursive(dirPath, currentDepth, relativeBase) {
-                const lines = [];
-                let entries;
+            async function listRecursive(dirPath: string, currentDepth: number, relativeBase: string): Promise<string[]> {
+                const lines: string[] = [];
+                let entries: Dirent[];
                 try {
                     entries = await fs.readdir(dirPath, { withFileTypes: true });
                 }
@@ -63,7 +85,7 @@ export function register(server, ctx) {
                     if (entry.isDirectory()) {
                         lines.push(`${rel}/`);
                         if (currentDepth + 1 < depth) {
-                            const subLines = await listRecursive(path.join(dirPath, entry.name), currentDepth + 1, rel);
+                            const subLines: string[] = await listRecursive(path.join(dirPath, entry.name), currentDepth + 1, rel);
                             lines.push(...subLines);
                         }
                     }
@@ -79,21 +101,21 @@ export function register(server, ctx) {
             return { content: [{ type: "text", text: lines.join("\n") }] };
         }
         // mode === "tree"
-        const rootPath = args.path;
+        const rootPath = args.path ?? '';
         const showSymbols = args.showSymbols || args.showSymbolNames || false;
         const showSymbolNames = args.showSymbolNames || false;
         let totalEntries = 0;
-        async function buildTree(currentPath, excludePatterns = []) {
+        async function buildTree(currentPath: string, excludePatterns: string[] = []): Promise<FileTreeEntry[]> {
             if (totalEntries >= TREE_MAX_ENTRIES)
                 return [];
             const validPath = await ctx.validatePath(currentPath);
             const entries = await fs.readdir(validPath, { withFileTypes: true });
-            const result = [];
-            const fileEntries = [];
-            const dirEntries = [];
+            const result: FileTreeEntry[] = [];
+            const fileEntries: Dirent[] = [];
+            const dirEntries: Dirent[] = [];
             for (const entry of entries) {
                 const relativePath = path.relative(rootPath, path.join(currentPath, entry.name));
-                const shouldExclude = excludePatterns.some(pattern => {
+                const shouldExclude = excludePatterns.some((pattern: string) => {
                     if (pattern.includes('*'))
                         return minimatch(relativePath, pattern, { dot: true });
                     return minimatch(relativePath, pattern, { dot: true }) ||
@@ -110,9 +132,9 @@ export function register(server, ctx) {
                 else
                     fileEntries.push(entry);
             }
-            let symbolResults = null;
+            let symbolResults: Map<string, { summary: string | null; names: string[] | null }> | null = null;
             if (showSymbols && fileEntries.length > 0) {
-                const promises = fileEntries.map(async (entry) => {
+                const promises = fileEntries.map(async (entry): Promise<[string, string | null, string[] | null]> => {
                     const fullPath = path.join(currentPath, entry.name);
                     if (!isSupported(fullPath))
                         return [entry.name, null, null];
@@ -135,13 +157,12 @@ export function register(server, ctx) {
                     }
                 });
                 const results = await Promise.all(promises);
-                symbolResults = new Map(results.map(([name, summary, names]) => [name, { summary, names
-                    }]));
+                symbolResults = new Map(results.map(([name, summary, names]) => [name, { summary, names }]));
             }
             for (const entry of dirEntries) {
                 if (totalEntries >= TREE_MAX_ENTRIES)
                     break;
-                const entryData = {
+                const entryData: FileTreeEntry = {
                     name: entry.name,
                     children: await buildTree(path.join(currentPath, entry.name), excludePatterns)
                 };
@@ -151,7 +172,7 @@ export function register(server, ctx) {
             for (const entry of fileEntries) {
                 if (totalEntries >= TREE_MAX_ENTRIES)
                     break;
-                const entryData = { name: entry.name };
+                const entryData: FileTreeEntry = { name: entry.name };
                 if (symbolResults) {
                     const info = symbolResults.get(entry.name);
                     if (info && info.summary)
@@ -165,8 +186,8 @@ export function register(server, ctx) {
             return result;
         }
         const treeData = await buildTree(rootPath, args.excludePatterns);
-        function escapeControlChars(str) {
-            return str.replace(/[\x00-\x1F\x7F]/g, (char) => {
+        function escapeControlChars(str: string): string {
+            return str.replace(/[\x00-\x1F\x7F]/g, (char: string) => {
                 const code = char.charCodeAt(0);
                 if (code === 0x09)
                     return '\\t';
@@ -177,8 +198,8 @@ export function register(server, ctx) {
                 return `\\x${code.toString(16).padStart(2, '0')}`;
             });
         }
-        function formatIndent(entries, depth = 0) {
-            const lines = [];
+        function formatIndent(entries: FileTreeEntry[], depth = 0): string[] {
+            const lines: string[] = [];
             const indent = '  '.repeat(depth);
             for (const entry of entries) {
                 if (entry.children) {

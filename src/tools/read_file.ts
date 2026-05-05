@@ -4,18 +4,50 @@ import { createInterface } from "readline";
 import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
 import { CHAR_BUDGET } from '../core/shared.js';
 import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
-function countLines(str) {
+import { ToolServer, ToolContext } from './types.js';
+
+interface ReadFileMetadata {
+    totalLines?: number;
+    linesReturned?: number;
+    hasMore?: boolean;
+    truncatedAt?: number;
+}
+
+interface LineWindow {
+    startLine: number;
+    endLine: number;
+}
+
+interface OffsetReadResult {
+    content: string;
+    totalLines: number;
+    linesReturned: number;
+}
+
+function countLines(str: string): number {
     if (!str)
         return 0;
     const n = (str.match(/\n/g) || []).length;
     return str.endsWith('\n') ? n : n + 1;
 }
-export function register(server, ctx) {
-    const handler = async (args) => {
+
+export function register(server: ToolServer, ctx: ToolContext) {
+    const handler = async (args: {
+        path: string;
+        maxChars?: number;
+        head?: number;
+        tail?: number;
+        offset?: number;
+        showLineNumbers?: boolean;
+        compression?: boolean;
+        aroundLine?: number;
+        context?: number;
+        ranges?: Array<{ startLine: number; endLine: number }>;
+    }) => {
         const validPath = await ctx.validatePath(args.path);
         const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
         if (args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0)) {
-            const windows = [];
+            const windows: LineWindow[] = [];
             if (args.aroundLine !== undefined) {
                 const windowRadius = args.context ?? 30;
                 windows.push({
@@ -29,7 +61,7 @@ export function register(server, ctx) {
                 }
             }
             windows.sort((a, b) => a.startLine - b.startLine);
-            const merged = [];
+            const merged: LineWindow[] = [];
             for (const w of windows) {
                 if (merged.length === 0 || w.startLine > merged[merged.length - 1].endLine + 1) {
                     merged.push({ ...w });
@@ -38,13 +70,13 @@ export function register(server, ctx) {
                     merged[merged.length - 1].endLine = Math.max(merged[merged.length - 1].endLine, w.endLine);
                 }
             }
-            const outputLines = [];
+            const outputLines: string[] = [];
             let totalLines = 0;
             let charCount = 0;
             let windowIdx = 0;
             let lastCollectedLine = -1;
             let budgetExhausted = false;
-            await new Promise((resolve, reject) => {
+            await new Promise<void>((resolve, reject) => {
                 const stream = createReadStream(validPath, { encoding: 'utf-8' });
                 const rl = createInterface({ input: stream, crlfDelay: Infinity });
                 rl.on('line', (line) => {
@@ -79,27 +111,27 @@ export function register(server, ctx) {
             });
             const text = (budgetExhausted ? '[truncated]\n' : '') + outputLines.join('\n');
             return {
-                content: [{ type: "text", text }],
+                content: [{ type: "text" as const, text }],
             };
         }
-        let standardReadContent = null;
+        let standardReadContent: string | null = null;
         let standardReadBudget = maxChars;
         if (args.compression) {
             standardReadContent = await readFileContent(validPath);
             const compressed = await compressTextFile(validPath, standardReadContent, maxChars);
             if (compressed !== null) {
-                return { content: [{ type: "text", text: compressed.text }] };
+                return { content: [{ type: "text" as const, text: compressed.text }] };
             }
             standardReadBudget = computeCompressionBudget(standardReadContent.length, maxChars);
         }
-        let content;
-        let meta = {};
+        let content: string | null = null;
+        let meta: ReadFileMetadata = {};
         if (args.tail) {
             content = await tailFile(validPath, args.tail);
         }
         else if (typeof args.offset === 'number' && args.offset >= 0) {
             const length = args.head || 200;
-            const result = await offsetReadFile(validPath, args.offset, length);
+            const result = await offsetReadFile(validPath, args.offset, length) as OffsetReadResult;
             content = result.content;
             meta = {
                 totalLines: result.totalLines,
@@ -129,18 +161,18 @@ export function register(server, ctx) {
             const lines = content.split('\n');
             if (lines[lines.length - 1] === '')
                 lines.pop();
-            content = lines.map((line, i) => `${startLine + i}:${line}`).join('\n');
+            content = lines.map((line: string, i: number) => `${startLine + i}:${line}`).join('\n');
         }
         let metaHeader = '';
         if (truncated && !args.compression) {
             metaHeader = `[truncated offset=${meta.truncatedAt}]\n`;
         }
         if (!truncated && meta.hasMore && !args.compression) {
-            metaHeader = `[offset=${args.offset + meta.linesReturned}]\n`;
+            metaHeader = `[offset=${args.offset! + meta.linesReturned!}]\n`;
         }
         const text = metaHeader + content;
         return {
-            content: [{ type: "text", text }],
+            content: [{ type: "text" as const, text }],
         };
     };
     server.registerTool("read_file", {

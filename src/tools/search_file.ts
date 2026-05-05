@@ -4,8 +4,31 @@ import { createReadStream } from "fs";
 import { createInterface } from "readline";
 import { CHAR_BUDGET } from '../core/shared.js';
 import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
-export function register(server, ctx) {
-    const handler = async (args) => {
+import type { ToolServer, ToolContext } from './types.js';
+
+interface SearchFileArgs {
+    path: string;
+    maxChars?: number;
+    grep?: string;
+    grepContext?: number;
+    symbol?: string;
+    nearLine?: number;
+    expandLines?: number;
+}
+
+interface OutputEntry {
+    num: number;
+    text: string;
+    isMatch: boolean;
+}
+
+interface BufferItem {
+    num: number;
+    text: string;
+}
+
+export function register(server: ToolServer, ctx: ToolContext): void {
+    const handler = async (args: SearchFileArgs) => {
         const validPath = await ctx.validatePath(args.path);
         const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
         if (args.grep) {
@@ -14,13 +37,13 @@ export function register(server, ctx) {
             const beforeCount = grepContext;
             const afterCount = grepContext;
             const hasContext = beforeCount > 0 || afterCount > 0;
-            const outputEntries = [];
+            const outputEntries: OutputEntry[] = [];
             let totalLines = 0;
             let charCount = 0;
-            const beforeBuffer = [];
+            const beforeBuffer: BufferItem[] = [];
             let afterRemaining = 0;
             let lastEmittedLine = 0;
-            function emit(lineNum, line, isMatch) {
+            function emit(lineNum: number, line: string, isMatch: boolean): void {
                 if (outputEntries.length > 0 && lineNum <= outputEntries[outputEntries.length - 1].num)
                     return;
                 if (hasContext && lastEmittedLine > 0 && lineNum > lastEmittedLine + 1) {
@@ -38,7 +61,7 @@ export function register(server, ctx) {
                     lastEmittedLine = lineNum;
                 }
             }
-            await new Promise((resolve, reject) => {
+            await new Promise<void>((resolve, reject) => {
                 const stream = createReadStream(validPath, { encoding: 'utf-8' });
                 const rl = createInterface({ input: stream, crlfDelay: Infinity });
                 rl.on('line', (line) => {
@@ -72,7 +95,7 @@ export function register(server, ctx) {
                 ? outputEntries.map(e => e.text).join('\n')
                 : 'No matches.';
             return {
-                content: [{ type: "text", text: content }],
+                content: [{ type: "text" as const, text: content }],
             };
         }
         if (args.symbol) {
@@ -104,7 +127,7 @@ export function register(server, ctx) {
             });
             const text = numbered.join('\n');
             return {
-                content: [{ type: "text", text }],
+                content: [{ type: "text" as const, text }],
             };
         }
         throw new Error('Provide grep or symbol.');

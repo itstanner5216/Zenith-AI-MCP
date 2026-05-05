@@ -1,8 +1,17 @@
 import { z } from "zod";
 import fs from "fs/promises";
 import { getFileStats } from '../core/lib.js';
-export function register(server, ctx) {
-    server.registerTool("file_manager", {
+import type { ToolServer, ToolContext } from './types.js';
+
+type FilesystemArgs = {
+    mode: "mkdir" | "delete" | "move" | "info";
+    path?: string;
+    source?: string;
+    destination?: string;
+};
+
+export function register(server: ToolServer, ctx: ToolContext) {
+    server.registerTool<FilesystemArgs>("file_manager", {
         title: "Filesystem",
         description: "Create directories, delete files, move/rename, or get file metadata.",
         inputSchema: z.object({
@@ -14,17 +23,17 @@ export function register(server, ctx) {
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
         if (args.mode === "mkdir") {
-            const validPath = await ctx.validatePath(args.path);
+            const validPath = await ctx.validatePath(args.path!);
             await fs.mkdir(validPath, { recursive: true });
             return { content: [{ type: "text", text: "Created." }] };
         }
         if (args.mode === "delete") {
             let validPath;
             try {
-                validPath = await ctx.validatePath(args.path);
+                validPath = await ctx.validatePath(args.path!);
             }
-            catch (e) {
-                if (e.code === 'ENOENT' || (e.message && e.message.includes('ENOENT'))) {
+            catch (e: unknown) {
+                if (e instanceof Error && (((e as NodeJS.ErrnoException).code === 'ENOENT') || e.message.includes('ENOENT'))) {
                     throw new Error("Unable to locate file.");
                 }
                 throw e;
@@ -37,13 +46,13 @@ export function register(server, ctx) {
             return { content: [{ type: "text", text: "Deleted." }] };
         }
         if (args.mode === "move") {
-            const validSourcePath = await ctx.validatePath(args.source);
-            const validDestPath = await ctx.validatePath(args.destination);
+            const validSourcePath = await ctx.validatePath(args.source!);
+            const validDestPath = await ctx.validatePath(args.destination!);
             await fs.rename(validSourcePath, validDestPath);
             return { content: [{ type: "text", text: "Moved." }] };
         }
         if (args.mode === "info") {
-            const validPath = await ctx.validatePath(args.path);
+            const validPath = await ctx.validatePath(args.path!);
             const info = await getFileStats(validPath);
             const text = Object.entries(info).map(([key, value]) => `${key}: ${value}`).join("\n");
             return { content: [{ type: "text", text }] };

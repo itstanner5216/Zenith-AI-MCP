@@ -2,10 +2,12 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { randomBytes, createHash } from 'crypto';
+import type { ToolServer, ToolContext } from './types.js';
 import { getProjectContext } from '../core/project-context.js';
 import { getDb, indexDirectory, ensureIndexFresh, indexFile, impactQuery, getSessionId, findRepoRoot, snapshotSymbol, getVersionHistory, getVersionText, } from '../core/symbol-index.js';
 import { getLangForFile, findSymbol, getSymbolStructure, checkSyntaxErrors, } from '../core/tree-sitter.js';
 import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
+import type { Edit } from '../core/edit-engine.js';
 import { normalizeLineEndings } from '../core/lib.js';
 // ---------------------------------------------------------------------------
 // Module-level constants
@@ -14,17 +16,120 @@ const MAX_CHARS = Number(process.env.REFACTOR_MAX_CHARS) || 30000;
 const DEFAULT_CONTEXT = 5;
 const MAX_CONTEXT_LINES = Math.min(30, Number(process.env.REFACTOR_MAX_CONTEXT) || 30);
 // ---------------------------------------------------------------------------
+// Local interfaces
+// ---------------------------------------------------------------------------
+interface SymbolStructure {
+    params?: unknown;
+    returnKind?: unknown;
+    parentKind?: unknown;
+    decorators?: unknown;
+    modifiers?: unknown;
+    [key: string]: unknown;
+}
+
+interface ModalBucket {
+    sample: SymbolStructure;
+    count: number;
+}
+
+interface ParsedPayloadGroup {
+    symbol: string;
+    indices: number[];
+    ack: number[];
+    body: string;
+}
+
+interface WorkItem {
+    symbol: string;
+    filePath?: string;
+}
+
+interface LoadedOccurrence {
+    index: number;
+    symbol: string;
+    absPath: string;
+    relFile: string;
+    line: number;
+    endLine: number;
+    flag: string | null;
+}
+
+interface LoadedQueryResult {
+    name: string;
+    filePath?: string;
+    refCount?: number;
+    callCount?: number;
+}
+
+interface LoadCache {
+    results: LoadedQueryResult[];
+    remaining: WorkItem[];
+    contextLines: number | null;
+    occurrences?: LoadedOccurrence[];
+    modalBySymbol?: Map<string, SymbolStructure>;
+}
+
+interface PayloadCache {
+    body: string;
+    ack: number[];
+    modalStructure: SymbolStructure | null;
+}
+
+// Version history row — extends the base row shape with an optional line column
+// that is stored in the DB by snapshotSymbol but not selected by getVersionHistory.
+type VersionEntry = ReturnType<typeof getVersionHistory>[number] & {
+    line?: number | null;
+};
+
+// DB row shapes used in raw queries
+interface FilePathRow {
+    file_path: string;
+}
+
+interface FileHashRow {
+    hash: string;
+}
+
+interface CountRow {
+    n: number;
+}
+
+interface FilePathRecordRow {
+    path: string;
+}
+
+// Args type for the tool handler — inferred from the Zod schema below.
+interface RefactorBatchArgs {
+    mode: "query" | "loadDiff" | "apply" | "reapply" | "restore" | "history";
+    target?: string;
+    fileScope?: string;
+    direction: "forward" | "reverse";
+    depth: number;
+    selection?: Array<number | { symbol: string; file?: string }>;
+    contextLines: number;
+    loadMore: boolean;
+    payload?: string;
+    dryRun: boolean;
+    symbolGroup?: string;
+    newTargets?: Array<string | { symbol: string; file?: string }>;
+    ack?: number[];
+    symbol?: string;
+    file?: string;
+    version?: number;
+}
+
+// ---------------------------------------------------------------------------
 // Module-level caches (per-process, keyed by `${repoRoot}::${sessionId}`)
 // ---------------------------------------------------------------------------
-const _loadCache = new Map();
+const _loadCache = new Map<string, LoadCache>();
 // Reserved for Task 2.1 (apply/reapply) — declared now so Wave 2 only extends.
-const _payloadCache = new Map();
+const _payloadCache = new Map<string, PayloadCache>();
 // Keyed by `${repoRoot}::${sessionId}::${symbolName}`. Locks a group after 1 failed retry.
-const _retryState = new Map();
+const _retryState = new Map<string, number>();
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function deepEqual(a, b) {
+function deepEqual(a: unknown, b: unknown): boolean {
     if (a === b)
         return true;
     if (a === null || b === null)
@@ -39,25 +144,28 @@ function deepEqual(a, b) {
                 return false;
         return true;
     }
-    if (typeof a === 'object') {
-        const ka = Object.keys(a), kb = Object.keys(b);
+    if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null) {
+        const ka = Object.keys(a as Record<string, unknown>);
+        const kb = Object.keys(b as Record<string, unknown>);
         if (ka.length !== kb.length)
             return false;
+        const ao = a as Record<string, unknown>;
+        const bo = b as Record<string, unknown>;
         for (const k of ka)
-            if (!deepEqual(a[k], b[k]))
+            if (!deepEqual(ao[k], bo[k]))
                 return false;
         return true;
     }
     return false;
 }
-function findModal(items) {
+function findModal(items: (SymbolStructure | null | undefined)[]): SymbolStructure | null {
     // items: array of structures (may contain null). Returns the non-null structure
     // that occurs most often by deep equality. Null if all entries are null.
-    const buckets = [];
+    const buckets: ModalBucket[] = [];
     for (const s of items) {
         if (s === null || s === undefined)
             continue;
-        let hit = null;
+        let hit: ModalBucket | null = null;
         for (const b of buckets) {
             if (deepEqual(b.sample, s)) {
                 hit = b;
@@ -74,7 +182,7 @@ function findModal(items) {
     buckets.sort((a, b) => b.count - a.count);
     return buckets[0].sample;
 }
-function firstDiffReason(modal, s) {
+function firstDiffReason(modal: SymbolStructure | null, s: SymbolStructure | null): string | null {
     if (!modal || !s)
         return null;
     if (!deepEqual(modal.params, s.params))
@@ -97,8 +205,8 @@ function firstDiffReason(modal, s) {
 //   function chargeStripe(card, amount) { ... }
 //
 // Returns: [{symbol, indices: number[], ack: number[], body: string}, ...]
-function parsePayload(payload) {
-    const groups = [];
+function parsePayload(payload: string): ParsedPayloadGroup[] {
+    const groups: ParsedPayloadGroup[] = [];
     const blocks = payload.split(/\n(?=[A-Za-z_$][\w$.]*\s+\d)/);
     for (const block of blocks) {
         const nl = block.indexOf('\n');
@@ -110,8 +218,8 @@ function parsePayload(payload) {
         if (!m)
             continue;
         const symbol = m[1];
-        const indices = m[2].split(',').map(s => Number(s.trim())).filter(Number.isFinite);
-        const ack = m[3] ? m[3].split(',').map(s => Number(s.trim())).filter(Number.isFinite) : [];
+        const indices = m[2].split(',').map((s: string) => Number(s.trim())).filter(Number.isFinite);
+        const ack = m[3] ? m[3].split(',').map((s: string) => Number(s.trim())).filter(Number.isFinite) : [];
         groups.push({ symbol, indices, ack, body });
     }
     return groups;
@@ -119,8 +227,10 @@ function parsePayload(payload) {
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
-export function register(server, ctx) {
-    server.registerTool("refactor_batch", {
+export function register(server: ToolServer, ctx: ToolContext) {
+    // FsContext only needs getAllowedDirectories; validatePath is optional there.
+    const fsCtx = { getAllowedDirectories: () => ctx.getAllowedDirectories() };
+    server.registerTool<RefactorBatchArgs>("refactor_batch", {
         title: "Refactor Batch",
         description: "Apply one edit pattern across multiple similar symbols, with rollback. Core pipeline: loadDiff (symbol bodies + context) → apply (write edits). query is optional — you can skip it and call loadDiff directly with explicit {symbol, file} pairs if you already know the targets (e.g. from search_files). After a successful apply: reapply sends the same cached edit to new targets, restore rolls back any symbol to a prior snapshot. Every apply/reapply/restore snapshots pre-edit text automatically. No default mode — mode is always required.",
         inputSchema: z.object({
@@ -148,20 +258,21 @@ export function register(server, ctx) {
             version: z.number().int().min(0).optional().describe("restore: Which version index to restore (from history output). Omit to list available versions instead of restoring."),
         }),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
-    }, async (args) => {
-        const pc = getProjectContext(ctx);
+    }, async (args: RefactorBatchArgs) => {
+        const pc = getProjectContext(fsCtx);
         // =================================================================
         // QUERY
         // =================================================================
         if (args.mode === 'query') {
             if (!args.target) {
-                return { content: [{ type: 'text', text: 'target required for query.' }] };
+                return { content: [{ type: 'text' as const, text: 'target required for query.' }] };
             }
             const repoRoot = pc.getRoot(args.fileScope);
             if (!repoRoot)
                 throw new Error("No project root.");
             const db = getDb(repoRoot);
-            const count = db.prepare('SELECT COUNT(*) AS n FROM files').get().n;
+            const countRow = db.prepare<CountRow>('SELECT COUNT(*) AS n FROM files').get();
+            const count = countRow?.n ?? 0;
             if (count === 0) {
                 await indexDirectory(db, repoRoot, repoRoot, { maxFiles: 5000 });
             }
@@ -169,14 +280,14 @@ export function register(server, ctx) {
                 // Fire-and-forget freshness refresh; don't block the query.
                 (async () => {
                     try {
-                        const rows = db.prepare('SELECT path FROM files').all();
-                        const abs = rows.map(r => path.join(repoRoot, r.path));
+                        const rows = db.prepare<FilePathRecordRow>('SELECT path FROM files').all();
+                        const abs = rows.map((r: FilePathRecordRow) => path.join(repoRoot, r.path));
                         await ensureIndexFresh(db, repoRoot, abs);
                     }
                     catch { /* best-effort */ }
                 })();
             }
-            let relScope;
+            let relScope: string | undefined;
             if (args.fileScope) {
                 const absScope = await ctx.validatePath(args.fileScope);
                 relScope = path.relative(repoRoot, absScope);
@@ -186,35 +297,36 @@ export function register(server, ctx) {
                 depth: args.depth,
                 direction: args.direction,
             });
-            if (result.disambiguate) {
-                return { content: [{ type: 'text', text: 'Multiple definitions:\n' + result.definitions.join('\n') }] };
+            if ('disambiguate' in result && result.disambiguate) {
+                return { content: [{ type: 'text' as const, text: 'Multiple definitions:\n' + result.definitions.join('\n') }] };
             }
+            const successResult = result as { results: LoadedQueryResult[]; total: number };
             const sessionId = ctx.sessionId || getSessionId();
             const cacheKey = `${repoRoot}::${sessionId}`;
             _loadCache.set(cacheKey, {
-                results: result.results,
+                results: successResult.results,
                 remaining: [],
                 contextLines: null,
             });
-            if (!result.results.length) {
-                return { content: [{ type: 'text', text: 'No references.' }] };
+            if (!successResult.results.length) {
+                return { content: [{ type: 'text' as const, text: 'No references.' }] };
             }
-            const lines = result.results.map((r, i) => {
+            const lines = successResult.results.map((r: LoadedQueryResult, i: number) => {
                 const idx = i + 1;
                 if (args.direction === 'forward') {
                     return `${idx}) ${r.name}[${r.refCount}x] (${r.filePath})`;
                 }
                 return `${idx}) ${r.name}[${r.callCount}x]`;
             });
-            lines.push(`${result.results.length} total`);
-            return { content: [{ type: 'text', text: lines.join('\n') }] };
+            lines.push(`${successResult.results.length} total`);
+            return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
         }
         // =================================================================
         // LOAD
         // =================================================================
         if (args.mode === 'loadDiff') {
             if (!args.selection?.length && !args.loadMore) {
-                return { content: [{ type: 'text', text: 'selection required for loadDiff (or use loadMore=true to continue).' }] };
+                return { content: [{ type: 'text' as const, text: 'selection required for loadDiff (or use loadMore=true to continue).' }] };
             }
             const repoRoot = pc.getRoot();
             if (!repoRoot)
@@ -223,11 +335,11 @@ export function register(server, ctx) {
             const sessionId = ctx.sessionId || getSessionId();
             const cacheKey = `${repoRoot}::${sessionId}`;
             const cached = _loadCache.get(cacheKey);
-            let workList;
-            let contextLines;
+            let workList: WorkItem[];
+            let contextLines: number;
             if (args.loadMore) {
                 if (!cached || !cached.remaining.length) {
-                    return { content: [{ type: 'text', text: 'Nothing to continue.' }] };
+                    return { content: [{ type: 'text' as const, text: 'Nothing to continue.' }] };
                 }
                 workList = cached.remaining.slice();
                 contextLines = cached.contextLines ?? DEFAULT_CONTEXT;
@@ -235,17 +347,17 @@ export function register(server, ctx) {
             else {
                 contextLines = args.contextLines ?? DEFAULT_CONTEXT;
                 workList = [];
-                for (const entry of args.selection) {
+                for (const entry of args.selection!) {
                     if (typeof entry === 'number') {
                         if (!cached || !cached.results || !cached.results.length) {
-                            return { content: [{ type: 'text', text: 'Run query first.' }] };
+                            return { content: [{ type: 'text' as const, text: 'Run query first.' }] };
                         }
                         const r = cached.results[entry - 1];
                         if (!r)
                             continue;
                         if (!r.filePath) {
                             // Reverse query result — resolve definition file from index.
-                            const defRows = db.prepare("SELECT DISTINCT file_path FROM symbols WHERE name = ? AND kind = 'def'").all(r.name);
+                            const defRows = db.prepare<FilePathRow>("SELECT DISTINCT file_path FROM symbols WHERE name = ? AND kind = 'def'").all(r.name);
                             for (const row of defRows) {
                                 workList.push({ symbol: r.name, filePath: row.file_path });
                             }
@@ -254,13 +366,13 @@ export function register(server, ctx) {
                         workList.push({ symbol: r.name, filePath: r.filePath });
                     }
                     else {
-                        let filePath = entry.file;
+                        let filePath: string | undefined = entry.file;
                         if (filePath && path.isAbsolute(filePath)) {
                             filePath = path.relative(repoRoot, filePath);
                         }
                         if (!filePath) {
                             // No file specified — resolve from index, same as reapply.
-                            const defRows = db.prepare("SELECT DISTINCT file_path FROM symbols WHERE name = ? AND kind = 'def'").all(entry.symbol);
+                            const defRows = db.prepare<FilePathRow>("SELECT DISTINCT file_path FROM symbols WHERE name = ? AND kind = 'def'").all(entry.symbol);
                             for (const row of defRows) {
                                 workList.push({ symbol: entry.symbol, filePath: row.file_path });
                             }
@@ -273,20 +385,30 @@ export function register(server, ctx) {
             // -----------------------------------------------------------------
             // Walk the workList, gather symbol occurrences grouped by symbol name.
             // -----------------------------------------------------------------
-            const occurrences = []; // { symbol, relFile, absPath, source, sourceLines, line, endLine }
+            interface RawOccurrence {
+                symbol: string;
+                relFile: string;
+                absPath: string;
+                source: string;
+                sourceLines: string[];
+                line: number;
+                endLine: number;
+                workIndex: number;
+            }
+            const occurrences: RawOccurrence[] = []; // { symbol, relFile, absPath, source, sourceLines, line, endLine }
             for (let i = 0; i < workList.length; i++) {
                 const { symbol, filePath } = workList[i];
                 if (!filePath)
                     continue;
                 const absPath = path.join(repoRoot, filePath);
-                let validPath;
+                let validPath: string;
                 try {
                     validPath = await ctx.validatePath(absPath);
                 }
                 catch {
                     continue;
                 }
-                let source;
+                let source: string;
                 try {
                     source = await fs.readFile(validPath, 'utf-8');
                 }
@@ -316,24 +438,24 @@ export function register(server, ctx) {
             // -----------------------------------------------------------------
             // Outlier flagging: modal structure per symbol-name group.
             // -----------------------------------------------------------------
-            const flagByOccurrence = new Map();
-            const modalBySymbol = new Map();
-            const bySymbol = new Map();
+            const flagByOccurrence = new Map<RawOccurrence, string>();
+            const modalBySymbol = new Map<string, SymbolStructure>();
+            const bySymbol = new Map<string, RawOccurrence[]>();
             for (const occ of occurrences) {
                 if (!bySymbol.has(occ.symbol))
                     bySymbol.set(occ.symbol, []);
-                bySymbol.get(occ.symbol).push(occ);
+                bySymbol.get(occ.symbol)!.push(occ);
             }
             for (const [symName, group] of bySymbol) {
                 if (group.length < 2)
                     continue;
-                const structs = [];
+                const structs: (SymbolStructure | null)[] = [];
                 for (const occ of group) {
-                    let s = null;
+                    let s: SymbolStructure | null = null;
                     try {
                         const langName = getLangForFile(occ.absPath);
                         if (langName)
-                            s = await getSymbolStructure(occ.source, langName, occ.line, occ.endLine);
+                            s = await getSymbolStructure(occ.source, langName, occ.line, occ.endLine) as SymbolStructure | null;
                     }
                     catch {
                         s = null;
@@ -358,8 +480,8 @@ export function register(server, ctx) {
             // -----------------------------------------------------------------
             // Emit blocks, honour MAX_CHARS without splitting a symbol.
             // -----------------------------------------------------------------
-            const blocks = [];
-            const fileCounts = new Map();
+            const blocks: string[] = [];
+            const fileCounts = new Map<string, number>();
             let totalChars = 0;
             let cutAt = occurrences.length;
             const startIndex = args.loadMore ? (cached?.occurrences?.length || 0) : 0;
@@ -390,12 +512,12 @@ export function register(server, ctx) {
             }
             // Remaining entries (not yet loaded) — carry forward unique workIndices after cutAt.
             const loadedWorkIndices = new Set(occurrences.slice(0, cutAt).map(o => o.workIndex));
-            const remaining = [];
+            const remaining: WorkItem[] = [];
             for (let i = 0; i < workList.length; i++) {
                 if (!loadedWorkIndices.has(i))
                     remaining.push(workList[i]);
             }
-            const emittedOccurrences = occurrences.slice(0, cutAt).map((o, i) => ({
+            const emittedOccurrences: LoadedOccurrence[] = occurrences.slice(0, cutAt).map((o, i) => ({
                 index: startIndex + i + 1,
                 symbol: o.symbol,
                 absPath: o.absPath,
@@ -404,8 +526,8 @@ export function register(server, ctx) {
                 endLine: o.endLine,
                 flag: flagByOccurrence.get(o) || null,
             }));
-            const priorOccurrences = (args.loadMore && Array.isArray(cached?.occurrences))
-                ? cached.occurrences
+            const priorOccurrences: LoadedOccurrence[] = (args.loadMore && Array.isArray(cached?.occurrences))
+                ? cached!.occurrences!
                 : [];
             _loadCache.set(cacheKey, {
                 results: cached?.results || [],
@@ -415,7 +537,7 @@ export function register(server, ctx) {
                 modalBySymbol,
             });
             if (!blocks.length) {
-                return { content: [{ type: 'text', text: 'No symbols loaded.' }] };
+                return { content: [{ type: 'text' as const, text: 'No symbols loaded.' }] };
             }
             const header = [...fileCounts.entries()]
                 .map(([f, n]) => `${n} in ${f}`)
@@ -424,14 +546,14 @@ export function register(server, ctx) {
             if (remaining.length > 0) {
                 out += `\n[truncated] ${remaining.length} remaining. Call loadDiff with loadMore=true.`;
             }
-            return { content: [{ type: 'text', text: out }] };
+            return { content: [{ type: 'text' as const, text: out }] };
         }
         // =================================================================
         // APPLY
         // =================================================================
         if (args.mode === 'apply') {
             if (!args.payload) {
-                return { content: [{ type: 'text', text: 'payload required for apply.' }] };
+                return { content: [{ type: 'text' as const, text: 'payload required for apply.' }] };
             }
             const repoRoot = pc.getRoot();
             if (!repoRoot)
@@ -442,21 +564,21 @@ export function register(server, ctx) {
             const cached = _loadCache.get(cacheKey);
             const groups = parsePayload(args.payload);
             if (!groups.length) {
-                return { content: [{ type: 'text', text: 'No diff loaded. Call loadDiff first.' }] };
+                return { content: [{ type: 'text' as const, text: 'No diff loaded. Call loadDiff first.' }] };
             }
             // Source of truth: `occurrences` cached by the previous `load` call.
             if (!cached || !Array.isArray(cached.occurrences) || cached.occurrences.length === 0) {
-                return { content: [{ type: 'text', text: 'No diff loaded. Call loadDiff first.' }] };
+                return { content: [{ type: 'text' as const, text: 'No diff loaded. Call loadDiff first.' }] };
             }
             // Build symbolName -> [occurrence] map, preserving the indices load printed.
-            const loadedSymbols = new Map();
+            const loadedSymbols = new Map<string, LoadedOccurrence[]>();
             for (const occ of cached.occurrences) {
                 if (!loadedSymbols.has(occ.symbol))
                     loadedSymbols.set(occ.symbol, []);
-                loadedSymbols.get(occ.symbol).push(occ);
+                loadedSymbols.get(occ.symbol)!.push(occ);
             }
             // Flag set: every cached occurrence with a `flag` is an outlier.
-            const flaggedIndices = new Set();
+            const flaggedIndices = new Set<number>();
             for (const occ of cached.occurrences) {
                 if (occ.flag)
                     flaggedIndices.add(occ.index);
@@ -464,11 +586,11 @@ export function register(server, ctx) {
             // Gate: every payload group symbol must exist in the loaded set.
             for (const g of groups) {
                 if (!loadedSymbols.has(g.symbol)) {
-                    return { content: [{ type: 'text', text: `Unknown symbol: ${g.symbol}. Run loadDiff first.` }] };
+                    return { content: [{ type: 'text' as const, text: `Unknown symbol: ${g.symbol}. Run loadDiff first.` }] };
                 }
             }
             // Gate: outlier ack. Each flagged occurrence in a group must be in its ack list.
-            const unackFlagged = [];
+            const unackFlagged: number[] = [];
             for (const g of groups) {
                 const acks = new Set(g.ack);
                 for (const idx of g.indices) {
@@ -477,19 +599,19 @@ export function register(server, ctx) {
                 }
             }
             if (unackFlagged.length) {
-                return { content: [{ type: 'text', text: `Flagged outliers require ack: ${unackFlagged.join(',')}` }] };
+                return { content: [{ type: 'text' as const, text: `Flagged outliers require ack: ${unackFlagged.join(',')}` }] };
             }
             // Gate: char budget.
             let totalBudget = 0;
             for (const g of groups)
                 totalBudget += g.body.length * g.indices.length;
             if (totalBudget > MAX_CHARS) {
-                return { content: [{ type: 'text', text: 'Over char budget. Split the apply into smaller groups.' }] };
+                return { content: [{ type: 'text' as const, text: 'Over char budget. Split the apply into smaller groups.' }] };
             }
             // Gate: syntax.
             for (const g of groups) {
                 const occList = loadedSymbols.get(g.symbol);
-                const firstOcc = occList.find(o => g.indices.includes(o.index)) || occList[0];
+                const firstOcc = occList!.find(o => g.indices.includes(o.index)) || occList![0];
                 if (!firstOcc)
                     continue;
                 const langName = getLangForFile(firstOcc.absPath);
@@ -498,22 +620,32 @@ export function register(server, ctx) {
                 try {
                     const errs = await checkSyntaxErrors(g.body, langName);
                     if (errs && errs.length) {
-                        return { content: [{ type: 'text', text: `Syntax error in ${g.symbol}: line ${errs[0].line}:${errs[0].column}` }] };
+                        return { content: [{ type: 'text' as const, text: `Syntax error in ${g.symbol}: line ${errs[0].line}:${errs[0].column}` }] };
                     }
                 }
                 catch { /* best-effort */ }
             }
             // Build per-file edit bundles.
+            interface FileBundleEntry {
+                group: ParsedPayloadGroup;
+                occ: LoadedOccurrence;
+            }
+            interface FileBundle {
+                edits: Edit[];
+                disambiguations: Map<number, { nearLine: number }>;
+                occMeta: FileBundleEntry[];
+                relFile: string;
+            }
             // fileBundles: Map<absPath, { edits: [...], disambiguations: Map, occMeta: [{group, occ}] }>
-            const fileBundles = new Map();
+            const fileBundles = new Map<string, FileBundle>();
             for (const g of groups) {
-                const occList = loadedSymbols.get(g.symbol);
-                const selected = occList.filter(o => g.indices.includes(o.index));
+                const occList = loadedSymbols.get(g.symbol)!;
+                const selected = occList.filter((o: LoadedOccurrence) => g.indices.includes(o.index));
                 for (const occ of selected) {
                     if (!fileBundles.has(occ.absPath)) {
                         fileBundles.set(occ.absPath, { edits: [], disambiguations: new Map(), occMeta: [], relFile: occ.relFile });
                     }
-                    const bundle = fileBundles.get(occ.absPath);
+                    const bundle = fileBundles.get(occ.absPath)!;
                     const editIdx = bundle.edits.length;
                     bundle.edits.push({ mode: 'symbol', symbol: g.symbol, newText: g.body });
                     // Always set a disambiguation anchor so batches with multiple symbols work.
@@ -521,12 +653,12 @@ export function register(server, ctx) {
                     bundle.occMeta.push({ group: g, occ });
                 }
             }
-            const failedGroupMessages = new Map(); // symbolName -> message
-            let successfulGroupNames = new Set();
+            const failedGroupMessages = new Map<string, string>(); // symbolName -> message
+            const successfulGroupNames = new Set<string>();
             let successfulFileCount = 0;
             let warningSuffix = '';
             for (const [absPath, bundle] of fileBundles) {
-                let content;
+                let content: string;
                 try {
                     content = await fs.readFile(absPath, 'utf-8');
                 }
@@ -537,11 +669,12 @@ export function register(server, ctx) {
                             const retryKey = `${repoRoot}::${sessionId}::${group.symbol}`;
                             const count = (_retryState.get(retryKey) || 0) + 1;
                             _retryState.set(retryKey, count);
+                            const errMsg = err instanceof Error ? err.message : String(err);
                             if (count >= 2) {
                                 failedGroupMessages.set(group.symbol, `Group ${group.symbol} locked. Use edit_file directly.`);
                             }
                             else {
-                                failedGroupMessages.set(group.symbol, `Group ${group.symbol} failed: ${err.message}. Retry once or use edit_file directly.`);
+                                failedGroupMessages.set(group.symbol, `Group ${group.symbol} failed: ${errMsg}. Retry once or use edit_file directly.`);
                             }
                         }
                     }
@@ -555,8 +688,8 @@ export function register(server, ctx) {
                 if (result.errors && result.errors.length) {
                     // Determine which groups failed by mapping error indices to occMeta.
                     const failedEditIdx = new Set(result.errors.map(e => e.i));
-                    const failedSymbolsInFile = new Set();
-                    let firstErrMsgBySymbol = new Map();
+                    const failedSymbolsInFile = new Set<string>();
+                    const firstErrMsgBySymbol = new Map<string, string>();
                     for (let i = 0; i < bundle.occMeta.length; i++) {
                         if (failedEditIdx.has(i)) {
                             const sym = bundle.occMeta[i].group.symbol;
@@ -648,11 +781,12 @@ export function register(server, ctx) {
                         const retryKey = `${repoRoot}::${sessionId}::${group.symbol}`;
                         const count = (_retryState.get(retryKey) || 0) + 1;
                         _retryState.set(retryKey, count);
+                        const errMsg = err instanceof Error ? err.message : String(err);
                         if (count >= 2) {
                             failedGroupMessages.set(group.symbol, `Group ${group.symbol} locked. Use edit_file directly.`);
                         }
                         else {
-                            failedGroupMessages.set(group.symbol, `Group ${group.symbol} failed: ${err.message}. Retry once or use edit_file directly.`);
+                            failedGroupMessages.set(group.symbol, `Group ${group.symbol} failed: ${errMsg}. Retry once or use edit_file directly.`);
                         }
                     }
                     continue;
@@ -664,7 +798,7 @@ export function register(server, ctx) {
                 try {
                     const relPath = path.relative(repoRoot, absPath);
                     for (const snap of (result.pendingSnapshots || [])) {
-                        snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                        snapshotSymbol(db, snap.symbol ?? '', relPath, snap.originalText, sessionId, snap.line ?? null);
                     }
                 }
                 catch { /* best-effort */ }
@@ -697,12 +831,12 @@ export function register(server, ctx) {
                     if (okCount)
                         lines.unshift(`Applied ${okCount} symbols across ${successfulFileCount} files.`);
                 }
-                return { content: [{ type: 'text', text: lines.join('\n') + warningSuffix }] };
+                return { content: [{ type: 'text' as const, text: lines.join('\n') + warningSuffix }] };
             }
             if (args.dryRun) {
                 const dryLines = [`Dry run: ${successfulGroupNames.size} symbols across ${successfulFileCount} files.`];
                 // Report flagged outliers that were acknowledged.
-                const ackedOutliers = [];
+                const ackedOutliers: number[] = [];
                 for (const g of groups) {
                     for (const idx of g.ack) {
                         if (flaggedIndices.has(idx))
@@ -713,19 +847,19 @@ export function register(server, ctx) {
                     dryLines.push(`Acknowledged outliers: ${ackedOutliers.join(',')}`);
                 if (warningSuffix)
                     dryLines.push(warningSuffix.trim());
-                return { content: [{ type: 'text', text: dryLines.join('\n') }] };
+                return { content: [{ type: 'text' as const, text: dryLines.join('\n') }] };
             }
-            return { content: [{ type: 'text', text: `Applied ${successfulGroupNames.size} symbols across ${successfulFileCount} files.${warningSuffix}` }] };
+            return { content: [{ type: 'text' as const, text: `Applied ${successfulGroupNames.size} symbols across ${successfulFileCount} files.${warningSuffix}` }] };
         }
         // =================================================================
         // REAPPLY
         // =================================================================
         if (args.mode === 'reapply') {
             if (!args.symbolGroup) {
-                return { content: [{ type: 'text', text: 'symbolGroup required for reapply.' }] };
+                return { content: [{ type: 'text' as const, text: 'symbolGroup required for reapply.' }] };
             }
             if (!args.newTargets?.length) {
-                return { content: [{ type: 'text', text: 'newTargets required for reapply.' }] };
+                return { content: [{ type: 'text' as const, text: 'newTargets required for reapply.' }] };
             }
             const repoRoot = pc.getRoot();
             if (!repoRoot)
@@ -735,13 +869,22 @@ export function register(server, ctx) {
             const payloadKey = `${repoRoot}::${sessionId}::${args.symbolGroup}`;
             const cachedPayload = _payloadCache.get(payloadKey);
             if (!cachedPayload) {
-                return { content: [{ type: 'text', text: `No cached payload for ${args.symbolGroup}.` }] };
+                return { content: [{ type: 'text' as const, text: `No cached payload for ${args.symbolGroup}.` }] };
             }
             // Resolve new targets to occurrences.
-            const targets = []; // { absPath, relFile, source, line, endLine }
-            const skipped = [];
+            interface ReapplyTarget {
+                symbol: string;
+                absPath: string;
+                relFile: string;
+                source: string;
+                line: number;
+                endLine: number;
+            }
+            const targets: ReapplyTarget[] = []; // { absPath, relFile, source, line, endLine }
+            const skipped: string[] = [];
             for (const entry of args.newTargets) {
-                let symName, file;
+                let symName: string;
+                let file: string | undefined;
                 if (typeof entry === 'string') {
                     symName = entry;
                     file = undefined;
@@ -751,29 +894,29 @@ export function register(server, ctx) {
                     file = entry.file;
                 }
                 // Candidate files: explicit file hint, else look up def occurrences from the symbol index.
-                let candidateFiles;
+                let candidateFiles: string[];
                 if (file) {
                     candidateFiles = [file];
                 }
                 else {
-                    const rows = db.prepare("SELECT DISTINCT file_path FROM symbols WHERE name = ? AND kind = 'def'").all(symName);
+                    const rows = db.prepare<FilePathRow>("SELECT DISTINCT file_path FROM symbols WHERE name = ? AND kind = 'def'").all(symName);
                     if (!rows.length) {
                         skipped.push(symName);
                         continue;
                     }
-                    candidateFiles = rows.map(r => r.file_path);
+                    candidateFiles = rows.map((r: FilePathRow) => r.file_path);
                 }
                 let addedAny = false;
                 for (const cf of candidateFiles) {
                     const absPath = path.isAbsolute(cf) ? cf : path.join(repoRoot, cf);
-                    let validPath;
+                    let validPath: string;
                     try {
                         validPath = await ctx.validatePath(absPath);
                     }
                     catch {
                         continue;
                     }
-                    let source;
+                    let source: string;
                     try {
                         source = await fs.readFile(validPath, 'utf-8');
                     }
@@ -803,18 +946,18 @@ export function register(server, ctx) {
             }
             if (!targets.length) {
                 const suffix = skipped.length ? ` (skipped ${skipped.length})` : '';
-                return { content: [{ type: 'text', text: `Reapplied 0 targets.${suffix}` }] };
+                return { content: [{ type: 'text' as const, text: `Reapplied 0 targets.${suffix}` }] };
             }
             // Outlier flagging: compare new targets against the ORIGINAL baseline
             // structure (cached from the initial loadDiff). If no baseline is cached
             // (single-symbol apply), fall back to comparing targets to each other.
-            const structs = [];
+            const structs: (SymbolStructure | null)[] = [];
             for (const t of targets) {
-                let s = null;
+                let s: SymbolStructure | null = null;
                 try {
                     const langName = getLangForFile(t.absPath);
                     if (langName)
-                        s = await getSymbolStructure(t.source, langName, t.line, t.endLine);
+                        s = await getSymbolStructure(t.source, langName, t.line, t.endLine) as SymbolStructure | null;
                 }
                 catch {
                     s = null;
@@ -826,7 +969,7 @@ export function register(server, ctx) {
                 const modal = baseline || (targets.length >= 2 ? findModal(structs) : null);
                 if (modal) {
                     const ackSet = new Set(args.ack || []);
-                    const flagged = [];
+                    const flagged: number[] = [];
                     for (let i = 0; i < targets.length; i++) {
                         const s = structs[i];
                         if (!s)
@@ -835,7 +978,7 @@ export function register(server, ctx) {
                             flagged.push(i + 1);
                     }
                     if (flagged.length) {
-                        return { content: [{ type: 'text', text: `Flagged outliers require ack: ${flagged.join(',')}` }] };
+                        return { content: [{ type: 'text' as const, text: `Flagged outliers require ack: ${flagged.join(',')}` }] };
                     }
                 }
             }
@@ -845,22 +988,27 @@ export function register(server, ctx) {
                 if (langName) {
                     const errs = await checkSyntaxErrors(cachedPayload.body, langName);
                     if (errs && errs.length) {
-                        return { content: [{ type: 'text', text: `Syntax error in ${args.symbolGroup}: line ${errs[0].line}:${errs[0].column}` }] };
+                        return { content: [{ type: 'text' as const, text: `Syntax error in ${args.symbolGroup}: line ${errs[0].line}:${errs[0].column}` }] };
                     }
                 }
             }
             catch { /* best-effort */ }
             // Char budget.
             if (cachedPayload.body.length * targets.length > MAX_CHARS) {
-                return { content: [{ type: 'text', text: 'Over char budget. Split the apply into smaller groups.' }] };
+                return { content: [{ type: 'text' as const, text: 'Over char budget. Split the apply into smaller groups.' }] };
             }
             // Build per-file bundles.
-            const fileBundles = new Map();
+            interface ReapplyBundle {
+                edits: Edit[];
+                disambiguations: Map<number, { nearLine: number }>;
+                occMeta: ReapplyTarget[];
+            }
+            const fileBundles = new Map<string, ReapplyBundle>();
             for (const t of targets) {
                 if (!fileBundles.has(t.absPath)) {
                     fileBundles.set(t.absPath, { edits: [], disambiguations: new Map(), occMeta: [] });
                 }
-                const bundle = fileBundles.get(t.absPath);
+                const bundle = fileBundles.get(t.absPath)!;
                 const editIdx = bundle.edits.length;
                 bundle.edits.push({ mode: 'symbol', symbol: t.symbol, newText: cachedPayload.body });
                 bundle.disambiguations.set(editIdx, { nearLine: t.line });
@@ -870,7 +1018,7 @@ export function register(server, ctx) {
             let reapplyFailedCount = 0;
             let warningSuffix = '';
             for (const [absPath, bundle] of fileBundles) {
-                let content;
+                let content: string;
                 try {
                     content = await fs.readFile(absPath, 'utf-8');
                 }
@@ -920,7 +1068,7 @@ export function register(server, ctx) {
                 try {
                     const relPath = path.relative(repoRoot, absPath);
                     for (const snap of (result.pendingSnapshots || [])) {
-                        snapshotSymbol(db, snap.symbol, relPath, snap.originalText, sessionId, snap.line);
+                        snapshotSymbol(db, snap.symbol ?? '', relPath, snap.originalText, sessionId, snap.line ?? null);
                     }
                 }
                 catch { /* best-effort */ }
@@ -938,43 +1086,43 @@ export function register(server, ctx) {
             const skippedSuffix = skipped.length ? ` (skipped ${skipped.length})` : '';
             const failedSuffix = reapplyFailedCount ? ` (${reapplyFailedCount} failed)` : '';
             if (args.dryRun) {
-                return { content: [{ type: 'text', text: `Dry run: ${reappliedCount} targets.${skippedSuffix}${failedSuffix}` }] };
+                return { content: [{ type: 'text' as const, text: `Dry run: ${reappliedCount} targets.${skippedSuffix}${failedSuffix}` }] };
             }
-            return { content: [{ type: 'text', text: `Reapplied ${reappliedCount} targets.${skippedSuffix}${failedSuffix}${warningSuffix}` }] };
+            return { content: [{ type: 'text' as const, text: `Reapplied ${reappliedCount} targets.${skippedSuffix}${failedSuffix}${warningSuffix}` }] };
         }
         // =================================================================
         // HISTORY
         // =================================================================
         if (args.mode === 'history') {
             if (!args.symbol) {
-                return { content: [{ type: 'text', text: 'symbol required for history.' }] };
+                return { content: [{ type: 'text' as const, text: 'symbol required for history.' }] };
             }
             const repoRoot = pc.getRoot(args.file);
             if (!repoRoot)
                 throw new Error("No project root.");
             const db = getDb(repoRoot);
             const sessionId = ctx.sessionId || getSessionId();
-            let relPath = null;
+            let relPath: string | undefined;
             if (args.file) {
                 const absPath = await ctx.validatePath(args.file);
                 relPath = path.relative(repoRoot, absPath);
             }
             const rows = getVersionHistory(db, args.symbol, sessionId, relPath);
             if (!rows.length) {
-                return { content: [{ type: 'text', text: `No version history for ${args.symbol}.` }] };
+                return { content: [{ type: 'text' as const, text: `No version history for ${args.symbol}.` }] };
             }
             const lines = rows.map((r, i) => `v${i} ${r.file_path} ${r.text_hash?.slice(0, 8) || '?'} ${new Date(r.created_at).toISOString()}`);
-            return { content: [{ type: 'text', text: lines.join('\n') }] };
+            return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
         }
         // =================================================================
         // RESTORE
         // =================================================================
         if (args.mode === 'restore') {
             if (!args.symbol) {
-                return { content: [{ type: 'text', text: 'symbol required for restore.' }] };
+                return { content: [{ type: 'text' as const, text: 'symbol required for restore.' }] };
             }
             if (!args.file) {
-                return { content: [{ type: 'text', text: 'file required for restore.' }] };
+                return { content: [{ type: 'text' as const, text: 'file required for restore.' }] };
             }
             const absPath = await ctx.validatePath(args.file);
             const repoRoot = findRepoRoot(absPath) || pc.getRoot();
@@ -987,44 +1135,44 @@ export function register(server, ctx) {
             if (args.version === undefined) {
                 const rows = getVersionHistory(db, args.symbol, sessionId, relPath);
                 if (!rows.length) {
-                    return { content: [{ type: 'text', text: `No version history for ${args.symbol} in ${relPath}.` }] };
+                    return { content: [{ type: 'text' as const, text: `No version history for ${args.symbol} in ${relPath}.` }] };
                 }
                 const lines = rows.map((r, i) => `v${i} ${r.text_hash?.slice(0, 8) || '?'} ${new Date(r.created_at).toISOString()}`);
-                return { content: [{ type: 'text', text: lines.join('\n') }] };
+                return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
             }
             const history = getVersionHistory(db, args.symbol, sessionId, relPath);
-            const versionEntry = history?.[args.version];
+            const versionEntry: VersionEntry | undefined = history?.[args.version];
             if (!versionEntry) {
-                return { content: [{ type: 'text', text: `${args.symbol}: version ${args.version} not found. ${history.length} versions available.` }] };
+                return { content: [{ type: 'text' as const, text: `${args.symbol}: version ${args.version} not found. ${history.length} versions available.` }] };
             }
             const restoredText = getVersionText(db, versionEntry.id);
             if (!restoredText) {
-                return { content: [{ type: 'text', text: `${args.symbol}: version ${args.version} text missing.` }] };
+                return { content: [{ type: 'text' as const, text: `${args.symbol}: version ${args.version} text missing.` }] };
             }
-            let content;
+            let content: string;
             try {
                 content = normalizeLineEndings(await fs.readFile(absPath, 'utf-8'));
             }
             catch {
-                return { content: [{ type: 'text', text: `${args.symbol}: file not found — ${relPath}.` }] };
+                return { content: [{ type: 'text' as const, text: `${args.symbol}: file not found — ${relPath}.` }] };
             }
             // Staleness check: if the file changed since our last index (e.g. after
             // a prior apply), warn the model so it can verify compatibility.
             let fileChanged = false;
             try {
                 const curHash = createHash('md5').update(content).digest('hex');
-                const stored = db.prepare('SELECT hash FROM files WHERE path = ?').get(relPath);
+                const stored = db.prepare<FileHashRow>('SELECT hash FROM files WHERE path = ?').get(relPath);
                 if (stored && stored.hash !== curHash)
                     fileChanged = true;
             }
             catch { /* best-effort */ }
             const langName = getLangForFile(absPath);
             if (!langName) {
-                return { content: [{ type: 'text', text: `${args.symbol}: unsupported language for ${relPath}.` }] };
+                return { content: [{ type: 'text' as const, text: `${args.symbol}: unsupported language for ${relPath}.` }] };
             }
             const matches = await findSymbol(content, langName, args.symbol, { kindFilter: 'def' });
             if (!matches?.length) {
-                return { content: [{ type: 'text', text: `${args.symbol}: not found in ${relPath}.` }] };
+                return { content: [{ type: 'text' as const, text: `${args.symbol}: not found in ${relPath}.` }] };
             }
             // Disambiguate: multiple matches → try stored line, then fall back to
             // body-similarity (the version text itself is the best fingerprint if the
@@ -1077,7 +1225,7 @@ export function register(server, ctx) {
             }
             catch { /* best-effort */ }
             if (args.dryRun) {
-                return { content: [{ type: 'text', text: `Dry run: would restore ${args.symbol} to v${args.version}.${staleWarning}${syntaxWarning}` }] };
+                return { content: [{ type: 'text' as const, text: `Dry run: would restore ${args.symbol} to v${args.version}.${staleWarning}${syntaxWarning}` }] };
             }
             // Snapshot current text before overwriting (so this restore is itself restorable).
             try {
@@ -1095,14 +1243,15 @@ export function register(server, ctx) {
                     await fs.unlink(tempPath);
                 }
                 catch { }
-                return { content: [{ type: 'text', text: `Restore failed: ${err.message}` }] };
+                const errMsg = err instanceof Error ? err.message : String(err);
+                return { content: [{ type: 'text' as const, text: `Restore failed: ${errMsg}` }] };
             }
             // Re-index.
             try {
                 await indexFile(db, repoRoot, absPath);
             }
             catch { /* best-effort */ }
-            return { content: [{ type: 'text', text: `${args.symbol}: restored to v${args.version}.${staleWarning}${syntaxWarning}` }] };
+            return { content: [{ type: 'text' as const, text: `${args.symbol}: restored to v${args.version}.${staleWarning}${syntaxWarning}` }] };
         }
         throw new Error('Invalid mode.');
     });

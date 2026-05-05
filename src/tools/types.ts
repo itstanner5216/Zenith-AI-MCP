@@ -1,7 +1,27 @@
-export type ToolContent = {
+export type ToolTextContent = {
     type: "text";
     text: string;
 };
+
+export type ToolImageContent = {
+    type: "image";
+    data: string;
+    mimeType: string;
+};
+
+export type ToolAudioContent = {
+    type: "audio";
+    data: string;
+    mimeType: string;
+};
+
+export type ToolBlobContent = {
+    type: "blob";
+    data: string;
+    mimeType: string;
+};
+
+export type ToolContent = ToolTextContent | ToolImageContent | ToolAudioContent | ToolBlobContent;
 
 export type ToolResult = {
     content: ToolContent[];
@@ -31,8 +51,8 @@ export type ToolServer = {
 export type ToolContext = {
     sessionId?: string;
     validatePath(inputPath: string): Promise<string>;
-    getAllowedDirectories?: () => string[];
-    setAllowedDirectories?: (directories: string[]) => void;
+    getAllowedDirectories: () => string[];
+    setAllowedDirectories: (directories: string[]) => void;
 };
 
 export function errorMessage(error: unknown): string {

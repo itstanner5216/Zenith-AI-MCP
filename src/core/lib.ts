@@ -8,6 +8,10 @@ import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
 import { isPathWithinAllowedDirectories } from './path-validation.js';
 
+function hasCode(e: unknown): e is { code: string } {
+    return typeof e === 'object' && e !== null && 'code' in e && typeof (e as Record<string, unknown>).code === 'string';
+}
+
 let allowedDirectories: string[] = [];
 
 export function setAllowedDirectories(directories: string[]): void {
@@ -18,7 +22,16 @@ export function getAllowedDirectories(): string[] {
     return [...allowedDirectories];
 }
 
-export function createFilesystemContext(initialAllowedDirectories: string[] = []) {
+export interface FilesystemContext {
+    getAllowedDirectories(): string[];
+    setAllowedDirectories(directories: string[]): void;
+    validatePath(requestedPath: string): Promise<string>;
+    _sessionId?: string;
+    _retrievalPipeline?: unknown;
+    _toolRegistry?: unknown;
+}
+
+export function createFilesystemContext(initialAllowedDirectories: string[] = []): FilesystemContext {
     let _allowedDirectories = [...initialAllowedDirectories];
 
     function getAllowedDirectories() {
@@ -48,8 +61,8 @@ export function createFilesystemContext(initialAllowedDirectories: string[] = []
                 throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${_allowedDirectories.join(', ')}`);
             }
             return realPath;
-        } catch (error: any) {
-            if (error.code === 'ENOENT') {
+        } catch (error: unknown) {
+            if (hasCode(error) && error.code === 'ENOENT') {
                 const parentDir = path.dirname(absolute);
                 try {
                     const realParentPath = await fs.realpath(parentDir);
@@ -115,8 +128,8 @@ export async function validatePath(requestedPath: string) {
             throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(', ')}`);
         }
         return realPath;
-    } catch (error: any) {
-        if (error.code === 'ENOENT') {
+    } catch (error: unknown) {
+        if (hasCode(error) && error.code === 'ENOENT') {
             const parentDir = path.dirname(absolute);
             try {
                 const realParentPath = await fs.realpath(parentDir);
@@ -153,8 +166,8 @@ export async function readFileContent(filePath: string, encoding = 'utf-8') {
 export async function writeFileContent(filePath: string, content: string) {
     try {
         await fs.writeFile(filePath, content, { encoding: "utf-8", flag: 'wx' });
-    } catch (error: any) {
-        if (error.code === 'EEXIST') {
+    } catch (error: unknown) {
+        if (hasCode(error) && error.code === 'EEXIST') {
             const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
             try {
                 await fs.writeFile(tempPath, content, 'utf-8');
