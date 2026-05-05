@@ -1014,6 +1014,9 @@ function _contentAwareTruncate(text: string, budget: number): string {
  *   5. _contentAwareTruncate (fallback)
  */
 export function compressString(text: string, budget: number, maxUserFrames = 10): string {
+  // Enforce 70% retention floor — never compress below 70% of original
+  const minBudget = Math.max(1, Math.floor(text.length * 0.70));
+  budget = Math.max(budget, minBudget);
   if (text.length <= budget) return text;
 
   if (_isSourceCode(text)) {
@@ -1055,5 +1058,9 @@ export function compressSourceStructured(
   budget: number,
   structure: StructureBlock[],
 ): string {
+  // Enforce 70% retention floor — never compress below 70% of original
+  const minBudget = Math.max(1, Math.floor(text.length * 0.70));
+  budget = Math.max(budget, minBudget);
+  if (text.length <= budget) return text;
   return _compressSourceStructured(text, budget, structure);
 }
