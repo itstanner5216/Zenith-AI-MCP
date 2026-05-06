@@ -101,7 +101,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
             return { content: [{ type: "text", text: lines.join("\n") }] };
         }
         // mode === "tree"
-        const rootPath = args.path ?? '';
+        const rootPath = await ctx.validatePath(args.path ?? '');
         const showSymbols = args.showSymbols || args.showSymbolNames || false;
         const showSymbolNames = args.showSymbolNames || false;
         let totalEntries = 0;

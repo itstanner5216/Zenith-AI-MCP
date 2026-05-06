@@ -2,7 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import fs from "fs/promises";
 import { fileURLToPath } from 'url';
-import { createFilesystemContext, setAllowedDirectories } from '../core/lib.js';
+import { createFilesystemContext } from '../core/lib.js';
 import { ripgrepAvailable } from '../core/shared.js';
 import {
   createFilesystemServer,
@@ -27,7 +27,7 @@ async function runStdio() {
   await validateDirectories(allowedDirectories);
 
   const ctx = createFilesystemContext(allowedDirectories);
-  setAllowedDirectories(allowedDirectories);
+
 
   const server = createFilesystemServer(ctx);
   attachRootsHandlers(server, ctx);

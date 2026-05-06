@@ -1,7 +1,6 @@
 /**
  * Abstract base classes for retrieval pipeline components.
  */
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { RetrievalContext, ScoredTool, ToolMapping } from "./models.js";
 
 export abstract class ToolRetriever {

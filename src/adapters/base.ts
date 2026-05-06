@@ -13,7 +13,7 @@ export abstract class MCPConfigAdapter {
   isSupported(): boolean {
     const plat = platform();
     const mapped = plat === "darwin" ? "macos" : plat === "win32" ? "windows" : "linux";
-    return this.supportedPlatforms.includes(mapped as any);
+    return this.supportedPlatforms.includes(mapped as typeof this.supportedPlatforms[number]);
   }
 
   protected backup(filePath: string): void {
@@ -28,8 +28,8 @@ export abstract class MCPConfigAdapter {
   }
 
   abstract configPath(): string | null;
-  abstract readConfig(): Record<string, any>;
-  abstract writeConfig(data: Record<string, any>): void;
-  abstract registerServer(name: string, config: Record<string, any>): void;
-  abstract discoverServers(): Record<string, Record<string, any>>;
+  abstract readConfig(): Record<string, unknown>;
+  abstract writeConfig(data: Record<string, unknown>): void;
+  abstract registerServer(name: string, config: Record<string, unknown>): void;
+  abstract discoverServers(): Record<string, Record<string, unknown>>;
 }

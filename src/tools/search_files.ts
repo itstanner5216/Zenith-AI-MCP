@@ -563,6 +563,9 @@ export function register(server: ToolServer, ctx: ToolContext) {
             return { content: [{ type: "text" as const, text }] };
         }
         // ---- CONTENT SEARCH MODE ----
+        if (!args.contentQuery) {
+            throw new Error('contentQuery required for content mode.');
+        }
         const userMaxResults = Math.min(500, Math.max(1, args.maxResults ?? 50));
         const contextLines = Math.max(0, args.contextLines ?? 0);
         const allExcludes = DEFAULT_EXCLUDE_GLOBS;

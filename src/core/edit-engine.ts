@@ -66,7 +66,7 @@ function findMatch(content: string, oldText: string, nearLine: number | undefine
     const trimmedOld = oldLinesTrimmed.join('\n');
     const trimIdx = findOccurrence(trimmedContent, trimmedOld, nearLine);
     if (trimIdx !== -1) {
-        const origIdx = mapTrimmedIndex(content, trimmedContent, trimIdx, trimmedOld.length);
+        const origIdx = mapTrimmedIndex(content, trimmedContent, trimIdx);
         if (origIdx !== -1) {
             const endPos = findOriginalEnd(content, origIdx, oldLinesTrimmed.length);
             return { index: origIdx, matchedText: content.slice(origIdx, endPos), strategy: 'trim-trailing' };
@@ -130,7 +130,7 @@ function findOccurrence(haystack: string, needle: string, nearLine: number | und
     return best;
 }
 
-function mapTrimmedIndex(original: string, trimmed: string, trimmedIdx: number, trimmedLen: number): number {
+function mapTrimmedIndex(original: string, trimmed: string, trimmedIdx: number): number {
     const trimmedBefore = trimmed.slice(0, trimmedIdx);
     const lineNum = trimmedBefore.split('\n').length - 1;
     const normalizedOrig = normalizeLineEndings(original);

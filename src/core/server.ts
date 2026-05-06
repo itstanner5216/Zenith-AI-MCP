@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { createRequire } from 'module';
 import fs from "fs/promises";
 import path from "path";
 import { normalizePath, expandHome } from './path-utils.js';
@@ -21,8 +22,9 @@ import { register as registerRefactorBatch } from '../tools/refactor_batch.js';
 import { configureRegistry } from '../adapters/index.js';
 import { loadSettings } from '../config/index.js';
 import { onRootsChanged } from './project-context.js';
-import { createRetrievalPipelineForZenith, ZenithToolRegistry } from '../retrieval/index.js';
-import { defaultRetrievalConfig } from '../retrieval/models.js';
+
+const _require = createRequire(import.meta.url);
+const _pkg = _require('../../package.json') as { version: string };
 
 export async function resolveInitialAllowedDirectories(args: string[]): Promise<string[]> {
   return Promise.all(args.map(async (dir: string) => {
@@ -71,7 +73,7 @@ function registerAllTools(server: ToolServer, ctx: ToolContext): void {
 
 export function createFilesystemServer(ctx: FilesystemContext): McpServer {
   const server = new McpServer(
-  { name: "zenith-mcp", version: "0.3.0" },
+  { name: "zenith-mcp", version: _pkg.version },
   {
     instructions: "Each call must set mode and the corresponding params, unless the schema lists the param explicitly as optional. Global Mode Rule: tool params apply only to the mode specified in the tools description. A param is shared only when explicitly listed for multiple modes."
   }
@@ -83,12 +85,7 @@ export function createFilesystemServer(ctx: FilesystemContext): McpServer {
     configureRegistry(settings.backupDir ?? undefined);
   }
 
-  // Initialize retrieval pipeline (opt-in via config — disabled by default)
-  const retrievalConfig = defaultRetrievalConfig();
-  const toolRegistry = new ZenithToolRegistry();
-  const pipeline = createRetrievalPipelineForZenith({ registry: toolRegistry, config: retrievalConfig });
-  ctx._retrievalPipeline = pipeline;
-  ctx._toolRegistry = toolRegistry;
+
 
   registerAllTools(server as ToolServer, ctx);
   return server;
@@ -99,7 +96,7 @@ export function attachRootsHandlers(server: McpServer, ctx: FilesystemContext): 
     const validatedRootDirs = await getValidRootDirectories(requestedRoots);
     if (validatedRootDirs.length > 0) {
       ctx.setAllowedDirectories(validatedRootDirs);
-      onRootsChanged({ getAllowedDirectories: ctx.getAllowedDirectories });
+      onRootsChanged();
       console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories`);
     } else {
       console.error("No valid root directories provided by client");

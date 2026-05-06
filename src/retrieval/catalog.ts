@@ -24,9 +24,7 @@ function extractParamNames(inputSchema: unknown): string[] {
   return Object.keys(props).sort();
 }
 
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+import { isObject } from "./utils.js";
 
 export function buildSnapshot(registry: Record<string, ToolMapping>): ToolCatalogSnapshot {
   _versionCounter++;

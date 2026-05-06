@@ -198,10 +198,9 @@ app.post('/mcp', async (req, res) => {
     // Handle the initialize request — this sets transport.sessionId
     await transport.handleRequest(req, res, req.body);
 
-    // Store the session — sync ctx._sessionId to the transport's assigned ID.
+    // Store the session
     const sid = transport.sessionId;
     if (sid) {
-        ctx._sessionId = sid;
         sessions.set(sid, { type: 'streamable', transport, server, ctx, lastSeenAt: Date.now() });
         console.error(`[session:${sid.slice(0, 8)}] opened (streamable)`);
     }
@@ -260,7 +259,7 @@ app.get('/sse', async (req, res) => {
     const messageEndpoint = normalizedPrefix ? `${normalizedPrefix}/messages` : '/messages';
     const transport = new SSEServerTransport(messageEndpoint, res);
     const sid = transport.sessionId;
-    ctx._sessionId = sid;
+
 
     sessions.set(sid, { type: 'sse', transport, server, ctx, lastSeenAt: Date.now() });
     console.error(`[session:${sid.slice(0, 8)}] opened (sse)`);

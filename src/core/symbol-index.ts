@@ -171,15 +171,6 @@ export function pruneOldSessions(db: Database, currentSessionId: string): void {
     db.prepare('DELETE FROM versions WHERE session_id != ?').run(currentSessionId);
 }
 
-function pruneOldVersions(db: Database, ttlMs: number): void {
-    const cutoff = Date.now() - ttlMs;
-    db.prepare('DELETE FROM versions WHERE created_at < ?').run(cutoff);
-}
-
-function defaultVersionTtlMs(): number {
-    const hours = Number(process.env.REFACTOR_VERSION_TTL_HOURS) || 24;
-    return hours * 60 * 60 * 1000;
-}
 
 // ---------------------------------------------------------------------------
 // File hashing

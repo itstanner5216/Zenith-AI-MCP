@@ -77,8 +77,6 @@ export type {
   StructureBlock,
   Anchor,
   EntryMeta,
-  DedupStats as DedupStatsBase,
-  DedupResult as DedupResultBase,
   TemplateInfoFull,
   CompressConfig as CompressConfigShape,
   ToonArrayMeta,

@@ -73,7 +73,7 @@ export class RollingMetrics {
 
     const events = this._events
       .map((e) => e.event)
-      .filter((ev) => group === undefined || (ev as any).group === group);
+      .filter((ev) => group === undefined || ev.group === group);
 
     if (events.length === 0) {
       return { ...EMPTY_SNAPSHOT };
@@ -81,14 +81,14 @@ export class RollingMetrics {
 
     const total = events.length;
     const describeCount = events.filter(
-      (ev) => (ev as any).routerDescribes && (ev as any).routerDescribes.length > 0
+      (ev) => ev.routerDescribes && ev.routerDescribes.length > 0
     ).length;
     const tier56Count = events.filter(
-      (ev) => ((ev as any).fallbackTier ?? 1) >= 5
+      (ev) => (ev.fallbackTier ?? 1) >= 5
     ).length;
 
     const latencies = events
-      .map((ev) => (ev as any).scorerLatencyMs ?? 0)
+      .map((ev) => ev.scorerLatencyMs ?? 0)
       .sort((a, b) => a - b);
 
     const pct = (sorted: number[], p: number): number => {
@@ -97,9 +97,9 @@ export class RollingMetrics {
       return sorted[idx];
     };
 
-    const totalK = events.reduce((s, ev) => s + ((ev as any).activeK ?? 0), 0);
+    const totalK = events.reduce((s, ev) => s + (ev.activeK ?? 0), 0);
     const totalEnum = events.reduce(
-      (s, ev) => s + ((ev as any).routerEnumSize ?? 0),
+      (s, ev) => s + (ev.routerEnumSize ?? 0),
       0
     );
 

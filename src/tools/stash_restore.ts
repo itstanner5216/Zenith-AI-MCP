@@ -2,7 +2,7 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from 'path';
 import { randomBytes } from 'crypto';
-import { normalizeLineEndings, createMinimalDiff } from '../core/lib.js';
+import { normalizeLineEndings, createMinimalDiff, findResumeOffset } from '../core/lib.js';
 import { getStashEntry, consumeAttempt, clearStash, listStash } from '../core/stash.js';
 import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
 import { findRepoRoot, getDb, snapshotSymbol, getSessionId, } from '../core/symbol-index.js';
@@ -80,6 +80,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
                 const preview = p.content.length > 500 ? p.content.slice(0, 500) + '...' : p.content;
                 return { content: [{ type: 'text', text: `[write] ${entry.filePath}\n${preview}` }] };
             }
+            throw new Error(`Unknown stash type: ${entry.type}`);
         }
         // =================================================================
         // RESTORE — clear a stash entry
@@ -193,27 +194,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
                             const existingLines = existing.split('\n');
                             const incomingLines = content.split('\n');
                             const tailLines = existingLines.slice(-500);
-                            let overlap = 0;
-                            if (tailLines.length && incomingLines.length) {
-                                const trim = (s: string) => s.trimEnd();
-                                const first = trim(incomingLines[0]);
-                                for (let i = 0; i < tailLines.length; i++) {
-                                    if (trim(tailLines[i]) !== first)
-                                        continue;
-                                    const overlapLen = Math.min(tailLines.length - i, incomingLines.length);
-                                    let matched = true;
-                                    for (let j = 0; j < overlapLen; j++) {
-                                        if (trim(tailLines[i + j]) !== trim(incomingLines[j])) {
-                                            matched = false;
-                                            break;
-                                        }
-                                    }
-                                    if (matched) {
-                                        overlap = overlapLen;
-                                        break;
-                                    }
-                                }
-                            }
+                            const overlap = findResumeOffset(tailLines, incomingLines);
                             const appendChunk = overlap > 0 ? incomingLines.slice(overlap).join('\n') : content;
                             const separator = existing.endsWith('\n') ? '' : '\n';
                             finalContent = existing + separator + appendChunk;

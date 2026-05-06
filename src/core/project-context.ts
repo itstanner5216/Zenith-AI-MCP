@@ -2,7 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import Database from 'better-sqlite3';
-import { findRepoRoot, getDb } from './symbol-index.js';
+import { getDb } from './symbol-index.js';
 import { ProjectRegistry } from './project-registry.js';
 import { resolveProjectRoot, clearProjectScopeCache } from '../utils/project-scope.js';
 
@@ -267,7 +267,7 @@ export function getProjectContext(ctx: FsContext): ProjectContext {
 /**
  * Hook into server.js — call this when roots change to refresh context.
  */
-export function onRootsChanged(_ctx: FsContext): void {
+export function onRootsChanged(): void {
     if (_instance) {
         _instance.refresh();
     }

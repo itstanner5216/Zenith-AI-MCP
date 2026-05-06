@@ -2,7 +2,7 @@ import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
 import { randomBytes } from 'crypto';
-import { normalizeLineEndings } from '../core/lib.js';
+import { normalizeLineEndings, findResumeOffset } from '../core/lib.js';
 import { stashWrite } from '../core/stash.js';
 import type { ToolContext, ToolServer } from './types.js';
 import { errorMessage } from './types.js';
@@ -14,27 +14,7 @@ type WriteFileArgs = {
     append?: boolean;
 };
 
-function findResumeOffset(existingTailLines: string[], incomingLines: string[]): number {
-    if (!existingTailLines.length || !incomingLines.length)
-        return 0;
-    const trim = (s: string) => s.trimEnd();
-    const firstIncoming = trim(incomingLines[0]);
-    for (let i = 0; i < existingTailLines.length; i++) {
-        if (trim(existingTailLines[i]) !== firstIncoming)
-            continue;
-        const overlapLen = Math.min(existingTailLines.length - i, incomingLines.length);
-        let matched = true;
-        for (let j = 0; j < overlapLen; j++) {
-            if (trim(existingTailLines[i + j]) !== trim(incomingLines[j])) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched)
-            return overlapLen;
-    }
-    return 0;
-}
+
 export function register(server: ToolServer, ctx: ToolContext): void {
     server.registerTool("write_file", {
         title: "Write File",

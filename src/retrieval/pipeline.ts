@@ -164,15 +164,21 @@ export class RetrievalPipeline {
   // ── Index helpers ─────────────────────────────────────────────────────
 
   private idxOk(): boolean {
-    const r = this.retriever as unknown as { _env_index?: unknown };
-    return r._env_index != null;
+    // TODO: Wire when BMXF retriever is connected
+    if ('isIndexReady' in this.retriever && typeof (this.retriever as Record<string, unknown>).isIndexReady === 'function') {
+      return (this.retriever as unknown as { isIndexReady(): boolean }).isIndexReady();
+    }
+    return false;
   }
 
   private hasKw(): boolean { return this.keywordRetriever !== null; }
 
   private hasFreq(): boolean {
-    const p = (this.logger as unknown as { _path?: string })._path;
-    return p != null && existsSync(p);
+    if ('getLogPath' in this.logger && typeof (this.logger as Record<string, unknown>).getLogPath === 'function') {
+      const p = (this.logger as unknown as { getLogPath(): string | null }).getLogPath();
+      return p != null && existsSync(p);
+    }
+    return false;
   }
 
   // ── Tier 4 ────────────────────────────────────────────────────────────
@@ -226,7 +232,10 @@ export class RetrievalPipeline {
   // ── Tier 5 ────────────────────────────────────────────────────────────
 
   private freqPrior(k: number): ScoredTool[] {
-    const p = (this.logger as unknown as { _path?: string })._path;
+    let p: string | null = null;
+    if ('getLogPath' in this.logger && typeof (this.logger as Record<string, unknown>).getLogPath === 'function') {
+      p = (this.logger as unknown as { getLogPath(): string | null }).getLogPath();
+    }
     if (!p || !existsSync(p)) return [];
 
     const cutoff = Date.now() / 1000 - 7 * 86400;
@@ -332,8 +341,9 @@ export class RetrievalPipeline {
 
     // 5. Pending rebuild (only if NO session is mid-turn — HAZARD 4)
     if (this._pendingRebuild !== null && !Array.from(this._inTurn.values()).some(Boolean)) {
-      const rb = (this.retriever as unknown as { rebuildIndex?: (r: Record<string, ToolMapping>) => void }).rebuildIndex;
-      if (rb) rb(this._pendingRebuild);
+      if ('rebuildIndex' in this.retriever && typeof (this.retriever as Record<string, unknown>).rebuildIndex === 'function') {
+        (this.retriever as unknown as { rebuildIndex(r: Record<string, ToolMapping>): void }).rebuildIndex(this._pendingRebuild);
+      }
       this._pendingRebuild = null;
     }
 
@@ -358,8 +368,9 @@ export class RetrievalPipeline {
 
     // 8. Pin catalog version
     let ver = "";
-    const gv = (this.retriever as unknown as { getSnapshotVersion?: () => string }).getSnapshotVersion;
-    if (gv) ver = gv() ?? "";
+    if ('getSnapshotVersion' in this.retriever && typeof (this.retriever as Record<string, unknown>).getSnapshotVersion === 'function') {
+      ver = (this.retriever as unknown as { getSnapshotVersion(): string }).getSnapshotVersion() ?? "";
+    }
     this._snapVer.set(sid, ver);
     state.catalogVersion = ver;
 
@@ -552,8 +563,9 @@ export class RetrievalPipeline {
       this._pendingRebuild = { ...registry };
       return;
     }
-    const rb = (this.retriever as unknown as { rebuildIndex?: (r: Record<string, ToolMapping>) => void }).rebuildIndex;
-    if (rb) rb(registry);
+    if ('rebuildIndex' in this.retriever && typeof (this.retriever as Record<string, unknown>).rebuildIndex === 'function') {
+      (this.retriever as unknown as { rebuildIndex(r: Record<string, ToolMapping>): void }).rebuildIndex(registry);
+    }
     this.metrics?.recordRescore();
   }
 

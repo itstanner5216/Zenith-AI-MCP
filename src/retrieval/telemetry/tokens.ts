@@ -1,4 +1,3 @@
-import type { RootEvidence, WorkspaceEvidence } from "../models.js";
 
 export const TOKEN_WEIGHTS: Record<string, number> = {
   "manifest:": 3.0,
@@ -103,7 +102,7 @@ function _applyFamilyCap(tokens: Record<string, number>): Record<string, number>
     const cap = currentTotal * MAX_FAMILY_CONTRIBUTION;
     let changed = false;
 
-    for (const [familyKey, familyTokens] of families.entries()) {
+    for (const [, familyTokens] of families.entries()) {
       const familySum = familyTokens.reduce((s, tok) => s + result[tok], 0);
       if (familySum > cap) {
         const scale = cap / familySum;

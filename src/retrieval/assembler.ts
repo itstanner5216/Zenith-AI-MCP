@@ -48,9 +48,7 @@ function stripDescriptions(schema: unknown): unknown {
   return result;
 }
 
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+import { isObject } from "./utils.js";
 
 export class TieredAssembler {
   assemble(

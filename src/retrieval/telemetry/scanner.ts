@@ -141,7 +141,7 @@ async function _scanRootAsync(
 
     let entries: { name: string; isFile: () => boolean; isDirectory: () => boolean; isSymbolicLink: () => boolean }[];
     try {
-      entries = (await readdir(dirPath, { withFileTypes: true })) as any;
+      entries = await readdir(dirPath, { withFileTypes: true });
     } catch {
       return;
     }

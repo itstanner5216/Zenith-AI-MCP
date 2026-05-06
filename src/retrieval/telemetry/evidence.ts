@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import type { RootEvidence, WorkspaceEvidence } from "../models.js";
 
-export type { RootEvidence, WorkspaceEvidence } from "../models.js";
-
 export function mergeEvidence(roots: RootEvidence[]): WorkspaceEvidence {
   const merged: Record<string, number> = {};
   for (const root of roots) {

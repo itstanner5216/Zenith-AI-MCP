@@ -121,6 +121,20 @@ interface RefactorBatchArgs {
 // ---------------------------------------------------------------------------
 // Module-level caches (per-process, keyed by `${repoRoot}::${sessionId}`)
 // ---------------------------------------------------------------------------
+const CACHE_MAX_ENTRIES = 64;
+
+/** Evict oldest entries when a Map exceeds CACHE_MAX_ENTRIES. */
+function evictOldest<V>(map: Map<string, V>): void {
+    if (map.size <= CACHE_MAX_ENTRIES) return;
+    const excess = map.size - CACHE_MAX_ENTRIES;
+    const iter = map.keys();
+    for (let i = 0; i < excess; i++) {
+        const { value, done } = iter.next();
+        if (done) break;
+        map.delete(value);
+    }
+}
+
 const _loadCache = new Map<string, LoadCache>();
 // Reserved for Task 2.1 (apply/reapply) — declared now so Wave 2 only extends.
 const _payloadCache = new Map<string, PayloadCache>();
@@ -308,6 +322,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
                 remaining: [],
                 contextLines: null,
             });
+            evictOldest(_loadCache);
             if (!successResult.results.length) {
                 return { content: [{ type: 'text' as const, text: 'No references.' }] };
             }
@@ -536,6 +551,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
                 occurrences: priorOccurrences.concat(emittedOccurrences),
                 modalBySymbol,
             });
+            evictOldest(_loadCache);
             if (!blocks.length) {
                 return { content: [{ type: 'text' as const, text: 'No symbols loaded.' }] };
             }
@@ -821,6 +837,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
                     if (successfulGroupNames.has(g.symbol) && !failedGroupMessages.has(g.symbol)) {
                         const modal = cached?.modalBySymbol?.get(g.symbol) || null;
                         _payloadCache.set(`${repoRoot}::${sessionId}::${g.symbol}`, { body: g.body, ack: g.ack, modalStructure: modal });
+                        evictOldest(_payloadCache);
                     }
                 }
             }

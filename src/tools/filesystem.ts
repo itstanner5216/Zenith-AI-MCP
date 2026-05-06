@@ -23,14 +23,16 @@ export function register(server: ToolServer, ctx: ToolContext) {
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args) => {
         if (args.mode === "mkdir") {
-            const validPath = await ctx.validatePath(args.path!);
+            if (!args.path) throw new Error('path required for mkdir.');
+            const validPath = await ctx.validatePath(args.path);
             await fs.mkdir(validPath, { recursive: true });
             return { content: [{ type: "text", text: "Created." }] };
         }
         if (args.mode === "delete") {
+            if (!args.path) throw new Error('path required for delete.');
             let validPath;
             try {
-                validPath = await ctx.validatePath(args.path!);
+                validPath = await ctx.validatePath(args.path);
             }
             catch (e: unknown) {
                 if (e instanceof Error && (((e as NodeJS.ErrnoException).code === 'ENOENT') || e.message.includes('ENOENT'))) {
@@ -46,13 +48,16 @@ export function register(server: ToolServer, ctx: ToolContext) {
             return { content: [{ type: "text", text: "Deleted." }] };
         }
         if (args.mode === "move") {
-            const validSourcePath = await ctx.validatePath(args.source!);
-            const validDestPath = await ctx.validatePath(args.destination!);
+            if (!args.source) throw new Error('source required for move.');
+            if (!args.destination) throw new Error('destination required for move.');
+            const validSourcePath = await ctx.validatePath(args.source);
+            const validDestPath = await ctx.validatePath(args.destination);
             await fs.rename(validSourcePath, validDestPath);
             return { content: [{ type: "text", text: "Moved." }] };
         }
         if (args.mode === "info") {
-            const validPath = await ctx.validatePath(args.path!);
+            if (!args.path) throw new Error('path required for info.');
+            const validPath = await ctx.validatePath(args.path);
             const info = await getFileStats(validPath);
             const text = Object.entries(info).map(([key, value]) => `${key}: ${value}`).join("\n");
             return { content: [{ type: "text", text }] };

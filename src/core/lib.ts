@@ -12,23 +12,12 @@ function hasCode(e: unknown): e is { code: string } {
     return typeof e === 'object' && e !== null && 'code' in e && typeof (e as Record<string, unknown>).code === 'string';
 }
 
-let allowedDirectories: string[] = [];
 
-export function setAllowedDirectories(directories: string[]): void {
-    allowedDirectories = [...directories];
-}
-
-export function getAllowedDirectories(): string[] {
-    return [...allowedDirectories];
-}
 
 export interface FilesystemContext {
     getAllowedDirectories(): string[];
     setAllowedDirectories(directories: string[]): void;
     validatePath(requestedPath: string): Promise<string>;
-    _sessionId?: string;
-    _retrievalPipeline?: unknown;
-    _toolRegistry?: unknown;
 }
 
 export function createFilesystemContext(initialAllowedDirectories: string[] = []): FilesystemContext {
@@ -93,6 +82,32 @@ export function formatSize(bytes: number): string {
     return `${(bytes / Math.pow(1024, unitIndex)).toFixed(2)} ${units[unitIndex]}`;
 }
 
+/**
+ * Detect how many incoming lines overlap with the tail of an existing file.
+ * Used by append-mode writes to avoid duplicating content on resume.
+ */
+export function findResumeOffset(existingTailLines: string[], incomingLines: string[]): number {
+    if (!existingTailLines.length || !incomingLines.length)
+        return 0;
+    const trim = (s: string) => s.trimEnd();
+    const firstIncoming = trim(incomingLines[0]);
+    for (let i = 0; i < existingTailLines.length; i++) {
+        if (trim(existingTailLines[i]) !== firstIncoming)
+            continue;
+        const overlapLen = Math.min(existingTailLines.length - i, incomingLines.length);
+        let matched = true;
+        for (let j = 0; j < overlapLen; j++) {
+            if (trim(existingTailLines[i + j]) !== trim(incomingLines[j])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched)
+            return overlapLen;
+    }
+    return 0;
+}
+
 export function normalizeLineEndings(text: string): string {
     return text.replace(/\r\n/g, '\n');
 }
@@ -109,42 +124,7 @@ export function createMinimalDiff(originalContent: string, newContent: string, f
     return createTwoFilesPatch(filepath, filepath, normalizedOriginal, normalizedNew, '', '', { context: 0 });
 }
 
-export async function validatePath(requestedPath: string) {
-    const expandedPath = expandHome(requestedPath);
-    const absolute = path.isAbsolute(expandedPath)
-        ? path.resolve(expandedPath)
-        : path.resolve(process.cwd(), expandedPath);
-    const normalizedRequested = normalizePath(absolute);
 
-    const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, allowedDirectories);
-    if (!isAllowed) {
-        throw new Error(`Access denied - path outside allowed directories: ${absolute} not in ${allowedDirectories.join(', ')}`);
-    }
-
-    try {
-        const realPath = await fs.realpath(absolute);
-        const normalizedReal = normalizePath(realPath);
-        if (!isPathWithinAllowedDirectories(normalizedReal, allowedDirectories)) {
-            throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(', ')}`);
-        }
-        return realPath;
-    } catch (error: unknown) {
-        if (hasCode(error) && error.code === 'ENOENT') {
-            const parentDir = path.dirname(absolute);
-            try {
-                const realParentPath = await fs.realpath(parentDir);
-                const normalizedParent = normalizePath(realParentPath);
-                if (!isPathWithinAllowedDirectories(normalizedParent, allowedDirectories)) {
-                    throw new Error(`Access denied - parent directory outside allowed directories: ${realParentPath} not in ${allowedDirectories.join(', ')}`);
-                }
-                return absolute;
-            } catch {
-                throw new Error(`Parent directory does not exist: ${parentDir}`);
-            }
-        }
-        throw error;
-    }
-}
 
 export async function getFileStats(filePath: string) {
     const stats = await fs.stat(filePath);
@@ -356,19 +336,18 @@ export async function searchFilesWithValidation(rootPath: string, pattern: strin
         const entries = await fs.readdir(currentPath, { withFileTypes: true });
         for (const entry of entries) {
             const fullPath = path.join(currentPath, entry.name);
-            try {
-                await validatePath(fullPath);
-                const relativePath = path.relative(rootPath, fullPath);
-                const shouldExclude = excludePatterns.some(excludePattern => minimatch(relativePath, excludePattern, { dot: true }));
-                if (shouldExclude) continue;
-                if (minimatch(relativePath, pattern, { dot: true })) {
-                    results.push(fullPath);
-                }
-                if (entry.isDirectory()) {
-                    await search(fullPath);
-                }
-            } catch {
+            const normalizedFull = normalizePath(path.resolve(fullPath));
+            if (!isPathWithinAllowedDirectories(normalizedFull, allowedDirectories)) {
                 continue;
+            }
+            const relativePath = path.relative(rootPath, fullPath);
+            const shouldExclude = excludePatterns.some(excludePattern => minimatch(relativePath, excludePattern, { dot: true }));
+            if (shouldExclude) continue;
+            if (minimatch(relativePath, pattern, { dot: true })) {
+                results.push(fullPath);
+            }
+            if (entry.isDirectory()) {
+                await search(fullPath);
             }
         }
     }

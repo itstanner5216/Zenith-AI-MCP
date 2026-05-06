@@ -41,38 +41,11 @@ export function buildRoutingToolSchema(demotedToolIds: string[]): Tool {
   };
 }
 
-export function formatNamespaceGrouped(
-  toolIds: string[],
-  envNamespaces: string[],
-): string[] {
-  const groups = new Map<string, string[]>();
-
-  for (const id of toolIds) {
-    const i = id.indexOf("__");
-    const ns = i >= 0 ? id.slice(0, i) : "";
-    let g = groups.get(ns);
-    if (!g) { g = []; groups.set(ns, g); }
-    g.push(id);
-  }
-
-  const out: string[] = [];
-
-  for (const ns of envNamespaces) {
-    const g = groups.get(ns);
-    if (g) { out.push(...g.sort()); groups.delete(ns); }
-  }
-
-  for (const ns of [...groups.keys()].sort()) {
-    out.push(...(groups.get(ns) ?? []).sort());
-  }
-
-  return out;
-}
 
 export function handleRoutingCall(
   name: string,
   describe: boolean,
-  args: Record<string, unknown>,
+  _args: Record<string, unknown>,
   registry: Record<string, ToolMapping>,
 ): TextContent[] {
   const mapping = registry[name];
