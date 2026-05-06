@@ -116,6 +116,17 @@ describe('edit_file tool handler — content mode', () => {
         await expect(handler({ path: filePath, edits: undefined }))
             .rejects.toThrow('No edits provided');
     });
+
+    it('returns a syntax warning when the rewritten file has parse errors', async () => {
+        const filePath = path.join(repoDir, 'warn.js');
+        fs.writeFileSync(filePath, 'function foo() {\n    return 1;\n}\n');
+        const result = await handler({
+            path: filePath,
+            edits: [{ mode: 'content', oldContent: '    return 1;', newContent: '    return {' }],
+        });
+        expect(result.content[0].text).toContain('⚠ Parse errors');
+        expect(fs.readFileSync(filePath, 'utf-8')).toContain('return {');
+    });
 });
 
 describe('edit_file tool handler — dryRun mode', () => {
@@ -182,5 +193,20 @@ describe('edit_file tool handler — block mode', () => {
         });
         expect(result.content[0].text).toContain('Applied');
         expect(fs.readFileSync(filePath, 'utf-8')).toContain('return 2');
+    });
+
+    it('preserves the original file when block replacement fails', async () => {
+        const filePath = path.join(repoDir, 'missing-block.js');
+        fs.writeFileSync(filePath, 'function foo() {\n    return 1;\n}\n');
+        await expect(handler({
+            path: filePath,
+            edits: [{
+                mode: 'block',
+                block_start: 'function missing() {',
+                block_end: '}',
+                replacement_block: 'function missing() {\n    return 2;\n}',
+            }],
+        })).rejects.toThrow('block_start not found');
+        expect(fs.readFileSync(filePath, 'utf-8')).toBe('function foo() {\n    return 1;\n}\n');
     });
 });
