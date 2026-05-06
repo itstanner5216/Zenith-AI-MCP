@@ -3,6 +3,8 @@ import fs from 'fs';
 import os from 'os';
 import Database from 'better-sqlite3';
 import { findRepoRoot, getDb } from './symbol-index.js';
+import { ProjectRegistry } from './project-registry.js';
+import { resolveProjectRoot, clearProjectScopeCache } from '../utils/project-scope.js';
 
 const ZENITH_HOME = path.join(os.homedir(), '.zenith-mcp');
 const GLOBAL_DB_PATH = path.join(ZENITH_HOME, 'global-stash.db');
@@ -50,14 +52,11 @@ function getGlobalDb(): Database {
 // ---------------------------------------------------------------------------
 // ProjectContext — the single authority on "what project am I in?"
 //
-// Resolution ladder:
-//   1. MCP roots from client (bound on init + refreshed on roots_changed)
-//   2. Git repo detection from the bound root
-//   3. Refresh/rebind on roots change notification
-//   4. Fallback to cwd
-//   5. If 1-4 fail: check manually registered project_roots table,
-//      or allow stashInit to register a new project root
-//   6. Global catch-all (~/.zenith-mcp/global-stash.db)
+// Resolution ladder (delegated to ../utils/project-scope.ts):
+//   1. Git repo detection
+//   2. Marker-based detection
+//   3. Registry matching (SQLite + allowed directories)
+//   4. Global fallback
 // ---------------------------------------------------------------------------
 
 export class ProjectContext {
@@ -66,13 +65,16 @@ export class ProjectContext {
     private _isGlobal: boolean;
     private _resolved: boolean;
     private _explicit: boolean;
+    private _registry: ProjectRegistry;
 
     constructor(ctx: FsContext) {
-        this._ctx = ctx;          // filesystem context (getAllowedDirectories, validatePath, etc.)
-        this._boundRoot = null;   // resolved project root (git or manual)
-        this._isGlobal = false;   // true if we fell through to global
-        this._resolved = false;   // true if we've done initial resolution
-        this._explicit = false;   // true if root was set explicitly via initProject (sticky)
+        this._ctx = ctx;
+        this._boundRoot = null;
+        this._isGlobal = false;
+        this._resolved = false;
+        this._explicit = false;
+        this._registry = new ProjectRegistry();
+        this._syncRegistry();
     }
 
     // --- Public API ---
@@ -140,6 +142,8 @@ export class ProjectContext {
         this._isGlobal = false;
         this._resolved = false;
         this._explicit = false;
+        clearProjectScopeCache();
+        this._syncRegistry();
         this._resolve();
     }
 
@@ -156,6 +160,13 @@ export class ProjectContext {
         db.prepare(
             'INSERT OR REPLACE INTO project_roots (root_path, name, created_at) VALUES (?, ?, ?)'
         ).run(abs, name || path.basename(abs), Date.now());
+
+        // Also register in-memory for immediate use
+        this._registry.register({
+            project_id: path.basename(abs),
+            project_name: name || path.basename(abs),
+            project_root: abs,
+        });
 
         // Bind to this project immediately (sticky — overrides any auto-promote)
         this._boundRoot = abs;
@@ -175,77 +186,51 @@ export class ProjectContext {
 
     // --- Private resolution ladder ---
 
+    /**
+     * Sync the in-memory ProjectRegistry from the persisted SQLite registry.
+     */
+    private _syncRegistry(): void {
+        try {
+            const db = getGlobalDb();
+            const rows = db.prepare<ProjectRootRow>('SELECT root_path, name FROM project_roots').all();
+            for (const row of rows) {
+                this._registry.register({
+                    project_id: row.name || path.basename(row.root_path),
+                    project_name: row.name,
+                    project_root: row.root_path,
+                });
+            }
+        } catch {
+            // Registry might be empty or DB not ready yet
+        }
+    }
+
     _resolve(): void {
         this._resolved = true;
 
-        // Step 1: MCP roots from client
-        const root = this._resolveFromMcpRoots();
+        // Delegate to shared utility with this context's allowed directories and registry
+        const root = resolveProjectRoot(process.cwd(), {
+            allowedDirectories: this._ctx.getAllowedDirectories(),
+            registryEntries: this._registry.listProjects(),
+        });
+
         if (root) {
             this._boundRoot = root;
             this._isGlobal = false;
             return;
         }
 
-        // Step 4: Fallback to cwd
-        const cwdRoot = this._resolveFromPath(process.cwd());
-        if (cwdRoot) {
-            this._boundRoot = cwdRoot;
-            this._isGlobal = false;
-            return;
-        }
-
-        // Step 5: Check manually registered project roots
-        const registeredRoot = this._resolveFromRegistry();
-        if (registeredRoot) {
-            this._boundRoot = registeredRoot;
-            this._isGlobal = false;
-            return;
-        }
-
-        // Step 6: Global fallback
+        // Global fallback
         this._boundRoot = null;
         this._isGlobal = true;
     }
 
-    // Step 1+2: MCP roots → git repo detection
-    _resolveFromMcpRoots(): string | null {
-        let dirs: string[];
-        try { dirs = this._ctx.getAllowedDirectories(); } catch { return null; }
-        if (!dirs || !dirs.length) return null;
-
-        // If there's exactly one allowed dir, use it directly
-        // If multiple, try to find a git repo among them
-        for (const dir of dirs) {
-            const gitRoot = findRepoRoot(dir);
-            if (gitRoot) return gitRoot;
-        }
-        // If no git root found but we have exactly one allowed dir, use it
-        if (dirs.length === 1) return dirs[0];
-        return null;
-    }
-
-    // Step 2: Git repo detection from a given path
-    _resolveFromPath(p: string): string | null {
-        if (!p) return null;
-        try {
-            const gitRoot = findRepoRoot(p);
-            if (gitRoot) return gitRoot;
-        } catch {}
-        return null;
-    }
-
-    // Step 5: Check the project_roots registry
-    _resolveFromRegistry(): string | null {
-        try {
-            const db = getGlobalDb();
-            const rows = db.prepare<ProjectRootRow>('SELECT root_path FROM project_roots ORDER BY created_at DESC').all();
-            const cwd = process.cwd();
-            // Check if cwd is inside any registered project
-            for (const row of rows) {
-                if (cwd.startsWith(row.root_path)) return row.root_path;
-            }
-            return null;
-        } catch { return null; }
+    // Step 1+2: Resolve from a specific file path (git → markers → registry)
+    _resolveFromPath(filePath: string): string | null {
+        return resolveProjectRoot(filePath, {
+            allowedDirectories: this._ctx.getAllowedDirectories(),
+            registryEntries: this._registry.listProjects(),
+        });
     }
 }
 
