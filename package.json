@@ -22,7 +22,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && shx chmod +x dist/cli/*.js dist/server/*.js dist/config/adapter-cli.js dist/config/zenith-mcp/admin-cli.js",
+    "build": "tsc && shx cp -r grammars dist/ && shx chmod +x dist/cli/*.js dist/server/*.js dist/config/adapter-cli.js dist/config/zenith-mcp/admin-cli.js",
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "test": "vitest run --coverage",
