@@ -20,7 +20,8 @@ import { register as registerFilesystem } from '../tools/filesystem.js';
 import { register as registerStashRestore } from '../tools/stash_restore.js';
 import { register as registerRefactorBatch } from '../tools/refactor_batch.js';
 import { configureRegistry } from '../adapters/index.js';
-import { loadSettings } from '../config/index.js';
+import { loadConfig, saveConfig, mergeToolsIntoConfig } from '../config/index.js';
+import type { ZenithConfig } from '../config/index.js';
 import { onRootsChanged } from './project-context.js';
 
 const _require = createRequire(import.meta.url);
@@ -57,19 +58,30 @@ export async function validateDirectories(directories: string[]): Promise<void> 
   }
 }
 
-function registerAllTools(server: ToolServer, ctx: ToolContext): void {
-  registerReadFile(server, ctx);
-  registerSearchFile(server, ctx);
-  registerReadMediaFile(server, ctx);
-  registerReadMultipleFiles(server, ctx);
-  registerWriteFile(server, ctx);
-  registerEditFile(server, ctx);
-  registerDirectory(server, ctx);
-  registerSearchFiles(server, ctx);
-  registerFilesystem(server, ctx);
-  registerStashRestore(server, ctx);
-  registerRefactorBatch(server, ctx);
-}
+/**
+ * Maps each register function to its tool name string (the first argument
+ * passed to `server.registerTool(name, ...)` inside each tool file).
+ *
+ * This is the single source of truth for tool-name discovery. When a new
+ * tool file is added, append an entry here and it will be picked up
+ * automatically by config merging and the enabled/disabled guard.
+ */
+const TOOL_REGISTRY: Array<{
+  name: string;
+  register: (server: ToolServer, ctx: ToolContext) => void;
+}> = [
+  { name: "read_file",           register: registerReadFile },
+  { name: "search_file",         register: registerSearchFile },
+  { name: "read_media_file",     register: registerReadMediaFile },
+  { name: "read_multiple_files", register: registerReadMultipleFiles },
+  { name: "write_file",          register: registerWriteFile },
+  { name: "edit_file",           register: registerEditFile },
+  { name: "directory",           register: registerDirectory },
+  { name: "search_files",        register: registerSearchFiles },
+  { name: "file_manager",        register: registerFilesystem },
+  { name: "stashRestore",        register: registerStashRestore },
+  { name: "refactor_batch",      register: registerRefactorBatch },
+];
 
 export function createFilesystemServer(ctx: FilesystemContext): McpServer {
   const server = new McpServer(
@@ -79,15 +91,31 @@ export function createFilesystemServer(ctx: FilesystemContext): McpServer {
   }
 );
 
-  // Initialize adapter registry if user has enabled adapters
-  const settings = loadSettings();
-  if (settings.enabledAdapters.length > 0) {
-    configureRegistry(settings.backupDir ?? undefined);
+  // ── Config: load, merge discovered tools, persist ────────────────────
+  const config: ZenithConfig = loadConfig();
+
+  // Build the list of available tool names dynamically from the registry.
+  const availableToolNames: string[] = TOOL_REGISTRY.map((t) => t.name);
+
+  // Merge discovered tools into config (new tools default to enabled).
+  const mergedConfig = mergeToolsIntoConfig(config, availableToolNames);
+
+  // Persist the merged state so the config file always reflects reality.
+  saveConfig(mergedConfig);
+
+  // ── Auto-write adapter setup (guarded by config flag) ────────────────
+  if (mergedConfig.auto_write.status) {
+    configureRegistry(mergedConfig.auto_write.backup_dir ?? undefined);
   }
 
+  // ── Register only the tools that are enabled in config ───────────────
+  const toolServer = server as ToolServer;
+  for (const entry of TOOL_REGISTRY) {
+    if (mergedConfig.tools[entry.name]) {
+      entry.register(toolServer, ctx);
+    }
+  }
 
-
-  registerAllTools(server as ToolServer, ctx);
   return server;
 }
 

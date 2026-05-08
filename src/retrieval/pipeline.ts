@@ -245,11 +245,11 @@ export class RetrievalPipeline {
       for (const line of readFileSync(p, "utf-8").split("\n")) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        let ev: any; // eslint-disable-line @typescript-eslint/no-explicit-any
-        try { ev = JSON.parse(trimmed); } catch { continue; }
+        let ev: Record<string, unknown>;
+        try { ev = JSON.parse(trimmed) as Record<string, unknown>; } catch { continue; }
         if (ev.type === "alert" || ev.group === "shadow") continue;
 
-        const ts: number | undefined = ev.timestamp;
+        const ts = typeof ev.timestamp === "number" ? ev.timestamp : undefined;
         let days: number;
         if (ts != null) {
           if (ts < cutoff) continue;
@@ -258,8 +258,10 @@ export class RetrievalPipeline {
           days = 0;
         }
         const decay = Math.exp(-0.1 * days);
-        for (const t of ev.directToolCalls ?? []) scores.set(t, (scores.get(t) ?? 0) + decay);
-        for (const t of ev.routerProxies ?? [])   scores.set(t, (scores.get(t) ?? 0) + decay);
+        const directCalls = Array.isArray(ev.directToolCalls) ? ev.directToolCalls as string[] : [];
+        const proxies = Array.isArray(ev.routerProxies) ? ev.routerProxies as string[] : [];
+        for (const t of directCalls) scores.set(t, (scores.get(t) ?? 0) + decay);
+        for (const t of proxies)     scores.set(t, (scores.get(t) ?? 0) + decay);
       }
     } catch { return []; }
 

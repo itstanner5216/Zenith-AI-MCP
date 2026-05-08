@@ -20,22 +20,27 @@ class CodexCLIAdapter extends MCPConfigAdapter {
     return readToml(p);
   }
 
-  writeConfig(data: Record<string, any>) {
+  writeConfig(data: Record<string, unknown>) {
     const p = this.configPath()!;
     mkdirSync(dirname(p), { recursive: true });
     this.backup(p);
     writeToml(p, data);
   }
 
-  registerServer(name: string, config: Record<string, any>) {
+  registerServer(name: string, config: Record<string, unknown>) {
     const data = this.readConfig();
-    if (!data.mcp_servers) data.mcp_servers = {};
-    data.mcp_servers[name] = config;
+    if (!data.mcp_servers || typeof data.mcp_servers !== "object") data.mcp_servers = {};
+    (data.mcp_servers as Record<string, unknown>)[name] = config;
     this.writeConfig(data);
   }
 
-  discoverServers() {
-    return this.readConfig().mcp_servers ?? {};
+  discoverServers(): Record<string, Record<string, unknown>> {
+    const data = this.readConfig();
+    const servers = data.mcp_servers;
+    if (servers && typeof servers === "object" && !Array.isArray(servers)) {
+      return servers as Record<string, Record<string, unknown>>;
+    }
+    return {};
   }
 }
 

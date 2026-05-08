@@ -24,22 +24,27 @@ class OpenClawAdapter extends MCPConfigAdapter {
     return readJson5(p);
   }
 
-  writeConfig(data: Record<string, any>) {
+  writeConfig(data: Record<string, unknown>) {
     const p = this.resolvePath();
     this.backup(p);
     mkdirSync(dirname(p), { recursive: true });
     writeJson5(p, data);
   }
 
-  registerServer(name: string, config: Record<string, any>) {
+  registerServer(name: string, config: Record<string, unknown>) {
     const data = this.readConfig();
-    if (!data.mcpServers) data.mcpServers = {};
-    data.mcpServers[name] = config;
+    if (!data.mcpServers || typeof data.mcpServers !== "object") data.mcpServers = {};
+    (data.mcpServers as Record<string, unknown>)[name] = config;
     this.writeConfig(data);
   }
 
-  discoverServers() {
-    return this.readConfig().mcpServers ?? {};
+  discoverServers(): Record<string, Record<string, unknown>> {
+    const data = this.readConfig();
+    const servers = data.mcpServers;
+    if (servers && typeof servers === "object" && !Array.isArray(servers)) {
+      return servers as Record<string, Record<string, unknown>>;
+    }
+    return {};
   }
 }
 

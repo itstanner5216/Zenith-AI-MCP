@@ -125,7 +125,7 @@ ZENITH_MCP_API_KEY=secret npx zenith-mcp-http /path/to/dir1 --port=3100 --host=0
 - `POST /messages` — Legacy SSE message endpoint
 - `GET /health` — Health check
 
-Sessions are isolated per client and reaped after 30 minutes of idle time (configurable via `SESSION_TTL_MS`). All HTTP requests require `Authorization: Bearer <API_KEY>`.
+Sessions are isolated per client and reaped after 30 minutes of idle time (configurable via `session_ttl_ms` in `~/.zenith-mcp/config`). All HTTP requests require `Authorization: Bearer <API_KEY>`.
 
 ---
 
@@ -416,21 +416,18 @@ Add the configuration to `.vscode/mcp.json` in your workspace.
 }
 ```
 
-## Environment Variables
+## Configuration
+
+All settings live in `~/.zenith-mcp/config`. A first-run interactive wizard generates this file on initial startup. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) Section 8 for the full config format.
+
+The only environment variables are authentication secrets and OS paths:
 
 | Variable | Description |
 |----------|-------------|
 | `ZENITH_MCP_API_KEY` / `MCP_BRIDGE_API_KEY` / `COMMANDER_API_KEY` | API key for HTTP mode (required) |
-| `SESSION_TTL_MS` | HTTP session idle timeout in ms (default: 1800000) |
-| `CHAR_BUDGET` | Global character budget for reads (default: 400000) |
-| `SEARCH_CHAR_BUDGET` | Character budget for search results (default: 15000) |
-| `DEFAULT_EXCLUDES` | Comma-separated default exclude patterns |
-| `SENSITIVE_PATTERNS` | Comma-separated sensitive file glob patterns |
-| `REFACTOR_MAX_CHARS` | Max characters for refactor_batch (default: 30000) |
-| `REFACTOR_MAX_CONTEXT` | Max context lines for refactor_batch (default: 30) |
-| `REFACTOR_VERSION_TTL_HOURS` | Version snapshot TTL in hours (default: 24) |
-| `ZENITH_MCP_ADAPTERS_ENABLED` | Comma-separated adapter names to enable (overrides config file) |
-| `ZENITH_MCP_ADAPTER_BACKUP_DIR` | Backup directory for adapter config file changes |
+| `TOON_PROJECT_DIR` | Path to `toon` compression project |
+
+All tuning parameters (`session_ttl_ms`, `char_budget`, `search_char_budget`, `refactor_max_chars`, `refactor_max_context`, `refactor_version_ttl_hours`, `default_excludes`, `sensitive_patterns`) are in the `### Advanced` section of the config file. Tool enable/disable is in the `### Tools` section.
 
 ## Adapter Configuration
 
@@ -457,65 +454,24 @@ Zenith-MCP can auto-configure MCP client config files for 16 platforms.
 | Zed | JSON | All |
 | Antigravity | JSON | All |
 
-### Adapter CLI
+### Auto-Write Configuration
 
-```bash
-# List all available adapters
-npx zenith-mcp-config --list
+Auto-write is controlled via the unified config file at `~/.zenith-mcp/config`:
 
-# Enable adapters (comma-separated)
-npx zenith-mcp-config --enable claude_desktop,opencode
-
-# Check status
-npx zenith-mcp-config --status
-
-# Set backup directory (for config file backups before modification)
-npx zenith-mcp-config --backup-dir ~/.zenith-mcp/backups
+```text
+### Auto Write
+status: enabled
+backup_dir: ~/.zenith-mcp/mcp_backups/
+backup_mode: file
+custom_mcp_paths:
 ```
 
-Settings are persisted at `~/.zenith-mcp/adapter-config.json` and can be overridden via environment variables `ZENITH_MCP_ADAPTERS_ENABLED` and `ZENITH_MCP_ADAPTER_BACKUP_DIR`.
+- `status` — enable/disable auto-write (opt-in, disabled by default)
+- `backup_dir` — directory for config file backups before modification
+- `backup_mode` — `file` (`.bak` copies), `sqlite` (SQLite with 24h TTL), or `none`
+- `custom_mcp_paths` — comma-separated additional MCP config paths to scan
 
-## Server Configuration
-
-Zenith-MCP includes a config management system for managing external MCP server registrations.
-
-### Admin CLI
-
-```bash
-# List configured servers and their tools
-npx zenith-mcp-config-admin list
-
-# Show detailed status
-npx zenith-mcp-config-admin status
-
-# Register a new server
-npx zenith-mcp-config-admin install my-server npx -y my-mcp-server
-
-# Scan configured servers
-npx zenith-mcp-config-admin scan
-```
-
-Config is stored at `~/.zenith-mcp/zenith-mcp/servers.yaml`:
-
-```yaml
-servers:
-  my-server:
-    command: npx
-    args: ["-y", "my-mcp-server"]
-    transport: stdio
-    enabled: true
-    tools: {}
-    toolFilters:
-      allow: []
-      deny: []
-
-retrieval:
-  enabled: false
-  topK: 15
-  scorer: bmxf
-```
-
-The `retrieval` section controls the optional tool retrieval pipeline. When enabled, Zenith dynamically filters the tool set presented to clients based on workspace context and conversation history, using a 6-tier scoring fallback (BMXF blend → env-only → keyword → static categories → frequency prior → universal).
+The first-run wizard prompts for these settings on initial startup.
 
 ## Project Structure
 
@@ -526,7 +482,7 @@ src/                    — TypeScript source (all modules)
   cli/                  — stdio entry point
   server/               — HTTP entry point (Express 5)
   adapters/             — 16 MCP client config adapters
-  config/               — Adapter settings, admin CLI, server config management
+  config/               — Unified config system: parser, schema, loader, wizard, auto-write, backup
   retrieval/            — Opt-in 6-tier tool retrieval pipeline
   toon/                 — In-process compression library (BMX+, SageRank, codec)
   utils/                — Project scope resolution

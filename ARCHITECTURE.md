@@ -66,7 +66,7 @@ function createSessionPair() {
 **Session lifecycle:**
 - Each new client gets a fresh `{ ctx, server }` pair
 - Sessions are stored in a `Map` keyed by session ID
-- `SESSION_TTL_MS` (default 30 min) reaper closes idle sessions
+- `session_ttl_ms` config setting (default 30 min) reaper closes idle sessions
 - Bearer token auth via `ZENITH_MCP_API_KEY` / `MCP_BRIDGE_API_KEY` / `COMMANDER_API_KEY`
 - Transport types are never mixed (streamable vs SSE sessions are checked on every request)
 
@@ -223,7 +223,7 @@ Inline zero-dependency BM25 implementation (~120 lines):
 
 **Post-filter mode:** `bm25RankResults(lines, query, charBudget)`
 - Ranks raw result lines by BM25 relevance
-- Accumulates within `CHAR_BUDGET` (default 400k, override via env)
+- Accumulates within `char_budget` config setting (default 400k)
 
 **Ripgrep integration:**
 - `ripgrepAvailable()` — checks `/usr/bin/rg` for executable access
@@ -311,7 +311,7 @@ Returns `{ workingContent, errors, pendingSnapshots }`.
   - `patterns(id, name UNIQUE, edit_body, symbol_kind, created_at)`
 - Indexes: `symbols(name)`, `symbols(file_path)`, `symbols(kind, name)`, `edges(referenced_name)`, `edges(container_def_id)`, `versions(session_id)`, `versions(symbol_name, file_path, text_hash, session_id)` (dedup)
 - Schema migrations handled with `try/catch` on `ALTER TABLE`
-- Prunes old versions on open (default TTL: 24h, override via `REFACTOR_VERSION_TTL_HOURS`)
+- Prunes old versions on open (default TTL: 24h, configured via `refactor_version_ttl_hours` in config)
 
 **`indexFile(db, repoRoot, absFilePath)`**
 - Reads file, checks hash against `files` table
@@ -517,7 +517,7 @@ Returns `{ type: 'image'|'audio'|'blob', data: base64, mimeType }`.
   - If pre-filter fails or query ≤ 2 chars: falls back to full ripgrep
   - If ripgrep unavailable: JS fallback with regex search
   - Post-filter: BM25 ranks results if > 50 lines, otherwise simple budget truncation
-  - `SEARCH_CHAR_BUDGET` defaults to 15k (override via env)
+  - `search_char_budget` config setting defaults to 15k
 
 - **`files`** — `path`, `pattern`, `namePattern`, `pathContains`, `extensions`, `includeMetadata`, `includeHidden`, `maxResults`
   - ripgrep `--files` when available, JS walk fallback
@@ -599,7 +599,7 @@ Single-file search — grep or symbol lookup within one file. Read-only.
   - Fetches occurrences via `findSymbol()`
   - **Outlier detection:** computes `getSymbolStructure()` for each occurrence, finds modal structure, flags deviations (param shape, return type, parent scope, decorators, modifiers)
   - Emits blocks with headers: `symbol [index] relPath` (or `⚠ reason` if flagged)
-  - Char budget: `MAX_CHARS` (default 30k, override via `REFACTOR_MAX_CHARS`)
+  - Char budget: `refactor_max_chars` config setting (default 30k)
   - Supports pagination via `loadMore`
   - Caches occurrences in `_loadCache`
 
@@ -651,60 +651,69 @@ Zenith-MCP ships auto-configuration adapters for 16 MCP client platforms. These 
 
 **Config format helpers:** `src/adapters/helpers/` — `json5.ts`, `toml.ts`, `yaml.ts`
 
-**Settings:** `src/config/adapter-settings.ts`
-- Persisted at `~/.zenith-mcp/adapter-config.json`
-- Env overrides: `ZENITH_MCP_ADAPTERS_ENABLED`, `ZENITH_MCP_ADAPTER_BACKUP_DIR`
+**Configuration:** Auto-write is controlled through the unified config file at `~/.zenith-mcp/config`:
+- `auto_write.status` — enable/disable auto-write (opt-in, disabled by default)
+- `auto_write.backup_dir` — directory for config file backups before modification
+- `auto_write.backup_mode` — `file`, `sqlite`, or `none`
+- `auto_write.custom_mcp_paths` — additional MCP config file paths to scan
 
-**Adapter CLI:** `npx zenith-mcp-config`
-- `--list` — show all adapters
-- `--status` — show enabled adapters
-- `--enable <names>` — enable comma-separated adapters
-- `--disable <name>` — disable adapter
-- `--backup-dir <path>` — set backup directory
-- Interactive mode when no flags given
+The first-run wizard (`src/config/wizard.ts`) prompts for auto-write setup on initial startup.
 
 ---
 
-## 8. Config Management
+## 8. Config Management (`src/config/`)
 
-### Zenith-MCP Server Config (`src/config/zenith-mcp/`)
+Zenith uses a single plain-text config file at `~/.zenith-mcp/config` with a custom format: `###` subsection headers, `key: value` pairs, and `#` comments (both `value # comment` and `value #comment` styles).
 
-YAML-based configuration for managing external MCP servers and tool retrieval settings.
+**Config file structure:**
+```text
+Port: 7000
 
-**Config file:** `~/.zenith-mcp/zenith-mcp/servers.yaml` (legacy path: `~/.zenith-mcp/multi-mcp/servers.yaml`)
+### Tools
+read_text_file: enabled
+edit_file: enabled
+search_files: enabled
 
-**Config structure:** `ZenithMcpConfig`
-```yaml
-servers:
-  my-server:
-    command: npx
-    args: ["-y", "my-server"]
-    env: {}
-    transport: stdio
-    enabled: true
-    tools: {}
-    toolFilters: { allow: [], deny: [] }
-profiles:
-  default:
-    servers: [my-server]
-retrieval:
-  enabled: false
-  topK: 15
-  scorer: bmxf
+### Auto Write
+status: disabled
+backup_dir: ~/.zenith-mcp/mcp_backups/
+backup_mode: file
+custom_mcp_paths:
+
+### Zenith-Rag
+status: disabled
+postgres_url:
+username:
+password:
+
+### Advanced
+char_budget: 400000
+search_char_budget: 15000
+refactor_max_chars: 30000
+refactor_max_context: 30
+refactor_version_ttl_hours: 24
+session_ttl_ms: 1800000
+default_excludes: node_modules,.git,.next,...
+sensitive_patterns: **/.env,**/*.pem,...
 ```
 
-**Config loading:** `loadZenithMcpConfig()` reads YAML, normalizes via `normalizeServerConfig()` which handles both TS-era and Python-era field names (e.g., `type` → `transport`, `triggers` → `toolFilters.allow`, `idle_timeout_minutes` → `idleTimeoutSeconds`).
+**Modules:**
 
-**Tool cache:** `cache.ts`
-- `mergeDiscoveredTools()` — merges discovered tools, preserves existing `enabled` state, updates `lastSeenAt`
-- `cleanupStaleTools()` — removes disabled tools from previous discovery cycles
-- `getEnabledTools()` — returns set of enabled tool names
+- **`parser.ts`** — Reads/writes the plain-text config format. Produces an ordered `RawConfig` array of `ConfigEntry` items (sections, subsections, key-value pairs, comments, blanks) for round-trip fidelity — unknown keys and comments are preserved across read/write cycles.
 
-**Admin CLI:** `npx zenith-mcp-config-admin`
-- `list [--server-filter <name>] [--disabled-only]` — list servers and tools with staleness indicators
-- `status` — multi-line status summary
-- `install <server-name> [command] [args...]` — register a server
-- `scan [server-name]` — read-only server discovery from config
+- **`schema.ts`** — Defines `ZenithConfig` (typed interface), `DEFAULT_CONFIG` (all defaults), `configToRaw()` (typed config → parser's RawConfig), and `rawToConfig()` (RawConfig → typed config with validation and fallbacks).
+
+- **`loader.ts`** — `loadConfig()` reads and parses the config file, `saveConfig()` serializes and writes it, `mergeToolsIntoConfig()` discovers tools at runtime and merges them into the config (new tools default to enabled, existing tools preserve their state).
+
+- **`wizard.ts`** — First-run interactive wizard that runs on initial startup when no config file exists. Prompts for auto-write setup, backup mode (file/SQLite with 24h TTL/no backup), custom MCP paths, port, and character budget. Generates the config file and optionally runs auto-write immediately.
+
+- **`auto-write.ts`** — Registers Zenith in other MCP clients' config files via the adapter system. Reads each adapter's native config format, preserves unknown fields, backs up before mutation, and writes only the necessary Zenith server entry.
+
+- **`backup.ts`** — SQLite-based backup with WAL mode and configurable TTL, file-based `.bak` backup, or no-backup mode.
+
+- **`index.ts`** — Barrel exports: `configExists`, `loadConfig`, `saveConfig`, `mergeToolsIntoConfig`.
+
+**Dynamic tool discovery:** At startup, `server.ts` builds a `TOOL_REGISTRY` array of all registered tool names. `mergeToolsIntoConfig()` compares this against the tools in the config file — new tools are added as enabled, existing tools preserve their enabled/disabled state.
 
 ---
 
@@ -712,7 +721,7 @@ retrieval:
 
 Opt-in (disabled by default) system for dynamically filtering the tool set presented to LLM clients based on workspace context and conversation history. Reduces context waste when Zenith is used as a proxy managing many MCP servers.
 
-**Enabled via:** `retrieval.enabled: true` in `servers.yaml`
+**Enabled via:** `defaultRetrievalConfig()` in `src/retrieval/models.ts` (defaults to `enabled: false`)
 
 ### Architecture
 
@@ -808,19 +817,15 @@ When modifying tools, guard aggressively against context bloat. If unsure whethe
 
 ## 12. Environment Variables Reference
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `ZENITH_MCP_API_KEY` / `MCP_BRIDGE_API_KEY` / `COMMANDER_API_KEY` | — | HTTP bearer token (required for HTTP mode) |
-| `SESSION_TTL_MS` | 1800000 | HTTP session idle timeout |
-| `CHAR_BUDGET` | 400000 | Global character budget for reads |
-| `SEARCH_CHAR_BUDGET` | 15000 | Character budget for search result snippets |
-| `DEFAULT_EXCLUDES` | `node_modules,.git,...` | Comma-separated default exclude patterns |
-| `SENSITIVE_PATTERNS` | `**/.env,**/*.pem,...` | Comma-separated sensitive file globs |
-| `REFACTOR_MAX_CHARS` | 30000 | Max chars for refactor_batch loads |
-| `REFACTOR_MAX_CONTEXT` | 30 | Max context lines for refactor_batch |
-| `REFACTOR_VERSION_TTL_HOURS` | 24 | Version snapshot TTL in hours |
-| `ZENITH_MCP_ADAPTERS_ENABLED` | — | Comma-separated adapter names to enable |
-| `ZENITH_MCP_ADAPTER_BACKUP_DIR` | — | Backup directory for adapter config changes |
+All tuning and configuration settings live in `~/.zenith-mcp/config` (see Section 8). The only remaining environment variables are authentication secrets and OS platform paths:
+
+| Variable | Purpose |
+|----------|---------|
+| `ZENITH_MCP_API_KEY` / `MCP_BRIDGE_API_KEY` / `COMMANDER_API_KEY` | HTTP bearer token (required for HTTP mode) |
+| `TOON_PROJECT_DIR` | Path to `toon` compression project |
+| `APPDATA` / `LOCALAPPDATA` / `USERPROFILE` | OS-provided paths used by platform adapters for config file discovery on Windows |
+
+**Config file settings (not env vars):** `session_ttl_ms`, `char_budget`, `search_char_budget`, `default_excludes`, `sensitive_patterns`, `refactor_max_chars`, `refactor_max_context`, `refactor_version_ttl_hours` — all live in the `### Advanced` section of `~/.zenith-mcp/config`.
 
 ---
 
@@ -857,7 +862,7 @@ src/                          — TypeScript source (all modules)
   cli/                        — stdio entry point
   server/                     — HTTP entry point (Express 5)
   adapters/                   — 16 MCP client config adapters + helpers
-  config/                     — Adapter settings, admin CLI, server config management
+  config/                     — Unified config system: parser, schema, loader, wizard, auto-write, backup
   retrieval/                  — Opt-in 6-tier tool retrieval pipeline
   toon/                       — In-process compression library (BMX+, SageRank, codec)
   utils/                      — Project scope resolution

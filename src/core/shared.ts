@@ -5,27 +5,36 @@ import { spawn } from "child_process";
 import path from "path";
 import os from "os";
 import { minimatch } from "minimatch";
+import { loadConfig } from '../config/index.js';
 
-export const CHAR_BUDGET = (() => {
-    const env = process.env.CHAR_BUDGET;
-    if (env) {
-        const trimmed = env.trim();
-        if (/^\s*[+-]?\d+\s*$/.test(trimmed)) {
-            const parsed = parseInt(trimmed, 10);
-            if (!isNaN(parsed) && parsed >= 10_000 && parsed <= 2_000_000) return parsed;
-        }
-    }
+const _config = loadConfig();
+
+export const CHAR_BUDGET: number = (() => {
+    const val = _config.advanced.char_budget;
+    if (typeof val === 'number' && !isNaN(val) && val >= 10_000 && val <= 2_000_000) return val;
     return 400_000;
 })();
 export const RANK_THRESHOLD = 50;
 
-export const DEFAULT_EXCLUDES = (process.env.DEFAULT_EXCLUDES ||
-    'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
-).split(',').map(p => p.trim()).filter(Boolean);
+export const DEFAULT_EXCLUDES: string[] = (() => {
+    const raw = _config.advanced.default_excludes;
+    if (raw && typeof raw === 'string') {
+        const parsed = raw.split(',').map(p => p.trim()).filter(Boolean);
+        if (parsed.length > 0) return parsed;
+    }
+    return 'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
+        .split(',').map(p => p.trim()).filter(Boolean);
+})();
 
-export const SENSITIVE_PATTERNS = (process.env.SENSITIVE_PATTERNS ||
-    '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
-).split(',').map(p => p.trim()).filter(Boolean);
+export const SENSITIVE_PATTERNS: string[] = (() => {
+    const raw = _config.advanced.sensitive_patterns;
+    if (raw && typeof raw === 'string') {
+        const parsed = raw.split(',').map(p => p.trim()).filter(Boolean);
+        if (parsed.length > 0) return parsed;
+    }
+    return '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
+        .split(',').map(p => p.trim()).filter(Boolean);
+})();
 
 export function isSensitive(filePath: string): boolean {
     const rel = path.relative(os.homedir(), filePath);

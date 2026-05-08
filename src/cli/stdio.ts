@@ -10,6 +10,7 @@ import {
   resolveInitialAllowedDirectories,
   validateDirectories,
 } from '../core/server.js';
+import { configExists, runFirstRunWizard } from '../config/index.js';
 
 async function runStdio() {
   const args = process.argv.slice(2);
@@ -25,6 +26,10 @@ async function runStdio() {
 
   const allowedDirectories = await resolveInitialAllowedDirectories(dirArgs);
   await validateDirectories(allowedDirectories);
+
+  if (!configExists()) {
+    await runFirstRunWizard();
+  }
 
   const ctx = createFilesystemContext(allowedDirectories);
 

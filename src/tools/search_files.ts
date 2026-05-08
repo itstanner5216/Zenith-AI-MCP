@@ -7,12 +7,11 @@ import { RipgrepResult } from '../core/shared.js';
 import { isSupported, getLangForFile, getDefinitions, getStructuralFingerprint, computeStructuralSimilarity, } from '../core/tree-sitter.js';
 import { findRepoRoot, getDb, indexDirectory } from '../core/symbol-index.js';
 import { ToolServer, ToolContext } from './types.js';
+import { loadConfig } from '../config/index.js';
 // Smaller budget for content-search results (match snippets, not full files).
-// Configurable via env var. Symbol/list modes still use full CHAR_BUDGET.
-const SEARCH_CHAR_BUDGET = (() => {
-    const v = parseInt(process.env.SEARCH_CHAR_BUDGET || '15000', 10);
-    return isNaN(v) ? 15_000 : Math.min(v, CHAR_BUDGET);
-})();
+// Configurable via config. Symbol/list modes still use full CHAR_BUDGET.
+const _config = loadConfig();
+const SEARCH_CHAR_BUDGET = Math.min(_config.advanced.search_char_budget, CHAR_BUDGET);
 const DEFAULT_EXCLUDE_GLOBS = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
 
 interface SymbolDbRow {

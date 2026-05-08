@@ -26,31 +26,33 @@ class ContinueDevAdapter extends MCPConfigAdapter {
     return readYaml(p);
   }
 
-  writeConfig(data: Record<string, any>) {
+  writeConfig(data: Record<string, unknown>) {
     const p = this.configPath()!;
     this.backup(p);
     mkdirSync(join(p, ".."), { recursive: true });
     writeYaml(p, data);
   }
 
-  registerServer(name: string, config: Record<string, any>) {
+  registerServer(name: string, config: Record<string, unknown>) {
     const data = this.readConfig();
-    const servers: Record<string, any>[] = data.mcpServers || [];
+    const raw = data.mcpServers;
+    const servers: Record<string, unknown>[] = Array.isArray(raw) ? (raw as Record<string, unknown>[]) : [];
 
-    const filtered = servers.filter(s => !(typeof s === "object" && s !== null && s.name === name));
+    const filtered = servers.filter(s => !(typeof s === "object" && s !== null && (s as Record<string, unknown>).name === name));
 
-    const entry: Record<string, any> = { ...config, name };
+    const entry: Record<string, unknown> = { ...config, name };
     filtered.push(entry);
     data.mcpServers = filtered;
     this.writeConfig(data);
   }
 
-  discoverServers() {
-    const serversList: Record<string, any>[] = this.readConfig().mcpServers || [];
-    const result: Record<string, Record<string, any>> = {};
+  discoverServers(): Record<string, Record<string, unknown>> {
+    const raw = this.readConfig().mcpServers;
+    const serversList: Record<string, unknown>[] = Array.isArray(raw) ? (raw as Record<string, unknown>[]) : [];
+    const result: Record<string, Record<string, unknown>> = {};
     for (const s of serversList) {
       if (typeof s === "object" && s !== null && "name" in s) {
-        const { name, ...rest } = s;
+        const { name, ...rest } = s as Record<string, unknown>;
         result[name as string] = rest;
       }
     }

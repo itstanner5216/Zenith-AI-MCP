@@ -112,7 +112,7 @@ Runtime artifacts live in `dist/`; source of truth lives in `src/` plus the root
   - Streamable HTTP plus legacy SSE
   - bearer-token auth
   - per-session `{ ctx, server }` isolation
-  - idle session reaping via `SESSION_TTL_MS`
+  - idle session reaping via `session_ttl_ms` config setting
 
 ### Core Orchestrator
 
@@ -533,21 +533,14 @@ Key pieces:
 - `src/adapters/helpers/`
   - JSON5, TOML, YAML helpers
 
-Settings:
+Settings (in `~/.zenith-mcp/config`):
 
-- `~/.zenith-mcp/adapter-config.json`
-- `ZENITH_MCP_ADAPTERS_ENABLED`
-- `ZENITH_MCP_ADAPTER_BACKUP_DIR`
+- `auto_write.status` — enable/disable auto-write
+- `auto_write.backup_dir` — backup directory for config file changes
+- `auto_write.backup_mode` — `file`, `sqlite`, or `none`
+- `auto_write.custom_mcp_paths` — additional MCP config paths to scan
 
-CLI:
-
-```bash
-npx zenith-mcp-config --list
-npx zenith-mcp-config --status
-npx zenith-mcp-config --enable claude_desktop,opencode
-npx zenith-mcp-config --disable opencode
-npx zenith-mcp-config --backup-dir ~/.zenith-mcp/backups
-```
+Auto-write is controlled via `~/.zenith-mcp/config` (`auto_write.status`, `auto_write.backup_dir`, `auto_write.backup_mode`, `auto_write.custom_mcp_paths`). There is no separate CLI — the first-run wizard handles initial setup.
 
 Keep adapter write operations conservative:
 
@@ -561,33 +554,22 @@ Keep adapter write operations conservative:
 
 ## 9. Config Management
 
-Config management lives in `src/config/zenith-mcp/`.
+Config management lives in `src/config/`.
 
-Config file:
+Config file: `~/.zenith-mcp/config` (plain-text format with `###` subsection headers, `key: value` pairs, `#` comments).
 
-```text
-~/.zenith-mcp/zenith-mcp/servers.yaml
-```
+Modules:
 
-Legacy config path may still be normalized during load.
+- `parser.ts` — reads/writes the plain-text config format; produces an ordered `RawConfig` array for round-trip fidelity
+- `schema.ts` — `ZenithConfig` interface, `DEFAULT_CONFIG`, `configToRaw()`, `rawToConfig()`
+- `loader.ts` — `loadConfig()`, `saveConfig()`, `mergeToolsIntoConfig()` (dynamic tool discovery)
+- `wizard.ts` — first-run interactive wizard (auto-write, backup mode, port, char_budget)
+- `auto-write.ts` — registers Zenith in other MCP clients via adapters
+- `backup.ts` — SQLite/file/none backup modes
 
-Main concepts:
+Key sections in the config file: `### Tools` (dynamic enable/disable), `### Auto Write`, `### Zenith-Rag`, `### Advanced` (all tuning params).
 
-- external MCP server registrations
-- tool cache
-- profiles
-- optional retrieval configuration
-
-Admin CLI:
-
-```bash
-npx zenith-mcp-config-admin list
-npx zenith-mcp-config-admin status
-npx zenith-mcp-config-admin install <server-name> [command] [args...]
-npx zenith-mcp-config-admin scan [server-name]
-```
-
-Developer rule: config CLIs can be verbose for humans, but MCP tool responses should remain minimal.
+Developer rule: MCP tool responses should remain minimal regardless of config system verbosity.
 
 ---
 
@@ -595,12 +577,7 @@ Developer rule: config CLIs can be verbose for humans, but MCP tool responses sh
 
 Retrieval is opt-in and disabled by default.
 
-Enabled through config:
-
-```yaml
-retrieval:
-  enabled: true
-```
+Enabled via `defaultRetrievalConfig()` in `src/retrieval/models.ts` (defaults to `enabled: false`).
 
 Purpose: reduce active tool-list bloat when Zenith manages or proxies larger tool sets.
 

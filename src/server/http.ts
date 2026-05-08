@@ -29,12 +29,20 @@ import {
     validateDirectories,
 } from '../core/server.js';
 import { ripgrepAvailable } from '../core/shared.js';
+import { configExists, runFirstRunWizard, loadConfig } from '../config/index.js';
+
+// ---------------------------------------------------------------------------
+// First-run wizard — ensure config exists before proceeding
+// ---------------------------------------------------------------------------
+if (!configExists()) {
+    await runFirstRunWizard();
+}
 
 // ---------------------------------------------------------------------------
 // Parse CLI args
 // ---------------------------------------------------------------------------
 const args = process.argv.slice(2);
-let port = 3100;
+let cliPort: number | undefined;
 let host = '0.0.0.0';
 const dirArgs: string[] = [];
 const API_KEY = process.env.ZENITH_MCP_API_KEY || process.env.MCP_BRIDGE_API_KEY || process.env.COMMANDER_API_KEY;
@@ -46,13 +54,17 @@ if (!API_KEY) {
 
 for (const arg of args) {
     if (arg.startsWith('--port=')) {
-        port = parseInt(arg.split('=')[1], 10);
+        cliPort = parseInt(arg.split('=')[1], 10);
     } else if (arg.startsWith('--host=')) {
         host = arg.split('=')[1];
     } else if (!arg.startsWith('--')) {
         dirArgs.push(arg);
     }
 }
+
+// Load config and resolve port: CLI --port flag overrides config value
+const config = loadConfig();
+const port = cliPort ?? config.port;
 
 // Resolve and validate the baseline allowed directories from CLI args.
 // Each HTTP session gets its OWN copy of these as the starting point;
@@ -96,7 +108,7 @@ function removeSession(sessionId: string): void {
 // Session reaper — close sessions idle longer than SESSION_TTL_MS.
 // Prevents unbounded memory growth from clients that connect and vanish.
 // ---------------------------------------------------------------------------
-const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || '1800000', 10); // 30 min default
+const SESSION_TTL_MS = config.advanced.session_ttl_ms;
 const REAP_INTERVAL_MS = 60_000; // check every 60s
 
 setInterval(() => {

@@ -9,12 +9,14 @@ import { getLangForFile, findSymbol, getSymbolStructure, checkSyntaxErrors, } fr
 import { applyEditList, syntaxWarn } from '../core/edit-engine.js';
 import type { Edit } from '../core/edit-engine.js';
 import { normalizeLineEndings } from '../core/lib.js';
+import { loadConfig } from '../config/index.js';
 // ---------------------------------------------------------------------------
 // Module-level constants
 // ---------------------------------------------------------------------------
-const MAX_CHARS = Number(process.env.REFACTOR_MAX_CHARS) || 30000;
+const _config = loadConfig();
+const MAX_CHARS = _config.advanced.refactor_max_chars;
 const DEFAULT_CONTEXT = 5;
-const MAX_CONTEXT_LINES = Math.min(30, Number(process.env.REFACTOR_MAX_CONTEXT) || 30);
+const MAX_CONTEXT_LINES = Math.min(30, _config.advanced.refactor_max_context);
 // ---------------------------------------------------------------------------
 // Local interfaces
 // ---------------------------------------------------------------------------
