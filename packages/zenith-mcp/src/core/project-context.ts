@@ -272,3 +272,8 @@ export function onRootsChanged(): void {
         _instance.refresh();
     }
 }
+
+/** Reset the singleton — for test isolation only. */
+export function resetProjectContext(): void {
+    _instance = null;
+}

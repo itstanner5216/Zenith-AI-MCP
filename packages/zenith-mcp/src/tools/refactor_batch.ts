@@ -283,7 +283,8 @@ export function register(server: ToolServer, ctx: ToolContext) {
             if (!args.target) {
                 return { content: [{ type: 'text' as const, text: 'target required for query.' }] };
             }
-            const repoRoot = pc.getRoot(args.fileScope);
+            const resolvedScope = args.fileScope ? await ctx.validatePath(args.fileScope) : undefined;
+            const repoRoot = pc.getRoot(resolvedScope);
             if (!repoRoot)
                 throw new Error("No project root.");
             const db = getDb(repoRoot);
@@ -1116,15 +1117,15 @@ export function register(server: ToolServer, ctx: ToolContext) {
             if (!args.symbol) {
                 return { content: [{ type: 'text' as const, text: 'symbol required for history.' }] };
             }
-            const repoRoot = pc.getRoot(args.file);
+            const resolvedFile = args.file ? await ctx.validatePath(args.file) : undefined;
+            const repoRoot = pc.getRoot(resolvedFile);
             if (!repoRoot)
                 throw new Error("No project root.");
             const db = getDb(repoRoot);
             const sessionId = ctx.sessionId || getSessionId();
             let relPath: string | undefined;
-            if (args.file) {
-                const absPath = await ctx.validatePath(args.file);
-                relPath = path.relative(repoRoot, absPath);
+            if (resolvedFile) {
+                relPath = path.relative(repoRoot, resolvedFile);
             }
             const rows = getVersionHistory(db, args.symbol, sessionId, relPath);
             if (!rows.length) {
