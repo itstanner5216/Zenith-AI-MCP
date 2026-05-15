@@ -356,6 +356,9 @@ export function register(server: ToolServer, ctx: ToolContext) {
                 return { content: [{ type: 'text' as const, text: 'selection required for loadDiff (or use loadMore=true to continue).' }] };
             }
             const allowedDirs = ctx.getAllowedDirectories();
+            if (allowedDirs.length === 0) {
+                throw new Error("No allowed directories configured.");
+            }
             const repoRoot = pc.getRoot(allowedDirs[0]);
             if (!repoRoot)
                 throw new Error("No project root.");
