@@ -20,8 +20,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*"],
-  "exclude": [
-    "src/bmx-plus.ts",
-    "src/sagerank.ts"
-  ]
+  "exclude": []
 }
