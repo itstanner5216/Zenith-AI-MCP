@@ -99,14 +99,15 @@ describe('read_multiple_files — concurrency (parallelMap)', () => {
         const count = 15;
         const files = [];
         for (let i = 0; i < count; i++) {
-            files.push(makeFile(tmpDir, `ordered-${i}.txt`, `LINE_${i}`));
+            files.push(makeFile(tmpDir, `ordered-${i}.txt`, `LINE_${String(i).padStart(3, '0')}_MARK`));
         }
         const result = await handler({ paths: files, compression: false });
         const text = result.content[0].text;
         // Find positions of each file's content — should be in order 0,1,2,...
+        // Use padded indices so LINE_001 never matches inside LINE_010 etc.
         let prevPos = -1;
         for (let i = 0; i < count; i++) {
-            const pos = text.indexOf(`LINE_${i}`);
+            const pos = text.indexOf(`LINE_${String(i).padStart(3, '0')}_MARK`);
             expect(pos).toBeGreaterThan(prevPos);
             prevPos = pos;
         }
