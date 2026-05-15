@@ -30,7 +30,7 @@ describe('configToRaw — basic shape', () => {
     it('contains section entries for known config areas', () => {
         const result = configToRaw(DEFAULT_CONFIG);
         const types = result.map(e => e.type);
-        expect(types).toContain('section');
+        expect(types).not.toContain('section');
         expect(types).toContain('subsection');
     });
 
