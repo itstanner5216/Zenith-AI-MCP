@@ -362,6 +362,102 @@ async function ensureInit(): Promise<void> {
     return _initPromise;
 }
 
+// ---------------------------------------------------------------------------
+// WASM PIC side-module pre-screen
+// ---------------------------------------------------------------------------
+//
+// Background: web-tree-sitter@0.26.8 uses a module-global GOT (Global Offset
+// Table) dict to resolve dynamic symbol imports. When a WASM module that was
+// compiled as an Emscripten PIC side-module (position-independent code) is
+// loaded, its GOT.func imports are registered into that global dict with
+// `required=true` and `value=0`. After the load fails (because the scanner
+// symbols cannot be resolved), those poisoned GOT entries persist for the
+// lifetime of the Node.js process — causing every subsequent Language.load()
+// call to fail with the same unresolved-symbol error, regardless of which
+// grammar is being loaded.
+//
+// The incompatible WASM pattern: modules with GOT.func imports whose field
+// names contain "external_scanner". In the WASM binary, both strings appear
+// as UTF-8 in the imports section. A fast byte-scan detects this reliably.
+//
+// Safety of this heuristic: across all 43 grammar WASMs in this build, only
+// tree-sitter-vue.wasm contains the "GOT.func" byte sequence. All other WASMs
+// that have external scanners compiled them in statically (no GOT imports).
+// False positives are not possible with the current grammar set.
+//
+// Fix: if a WASM is detected as a PIC side-module before Language.load() is
+// called, we skip the load entirely. The GOT is never touched, so all
+// subsequent grammar loads in the same process remain healthy.
+
+/**
+ * Returns true if the WASM at `wasmPath` is an Emscripten PIC side-module
+ * that imports scanner functions via GOT.func — a pattern incompatible with
+ * web-tree-sitter's dynamic-library loader.
+ *
+ * Detection strategy: scan the raw WASM bytes for the ASCII strings "GOT.func"
+ * and "external_scanner". In the WASM binary format, import module and field
+ * names are stored as length-prefixed UTF-8 strings in the imports section
+ * (section ID 2). Both substrings are present in the imports section of any
+ * PIC side-module that stubs its external scanner via GOT.func imports, and
+ * neither appears together in any correctly-built standalone grammar WASM.
+ *
+ * This is cheaper and safer than a full WASM section parser because:
+ *   - vue.wasm is 17 KB — reading it is trivial.
+ *   - The two byte sequences cannot appear together in a well-formed
+ *     standalone grammar (confirmed by inspecting all 43 WASMs in the build).
+ *   - No WASM spec version dependency; byte scanning is version-agnostic.
+ */
+async function isIncompatiblePicSideModule(wasmPath: string): Promise<boolean> {
+    let bytes: Buffer;
+    try {
+        bytes = await fs.readFile(wasmPath);
+    } catch {
+        // If we can't read the file the outer access() check already handles this.
+        return false;
+    }
+
+    // WASM magic: \0asm followed by version 1 (little-endian uint32 = 01 00 00 00).
+    // Bail immediately for files that are not valid WASM binaries.
+    if (bytes.length < 8 ||
+        bytes[0] !== 0x00 || bytes[1] !== 0x61 ||
+        bytes[2] !== 0x73 || bytes[3] !== 0x6d) {
+        return false;
+    }
+
+    // Search for the "GOT.func" byte sequence (ASCII: 47 4f 54 2e 66 75 6e 63).
+    // This is the import module name used by Emscripten PIC side-modules for
+    // GOT-relocation stubs. No correctly-linked standalone grammar WASM uses it.
+    const gotFuncMarker = Buffer.from('GOT.func', 'ascii');
+    if (!bufferIncludes(bytes, gotFuncMarker)) {
+        return false;
+    }
+
+    // Also require "external_scanner" to distinguish a GOT.func import that
+    // specifically stubs out tree-sitter external-scanner functions from any
+    // other hypothetical future GOT.func usage.
+    const extScannerMarker = Buffer.from('external_scanner', 'ascii');
+    return bufferIncludes(bytes, extScannerMarker);
+}
+
+/**
+ * Returns true if `haystack` contains `needle` as a contiguous byte subsequence.
+ * Uses a simple scan; files are at most a few hundred KB so this is fast enough.
+ */
+function bufferIncludes(haystack: Buffer, needle: Buffer): boolean {
+    if (needle.length === 0) return true;
+    const limit = haystack.length - needle.length;
+    const first = needle[0];
+    for (let i = 0; i <= limit; i++) {
+        if (haystack[i] !== first) continue;
+        let match = true;
+        for (let j = 1; j < needle.length; j++) {
+            if (haystack[i + j] !== needle[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 /**
  * Load a Language grammar (WASM), cached permanently.
  * Returns null if the grammar file doesn't exist.
@@ -377,6 +473,32 @@ async function loadLanguage(langName: string): Promise<Language | null> {
     try {
         await fs.access(wasmPath);
     } catch {
+        _languageCache.set(langName, null);
+        return null;
+    }
+
+    // Pre-screen: detect Emscripten PIC side-modules before calling Language.load().
+    //
+    // web-tree-sitter@0.26.8 uses a process-global GOT dict. If Language.load() is
+    // called with a PIC side-module WASM (one that imports scanner functions via
+    // GOT.func), the loader populates that dict with `required=true, value=0`
+    // entries for each scanner symbol. The load then fails (the symbols cannot be
+    // resolved), but the GOT entries persist — poisoning every subsequent
+    // Language.load() call in the same process, regardless of which grammar is
+    // loaded next.
+    //
+    // By detecting and skipping the incompatible WASM here, we never call
+    // Language.load() on it, so the GOT is never touched and all subsequent
+    // grammar loads remain healthy. The return value (null) is identical to what
+    // the caller would have received after the load failure anyway.
+    if (await isIncompatiblePicSideModule(wasmPath)) {
+        console.error(
+            `[tree-sitter] Skipping ${langName} grammar: WASM is an Emscripten PIC ` +
+            `side-module with unresolvable GOT.func imports for external_scanner_* ` +
+            `symbols. Loading it would poison the web-tree-sitter GOT and break all ` +
+            `subsequent grammar loads in this process. The ${langName} grammar will ` +
+            `be unavailable for this session.`
+        );
         _languageCache.set(langName, null);
         return null;
     }
