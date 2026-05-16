@@ -314,7 +314,7 @@ async function applyEditList(content: string, edits: Edit[], { filePath, isBatch
 async function syntaxWarn(filePath: string, content: string): Promise<string> {
     try {
         const ext = path.extname(filePath).toLowerCase();
-        if (['.scss', '.mdx', '.jsonc'].includes(ext)) return '';
+        if (['.mdx', '.jsonc'].includes(ext)) return '';
         const langName = getLangForFile(filePath);
         if (!langName) return '';
         const syntaxErrors = await checkSyntaxErrors(content, langName);
