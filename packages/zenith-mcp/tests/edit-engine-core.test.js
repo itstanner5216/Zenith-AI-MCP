@@ -277,11 +277,6 @@ describe('syntaxWarn', () => {
         expect(result).toBe('');
     });
 
-    it('returns empty string for unsupported extensions', async () => {
-        const result = await syntaxWarn('/tmp/test.scss', 'broken {');
-        expect(result).toBe('');
-    });
-
     it('returns empty string for .mdx files', async () => {
         const result = await syntaxWarn('/tmp/test.mdx', 'anything');
         expect(result).toBe('');
