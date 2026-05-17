@@ -593,19 +593,23 @@ export function register(server: ToolServer, ctx: ToolContext) {
                 const ext = path.extname(fullPath).toLowerCase();
                 if (!args.extensions.some(e => e.toLowerCase() === ext)) return false;
             }
-            if (args.pattern && !minimatch(relativePath, args.pattern, { dot: true })) {
-                return false;
+            if (args.pattern) {
+                const pat = args.pattern;
+                const matches = minimatch(relativePath, pat, { dot: true }) ||
+                    (!pat.includes('/') && minimatch(relativePath, `**/${pat}`, { dot: true }));
+                if (!matches) return false;
             }
             return true;
         }
 
         // ---- RIPGREP PATH ----
         if (hasRg) {
-            // Use --count-matches for exact totals when no per-file filters are needed
-            if (args.countOnly && !args.extensions?.length && !args.pathContains) {
+            if (args.countOnly) {
                 const counts = await ripgrepCountMatches(rootPath, {
                     contentQuery: args.contentQuery,
                     filePattern: args.pattern || null,
+                    ...(args.extensions?.length ? { extensions: args.extensions } : {}),
+                    ...(args.pathContains ? { pathContains: args.pathContains } : {}),
                     excludePatterns: allExcludes,
                     literalSearch: args.literalSearch ?? false,
                     includeHidden: args.includeHidden ?? false,
@@ -613,7 +617,6 @@ export function register(server: ToolServer, ctx: ToolContext) {
                 if (counts !== null) {
                     return { content: [{ type: 'text' as const, text: `matches: ${counts.matchCount}\nfiles: ${counts.fileCount}` }] };
                 }
-                // Fall through to BM25+ripgrep for degraded count
             }
 
             let rgResults: RipgrepResult[] | null = null;

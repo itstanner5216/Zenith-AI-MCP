@@ -36,7 +36,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
         inputSchema: z.object({
             mode: z.enum(["list", "tree"]).describe("Operation mode."),
             path: z.string().optional().describe("Dir path."),
-            depth: z.number().optional().default(1).describe("Recursion depth."),
+            depth: z.number().int().min(1).max(10).optional().describe("Recursion depth. Defaults to 1 for list, unlimited for tree."),
             includeSizes: z.boolean().optional().default(false).describe("Show file sizes."),
             sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort order."),
             excludePatterns: z.array(z.string()).optional().default([]).describe("Glob exclude patterns."),
@@ -75,9 +75,21 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                     lines.push(`[DENIED] ${relativeBase || path.basename(dirPath)}`);
                     return lines;
                 }
-                let truncated = entries.length > LIST_CAP;
-                if (truncated)
-                    entries = entries.slice(0, LIST_CAP);
+                // Filter by user-specified excludes before capping, so excluded entries don't consume cap slots
+                if (excludePatterns.length > 0) {
+                    entries = entries.filter(entry => {
+                        const rel = relativeBase ? path.join(relativeBase, entry.name) : entry.name;
+                        return !excludePatterns.some(pattern =>
+                            pattern.includes('*')
+                                ? minimatch(rel, pattern, { dot: true })
+                                : minimatch(rel, pattern, { dot: true }) ||
+                                  minimatch(rel, `**/${pattern}`, { dot: true }) ||
+                                  minimatch(rel, `**/${pattern}/**`, { dot: true })
+                        );
+                    });
+                }
+                const truncated = entries.length > LIST_CAP;
+                if (truncated) entries = entries.slice(0, LIST_CAP);
                 // Load sizes when needed for sorting or display
                 let processed: { entry: Dirent; size: number }[];
                 if (includeSizes || sortBy === 'size') {
@@ -94,28 +106,9 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                 else {
                     processed = entries.map(e => ({ entry: e, size: 0 }));
                 }
-                // Always sort
                 processed.sort(compareEntries);
                 for (const { entry, size } of processed) {
-                    if (lines.length >= LIST_CAP)
-                        break;
                     const rel = relativeBase ? path.join(relativeBase, entry.name) : entry.name;
-                    // Apply user-specified exclude patterns
-                    const shouldSkip = excludePatterns.some(pattern =>
-                        pattern.includes('*')
-                            ? minimatch(rel, pattern, { dot: true })
-                            : minimatch(rel, pattern, { dot: true }) ||
-                              minimatch(rel, `**/${pattern}`, { dot: true }) ||
-                              minimatch(rel, `**/${pattern}/**`, { dot: true })
-                    );
-                    if (shouldSkip) continue;
-                    // Apply default excludes
-                    const defaultExcluded = getDefaultExcludes().some(p =>
-                        entry.name === p ||
-                        minimatch(rel, p, { dot: true }) ||
-                        minimatch(rel, `**/${p}`, { dot: true })
-                    );
-                    if (defaultExcluded) continue;
                     if (entry.isDirectory()) {
                         lines.push(`${rel}/`);
                         if (currentDepth + 1 < depth) {
@@ -127,8 +120,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                         lines.push(includeSizes ? `${rel}  ${formatSize(size)}` : rel);
                     }
                 }
-                if (truncated)
-                    lines.push('[truncated]');
+                if (truncated) lines.push('[truncated]');
                 return lines;
             }
             const lines = await listRecursive(validPath, 0, '');
@@ -139,7 +131,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
         const showSymbols = args.showSymbols || args.showSymbolNames || false;
         const showSymbolNames = args.showSymbolNames || false;
         let totalEntries = 0;
-        const maxDepth = Math.max(1, Math.min(args.depth ?? 1, 10));
+        const maxDepth = args.depth != null ? Math.max(1, Math.min(args.depth, 10)) : Infinity;
         async function buildTree(currentPath: string, currentDepth: number, excludePatterns: string[] = []): Promise<FileTreeEntry[]> {
             if (totalEntries >= TREE_MAX_ENTRIES)
                 return [];
@@ -222,7 +214,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
             }
             return result;
         }
-        const treeData = await buildTree(rootPath, 1, args.excludePatterns);
+        const treeData = await buildTree(rootPath, 0, args.excludePatterns);
         function escapeControlChars(str: string): string {
             return str.replace(/[\x00-\x1F\x7F]/g, (char: string) => {
                 const code = char.charCodeAt(0);

@@ -279,9 +279,17 @@ export async function ripgrepSearch(rootPath: string, options: {
     includeHidden?: boolean;
     fileList?: string[] | null;
     includeContextLines?: boolean;
+    skipSensitiveFilter?: boolean;
+    maxMatchesPerFile?: number | null;
 } = {}): Promise<RipgrepResult[] | null> {
-    const { contentQuery, filePattern = null, ignoreCase = true, maxResults = 50, excludePatterns = [], contextLines = 0, literalSearch = false, includeHidden = false, fileList = null, includeContextLines = false } = options;
-    const rgArgs = ['--json', '--max-count', '100', '-m', '500'];
+    const {
+        contentQuery, filePattern = null, ignoreCase = true, maxResults = 50,
+        excludePatterns = [], contextLines = 0, literalSearch = false, includeHidden = false,
+        fileList = null, includeContextLines = false, skipSensitiveFilter = false,
+        maxMatchesPerFile = 500,
+    } = options;
+    const rgArgs = ['--json'];
+    if (maxMatchesPerFile !== null && maxMatchesPerFile > 0) rgArgs.push('-m', String(maxMatchesPerFile));
     if (ignoreCase) rgArgs.push('-i');
     if (literalSearch) rgArgs.push('-F');
     if (includeHidden) rgArgs.push('--hidden');
@@ -309,13 +317,13 @@ export async function ripgrepSearch(rootPath: string, options: {
                     if (msg.type === 'match' && results.length < maxResults) {
                         const d = msg.data;
                         const filePath = d.path?.text;
-                        if (filePath && !isSensitive(filePath)) {
+                        if (filePath && (skipSensitiveFilter || !isSensitive(filePath))) {
                             results.push({ file: filePath, line: d.line_number, content: d.lines?.text?.replace(/\n$/, '') || '' });
                         }
                     } else if (includeContextLines && msg.type === 'context') {
                         const d = msg.data;
                         const filePath = d.path?.text;
-                        if (filePath && !isSensitive(filePath)) {
+                        if (filePath && (skipSensitiveFilter || !isSensitive(filePath))) {
                             results.push({ file: filePath, line: d.line_number, content: d.lines?.text?.replace(/\n$/, '') || '', isContext: true });
                         }
                     }
@@ -380,6 +388,8 @@ export async function ripgrepCountMatches(
     options: {
         contentQuery: string;
         filePattern?: string | null;
+        extensions?: string[];
+        pathContains?: string | null;
         excludePatterns?: string[];
         literalSearch?: boolean;
         includeHidden?: boolean;
@@ -389,6 +399,8 @@ export async function ripgrepCountMatches(
     const {
         contentQuery,
         filePattern = null,
+        extensions = [],
+        pathContains = null,
         excludePatterns = [],
         literalSearch = false,
         includeHidden = false,
@@ -399,9 +411,14 @@ export async function ripgrepCountMatches(
     if (literalSearch) baseArgs.push('-F');
     if (includeHidden) baseArgs.push('--hidden');
     for (const pat of excludePatterns) baseArgs.push('--glob', `!${pat}`);
+    for (const pat of getSensitivePatterns()) baseArgs.push('--glob', `!${pat}`);
     if (filePattern) {
         const includeGlob = filePattern.includes('/') ? filePattern : `**/${filePattern}`;
         baseArgs.push('--glob', includeGlob);
+    }
+    for (const ext of extensions) {
+        const e = ext.startsWith('.') ? ext : `.${ext}`;
+        baseArgs.push('--glob', `**/*${e}`);
     }
 
     const targets = fileList && fileList.length > 0 ? fileList : [rootPath];
@@ -422,11 +439,13 @@ export async function ripgrepCountMatches(
                 if (!trimmed) continue;
                 const lastColon = trimmed.lastIndexOf(':');
                 if (lastColon === -1) continue;
+                const filePath = trimmed.slice(0, lastColon);
                 const count = Number(trimmed.slice(lastColon + 1));
-                if (!isNaN(count) && count > 0) {
-                    matchCount += count;
-                    fileCount++;
-                }
+                if (isNaN(count) || count <= 0) continue;
+                if (isSensitive(filePath)) continue;
+                if (pathContains && !filePath.toLowerCase().includes(pathContains.toLowerCase())) continue;
+                matchCount += count;
+                fileCount++;
             }
         });
 

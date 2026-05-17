@@ -323,14 +323,16 @@ export function countOccurrences(text: string, search: string): number {
 }
 
 export async function tailFile(filePath: string, numLines: number) {
-    if (numLines <= 0) return '';
+    const n = Math.floor(numLines);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    const cap = Math.min(n, 50_000);
     const stream = createReadStream(filePath, { encoding: 'utf-8' });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    const ring = new Array<string>(numLines);
+    const ring = new Array<string>(cap);
     let count = 0;
     try {
         for await (const line of rl) {
-            ring[count % numLines] = line;
+            ring[count % cap] = line;
             count++;
         }
     } finally {
@@ -338,8 +340,8 @@ export async function tailFile(filePath: string, numLines: number) {
         stream.destroy();
     }
     if (count === 0) return '';
-    if (count <= numLines) return ring.slice(0, count).join('\n');
-    const start = count % numLines;
+    if (count <= cap) return ring.slice(0, count).join('\n');
+    const start = count % cap;
     return [...ring.slice(start), ...ring.slice(0, start)].join('\n');
 }
 
@@ -364,19 +366,21 @@ export async function offsetReadFile(filePath: string, offset: number, length: n
     const stream = createReadStream(filePath, { encoding: 'utf-8' });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
     const collected: string[] = [];
-    let totalLines = 0;
+    let lineNum = 0;
+    let hasMore = false;
     try {
         for await (const line of rl) {
-            if (totalLines >= offset && collected.length < length) {
-                collected.push(line);
+            if (lineNum >= offset) {
+                if (collected.length < length) {
+                    collected.push(line);
+                } else {
+                    hasMore = true;
+                    break;
+                }
             }
-            totalLines++;
+            lineNum++;
         }
-        return {
-            content: collected.join('\n'),
-            totalLines,
-            linesReturned: collected.length,
-        };
+        return { content: collected.join('\n'), linesReturned: collected.length, hasMore };
     } finally {
         rl.close();
         stream.destroy();

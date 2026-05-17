@@ -43,7 +43,7 @@ describe('ProjectContext — resolution ladder', () => {
 
     it('resolves from MCP roots (allowed directories)', () => {
         const pc = new ProjectContext(ctx);
-        const root = pc.getRoot();
+        const root = pc.getRoot(path.join(repoDir, 'file.js'));
         expect(root).toBeTruthy();
     });
 
@@ -71,7 +71,7 @@ describe('ProjectContext — resolution ladder', () => {
 
     it('resolves from cwd when MCP roots empty but cwd is a git repo', () => {
         const pc = new ProjectContext(ctx);
-        pc._resolve();
+        pc.getRoot(path.join(repoDir, 'file.js'));
         expect(pc.isGlobal).toBe(false);
     });
 });
@@ -172,7 +172,7 @@ describe('ProjectContext — refresh', () => {
     it('reset resolves state so next getRoot re-resolves', async () => {
         const { ProjectContext } = await importProjectContext();
         const pc = new ProjectContext(ctx);
-        const root1 = pc.getRoot();
+        const root1 = pc.getRoot(path.join(repoDir, 'file.js'));
         expect(root1).toBeTruthy();
 
         pc.refresh();

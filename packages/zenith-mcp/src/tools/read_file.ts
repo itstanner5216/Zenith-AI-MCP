@@ -20,8 +20,8 @@ interface LineWindow {
 
 interface OffsetReadResult {
     content: string;
-    totalLines: number;
     linesReturned: number;
+    hasMore: boolean;
 }
 
 function countLines(str: string): number {
@@ -138,11 +138,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
             const length = args.head || 200;
             const result = await offsetReadFile(validPath, args.offset, length) as OffsetReadResult;
             content = result.content;
-            meta = {
-                totalLines: result.totalLines,
-                linesReturned: result.linesReturned,
-                hasMore: (args.offset + result.linesReturned) < result.totalLines,
-            };
+            meta = { linesReturned: result.linesReturned, hasMore: result.hasMore };
         }
         else if (args.head) {
             content = await headFile(validPath, args.head);
@@ -187,7 +183,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
             path: z.string().describe("File path."),
             maxChars: z.number().optional().describe("Max chars. Up to 400K."),
             head: z.number().optional().describe("First N lines."),
-            tail: z.number().optional().describe("Last N lines."),
+            tail: z.number().int().min(1).optional().describe("Last N lines."),
             offset: z.number().optional().describe("Start line (0-based). Use with head."),
             showLineNumbers: z.boolean().optional().describe("Prefix lines with numbers."),
             compression: z.boolean().optional().describe("Compress whitespace."),

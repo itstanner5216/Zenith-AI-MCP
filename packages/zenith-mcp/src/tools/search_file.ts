@@ -33,6 +33,8 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                 contextLines: grepContext,
                 fileList: [validPath],
                 includeContextLines: true,
+                skipSensitiveFilter: true,
+                maxMatchesPerFile: null,
             });
 
             if (!rgResults || rgResults.length === 0) {
