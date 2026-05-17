@@ -350,6 +350,74 @@ const _languageCache: Map<string, Language | null> = new Map();
 const _queryStringCache: Map<string, string | null> = new Map();
 const _compiledQueryCache: Map<string, Query | null> = new Map();
 
+/**
+ * AST node type names that getSymbolStructure treats as "the definition node"
+ * when locating a symbol by line range. Hoisted to module scope so the Set is
+ * allocated once at load time instead of on every getSymbolStructure call
+ * (hot path during symbol-aware edits and batch operations).
+ *
+ * Each node type appears EXACTLY ONCE. The comment for each entry lists every
+ * language that produces that node type — so the registry is the single
+ * source of truth without misleading duplicate entries. The line-range guard
+ * inside getSymbolStructure (`node.startPosition.row === startRow &&
+ * node.endPosition.row === endRow`) prevents false positives if a type
+ * happens to match a non-definition role in some grammar.
+ */
+const DEF_TYPES: ReadonlySet<string> = new Set([
+    // JS / TS
+    'function_declaration', 'function_definition', 'method_definition',
+    'arrow_function', 'function', 'method',
+    'class_declaration', 'class_definition',
+    'function_signature', 'method_signature',
+    'lexical_declaration', 'variable_declaration',
+    // Go
+    'short_var_declaration', 'type_spec',
+    // Rust
+    'function_item', 'struct_item', 'enum_item', 'trait_item',
+    'impl_item', 'const_item', 'static_item', 'mod_item', 'type_item',
+    // Java + C# + Kotlin + PHP
+    'method_declaration',
+    // Java + C# + Kotlin + PHP
+    'interface_declaration',
+    // Java + C#
+    'enum_declaration',
+    // Java
+    'annotation_type_declaration',
+    // C / C++
+    'struct_specifier', 'union_specifier', 'enum_specifier',
+    'template_declaration',
+    // C / C++ + PHP
+    'namespace_definition',
+    // C# + Kotlin
+    'property_declaration',
+    // C#
+    'constructor_declaration', 'event_declaration', 'namespace_declaration',
+    // Kotlin
+    'object_declaration', 'type_alias',
+    // PHP
+    'trait_declaration',
+    // Ruby
+    'singleton_method', 'class', 'module',
+    // Swift
+    'struct_declaration', 'protocol_declaration', 'extension_declaration',
+    'typealias_declaration',
+    // Lua (grammar variants — both names appear across forks)
+    'local_function_declaration', 'function_statement',
+    // GraphQL
+    'object_type_definition', 'input_object_type_definition',
+    'interface_type_definition', 'union_type_definition',
+    'enum_type_definition', 'directive_definition',
+    // HCL (resource/data/variable/output blocks)
+    'block',
+    // Prisma
+    'model_declaration', 'type_declaration',
+    'datasource_declaration', 'generator_declaration',
+    // Protocol Buffers
+    'message', 'enum', 'service', 'rpc',
+    // Dockerfile
+    'arg_instruction', 'env_instruction', 'from_instruction',
+]);
+
 // Symbol cache: hash(source) → Symbol[]
 const SYMBOL_CACHE_MAX = 100;
 
@@ -1440,105 +1508,6 @@ export async function getSymbolStructure(source: string, langName: string, start
     try {
         const startRow = startLine - 1;
         const endRow = endLine - 1;
-
-        const DEF_TYPES = new Set([
-            // ── JavaScript / TypeScript (existing) ──────────────────────────────
-            'function_declaration', 'function_definition', 'method_definition',
-            'arrow_function', 'function', 'method',
-            'class_declaration', 'class_definition',
-            'function_signature', 'method_signature',
-            'lexical_declaration', 'variable_declaration',
-
-            // ── Go ──────────────────────────────────────────────────────────────
-            'method_declaration',       // func (r Recv) Name()
-            'short_var_declaration',    // x := func() {}
-            'type_spec',                // type Foo struct { ... }
-
-            // ── Rust ────────────────────────────────────────────────────────────
-            'function_item',            // fn foo() { }
-            'struct_item',              // struct Foo { }
-            'enum_item',                // enum Foo { }
-            'trait_item',               // trait Foo { }
-            'impl_item',                // impl Foo { }
-            'const_item',               // const X: T = ...
-            'static_item',              // static X: T = ...
-            'mod_item',                 // mod foo { }
-            'type_item',                // type Alias = T;
-
-            // ── Java ────────────────────────────────────────────────────────────
-            'method_declaration',       // (shared with C#, Kotlin, PHP)
-            'interface_declaration',    // (shared with C#, PHP, Kotlin)
-            'enum_declaration',         // (shared with C#, Java)
-            'annotation_type_declaration', // @interface Foo
-
-            // ── C / C++ ─────────────────────────────────────────────────────────
-            'struct_specifier',         // struct Foo { }
-            'union_specifier',          // union Foo { }
-            'enum_specifier',           // enum Foo { }
-            'template_declaration',     // template<T> ...
-            'namespace_definition',     // namespace ns { }
-
-            // ── C# ──────────────────────────────────────────────────────────────
-            'property_declaration',     // public int Foo { get; set; }
-            'constructor_declaration',  // public Foo() { }
-            'event_declaration',        // event EventHandler Foo;
-            'namespace_declaration',    // namespace Ns { }
-
-            // ── Kotlin ──────────────────────────────────────────────────────────
-            'object_declaration',       // object Singleton { }
-            'property_declaration',     // (may overlap with C# — safe)
-            'type_alias',               // typealias Foo = Bar
-
-            // ── PHP ─────────────────────────────────────────────────────────────
-            'namespace_definition',     // namespace Foo\Bar;
-            'trait_declaration',        // trait Foo { }
-
-            // ── Ruby ────────────────────────────────────────────────────────────
-            'singleton_method',         // def self.foo; end
-            'class',                    // class Foo; end
-            'module',                   // module Foo; end
-
-            // ── Swift ───────────────────────────────────────────────────────────
-            'struct_declaration',       // struct Foo { }
-            'protocol_declaration',     // protocol Foo { }
-            'extension_declaration',    // extension Foo { }
-            'typealias_declaration',    // typealias Foo = Bar
-
-            // ── Bash ────────────────────────────────────────────────────────────
-            // 'function_definition' already present
-
-            // ── Lua ─────────────────────────────────────────────────────────────
-            'local_function_declaration', // local function foo() end
-            'function_statement',          // fallback for some Lua grammar variants
-
-            // ── GraphQL ─────────────────────────────────────────────────────────
-            'object_type_definition',       // type Foo { }
-            'input_object_type_definition', // input Foo { }
-            'interface_type_definition',    // interface Foo { }
-            'union_type_definition',        // union Foo = A | B
-            'enum_type_definition',         // enum Direction { }
-            'directive_definition',         // directive @foo on FIELD
-
-            // ── HCL ─────────────────────────────────────────────────────────────
-            'block',                    // resource "aws" "name" { }
-
-            // ── Prisma ──────────────────────────────────────────────────────────
-            'model_declaration',        // model User { }
-            'type_declaration',         // type Alias = ...
-            'datasource_declaration',   // datasource db { }
-            'generator_declaration',    // generator client { }
-
-            // ── Protocol Buffers ────────────────────────────────────────────────
-            'message',                  // message Foo { }
-            'enum',                     // enum Status { }
-            'service',                  // service Foo { }
-            'rpc',                      // rpc Method(...) returns (...)
-
-            // ── Dockerfile ──────────────────────────────────────────────────────
-            'arg_instruction',          // ARG VAR=default
-            'env_instruction',          // ENV KEY=value
-            'from_instruction',         // FROM image AS alias
-        ]);
 
         let defNode: Node | null = null;
         function findDef(node: Node): boolean {
