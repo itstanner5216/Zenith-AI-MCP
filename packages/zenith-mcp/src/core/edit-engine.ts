@@ -320,7 +320,10 @@ async function syntaxWarn(filePath: string, content: string): Promise<string> {
         const syntaxErrors = await checkSyntaxErrors(content, langName);
         if (!syntaxErrors?.length) return '';
         const locations = syntaxErrors.map(e => `${e.line}:${e.column}`).join(', ');
-        return `\n⚠ Parse errors at lines ${locations}`;
+        // Leading \n gives visual separation when this string is appended to
+        // other tool output. The body is plain text — no decorative glyph or
+        // emoji. Tool output stays actionable and machine-readable.
+        return `\nParse errors at lines ${locations}`;
     } catch {
         return '';
     }
