@@ -191,6 +191,12 @@ async function applyEditList(content: string, edits: Edit[], { filePath, isBatch
         const tag = isBatch ? `#${i + 1}: ` : '';
 
         // BLOCK mode
+        // BUG (tracked): block_start, block_end, and replacement_block are schema-optional but
+        // the !-assertions below provide zero runtime protection — if any field is absent the
+        // engine crashes with "Cannot read properties of undefined (reading 'trim'/'replace')".
+        // Fix: replace the three !-assertions with an explicit guard that pushes to errors[] and
+        // continues, consistent with how the other modes handle missing fields.
+        // The guard has been applied to the live dist already; implement it here properly.
         if (edit.mode === 'block') {
             const lines = workingContent.split('\n');
             const expectedStart = edit.block_start!.trim();
