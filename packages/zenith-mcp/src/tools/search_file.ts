@@ -2,7 +2,7 @@ import { z } from "zod";
 import fs from "fs/promises";
 import { createReadStream } from "fs";
 import { createInterface } from "readline";
-import { CHAR_BUDGET } from '../core/shared.js';
+import { getCharBudget } from '../core/shared.js';
 import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
 import type { ToolServer, ToolContext } from './types.js';
 
@@ -30,7 +30,7 @@ interface BufferItem {
 export function register(server: ToolServer, ctx: ToolContext): void {
     const handler = async (args: SearchFileArgs) => {
         const validPath = await ctx.validatePath(args.path);
-        const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        const maxChars = Math.min(args.maxChars ?? 50000, getCharBudget());
         if (args.grep) {
             const grepPattern = new RegExp(args.grep, 'i');
             const grepContext = Math.min(Math.max(0, args.grepContext ?? 0), 30);

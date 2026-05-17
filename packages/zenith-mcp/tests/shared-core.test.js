@@ -3,8 +3,10 @@ import os from 'os';
 import path from 'path';
 
 import {
+    getCharBudget,
     CHAR_BUDGET,
     RANK_THRESHOLD,
+    getDefaultExcludes,
     DEFAULT_EXCLUDES,
     SENSITIVE_PATTERNS,
     isSensitive,
@@ -13,27 +15,48 @@ import {
 } from '../dist/core/shared.js';
 
 describe('shared constants', () => {
-    it('CHAR_BUDGET defaults to 400000', () => {
-        expect(CHAR_BUDGET).toBe(400000);
+    it('getCharBudget defaults to 400000', () => {
+        expect(getCharBudget()).toBe(400000);
     });
 
-    it('CHAR_BUDGET is within valid range', () => {
-        expect(CHAR_BUDGET).toBeGreaterThanOrEqual(10000);
-        expect(CHAR_BUDGET).toBeLessThanOrEqual(2000000);
+    it('getCharBudget is within valid range', () => {
+        expect(getCharBudget()).toBeGreaterThanOrEqual(10000);
+        expect(getCharBudget()).toBeLessThanOrEqual(2000000);
     });
 
     it('RANK_THRESHOLD is 50', () => {
         expect(RANK_THRESHOLD).toBe(50);
     });
 
-    it('DEFAULT_EXCLUDES contains common directories', () => {
-        expect(DEFAULT_EXCLUDES).toContain('node_modules');
-        expect(DEFAULT_EXCLUDES).toContain('.git');
+    it('getDefaultExcludes contains common directories', () => {
+        expect(getDefaultExcludes()).toContain('node_modules');
+        expect(getDefaultExcludes()).toContain('.git');
     });
 
-    it('SENSITIVE_PATTERNS contains credential patterns', () => {
-        expect(SENSITIVE_PATTERNS).toContain('**/.env');
-        expect(SENSITIVE_PATTERNS).toContain('**/*.pem');
+    it('sensitive patterns cover .env and pem files', () => {
+        expect(isSensitive('.env')).toBe(true);
+        expect(isSensitive('server.pem')).toBe(true);
+    });
+});
+
+describe('shared compatibility exports', () => {
+    it('CHAR_BUDGET is a number equal to getCharBudget() default', () => {
+        expect(typeof CHAR_BUDGET).toBe('number');
+        expect(CHAR_BUDGET).toBe(getCharBudget());
+    });
+
+    it('DEFAULT_EXCLUDES is an array containing common directories', () => {
+        expect(Array.isArray(DEFAULT_EXCLUDES)).toBe(true);
+        expect(DEFAULT_EXCLUDES).toContain('node_modules');
+        expect(DEFAULT_EXCLUDES).toContain('.git');
+        // Must match the getter output since both derive from the same config path
+        expect(DEFAULT_EXCLUDES).toEqual(getDefaultExcludes());
+    });
+
+    it('SENSITIVE_PATTERNS is an array covering credential-like patterns', () => {
+        expect(Array.isArray(SENSITIVE_PATTERNS)).toBe(true);
+        expect(SENSITIVE_PATTERNS.some(p => p.includes('.env'))).toBe(true);
+        expect(SENSITIVE_PATTERNS.some(p => p.includes('.pem'))).toBe(true);
     });
 });
 

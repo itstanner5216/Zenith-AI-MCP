@@ -1,19 +1,31 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import { normalizePath } from './path-utils.js';
 
 async function parseRootUri(rootUri: string) {
     try {
-        const rawPath = rootUri.startsWith('file://') ? rootUri.slice(7) : rootUri;
-        const expandedPath = rawPath.startsWith('~/') || rawPath === '~'
+        let rawPath: string;
+        if (rootUri.startsWith('file:')) {
+            try {
+                rawPath = fileURLToPath(new URL(rootUri));
+            } catch (urlError) {
+                void urlError; // malformed file URI — fall back to manual path extraction
+                rawPath = rootUri.slice(rootUri.indexOf('/', rootUri.indexOf(':')) + 1);
+            }
+        } else {
+            rawPath = rootUri;
+        }
+
+        const expandedPath = rawPath === '~' || rawPath.startsWith('~/')
             ? path.join(os.homedir(), rawPath.slice(1))
             : rawPath;
+
         const absolutePath = path.resolve(expandedPath);
         const resolvedPath = await fs.realpath(absolutePath);
         return normalizePath(resolvedPath);
-    }
-    catch {
+    } catch {
         return null;
     }
 }

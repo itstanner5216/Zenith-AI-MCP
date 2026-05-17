@@ -5,10 +5,9 @@ import path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { getSymbols, getLangForFile, isSupported } from './tree-sitter.js';
-import { DEFAULT_EXCLUDES } from './shared.js';
+import { getDefaultExcludes, isSensitive } from './shared.js';
+import { minimatch } from 'minimatch';
 import { loadConfig } from '../config/index.js';
-
-const _config = loadConfig();
 
 // ---------------------------------------------------------------------------
 // Row shape interfaces for typed DB queries
@@ -155,7 +154,7 @@ export function getDb(repoRoot: string): Database.Database {
         });
     }
 
-    try { db.prepare('DELETE FROM versions WHERE created_at < ?').run(Date.now() - _config.advanced.refactor_version_ttl_hours * 60 * 60 * 1000); } catch { /* table may be mid-migration */ }
+    try { db.prepare('DELETE FROM versions WHERE created_at < ?').run(Date.now() - loadConfig().advanced.refactor_version_ttl_hours * 60 * 60 * 1000); } catch { /* table may be mid-migration */ }
 
     _dbCache.set(repoRoot, db);
     return db;
@@ -196,8 +195,40 @@ interface SymbolLike {
     column: number;
 }
 
+function shouldIndexFile(repoRoot: string, absPath: string): boolean {
+    if (!isSupported(absPath)) return false;
+    if (isSensitive(absPath)) return false;
+    const relPath = path.relative(repoRoot, absPath);
+    const base = path.basename(absPath);
+    const excludes = getDefaultExcludes();
+    // Reject files whose path passes through an excluded directory (e.g. node_modules/, .git/).
+    // The base-name and pattern checks below only catch exact filename matches and glob patterns,
+    // not files nested inside an excluded directory when indexFile() is called directly.
+    const dirSegments = relPath.split(path.sep).slice(0, -1);
+    if (dirSegments.some(seg => excludes.some(pattern =>
+        seg === pattern || minimatch(seg, pattern, { dot: true, nocase: true })
+    ))) return false;
+    return !excludes.some(pattern =>
+        base === pattern ||
+        minimatch(relPath, pattern, { dot: true, nocase: true }) ||
+        minimatch(relPath, `**/${pattern}`, { dot: true, nocase: true })
+    );
+}
+
+function purgeIndexedPath(db: Database.Database, relPath: string): void {
+    db.transaction(() => {
+        db.prepare('DELETE FROM symbols WHERE file_path = ?').run(relPath);
+        db.prepare('DELETE FROM files WHERE path = ?').run(relPath);
+    })();
+}
+
 export async function indexFile(db: Database.Database, repoRoot: string, absFilePath: string): Promise<void> {
     const relPath = path.relative(repoRoot, absFilePath);
+
+    if (!shouldIndexFile(repoRoot, absFilePath)) {
+        purgeIndexedPath(db, relPath);
+        return;
+    }
 
     let source: string;
     try {
@@ -278,11 +309,11 @@ export async function indexDirectory(db: Database.Database, repoRoot: string, di
         try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; } // nosemgrep
         for (const entry of entries) {
             if (filePaths.length >= maxFiles) return;
-            if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+            if (getDefaultExcludes().some(p => entry.name === p)) continue;
             const fullPath = path.join(dir, entry.name); // nosemgrep
             if (entry.isDirectory()) {
                 await walk(fullPath);
-            } else if (entry.isFile() && isSupported(fullPath)) {
+            } else if (entry.isFile() && shouldIndexFile(repoRoot, fullPath)) {
                 filePaths.push(fullPath);
             }
         }

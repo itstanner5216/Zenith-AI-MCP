@@ -6,39 +6,50 @@ import path from "path";
 import os from "os";
 import { minimatch } from "minimatch";
 import { loadConfig } from '../config/index.js';
+import type { ZenithConfig } from '../config/index.js';
 
-const _config = loadConfig();
+let _config: ZenithConfig | null = null;
 
-export const CHAR_BUDGET: number = (() => {
-    const val = _config.advanced.char_budget;
+function getConfig(): ZenithConfig {
+    if (!_config) {
+        _config = loadConfig();
+    }
+    return _config;
+}
+
+export function getCharBudget(): number {
+    const val = getConfig().advanced.char_budget;
     if (typeof val === 'number' && !isNaN(val) && val >= 10_000 && val <= 2_000_000) return val;
     return 400_000;
-})();
+}
 export const RANK_THRESHOLD = 50;
+export const CHAR_BUDGET = getCharBudget();
 
-export const DEFAULT_EXCLUDES: string[] = (() => {
-    const raw = _config.advanced.default_excludes;
+export function getDefaultExcludes(): string[] {
+    const raw = getConfig().advanced.default_excludes;
     if (raw && typeof raw === 'string') {
         const parsed = raw.split(',').map(p => p.trim()).filter(Boolean);
         if (parsed.length > 0) return parsed;
     }
     return 'node_modules,.git,.next,.venv,venv,.env.local,dist,build,out,output,.cache,.turbo,.nuxt,.output,.svelte-kit,.parcel-cache,__pycache__,.pytest_cache,.mypy_cache,coverage,.nyc_output,.coverage,.DS_Store,*.min.js,*.min.css,*.map,.tsbuildinfo'
         .split(',').map(p => p.trim()).filter(Boolean);
-})();
+}
+export const DEFAULT_EXCLUDES = getDefaultExcludes();
 
-export const SENSITIVE_PATTERNS: string[] = (() => {
-    const raw = _config.advanced.sensitive_patterns;
+function getSensitivePatterns(): string[] {
+    const raw = getConfig().advanced.sensitive_patterns;
     if (raw && typeof raw === 'string') {
         const parsed = raw.split(',').map(p => p.trim()).filter(Boolean);
         if (parsed.length > 0) return parsed;
     }
     return '**/.env,**/*.pem,**/*.key,**/*.crt,**/*credentials*,**/*secret*,**/docker-compose.yaml,**/docker-compose.yml,**/.config/**'
         .split(',').map(p => p.trim()).filter(Boolean);
-})();
+}
+export const SENSITIVE_PATTERNS = getSensitivePatterns();
 
 export function isSensitive(filePath: string): boolean {
     const rel = path.relative(os.homedir(), filePath);
-    return SENSITIVE_PATTERNS.some(pat =>
+    return getSensitivePatterns().some(pat =>
         minimatch(rel, pat, { dot: true, nocase: true }) ||
         minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
     );
@@ -162,7 +173,8 @@ export class BM25Index {
     }
 }
 
-export function bm25RankResults(lines: string[], query: string, charBudget = CHAR_BUDGET) {
+export function bm25RankResults(lines: string[], query: string, charBudget?: number) {
+    const budget = charBudget ?? getCharBudget();
     const index = new BM25Index();
     const docs = lines.map((line, i) => ({ id: String(i), text: line }));
     index.build(docs);
@@ -172,7 +184,7 @@ export function bm25RankResults(lines: string[], query: string, charBudget = CHA
     for (const { id } of ranked) {
         const line = lines[Number(id)];
         if (line === undefined) continue;
-        if (charCount + line.length + 1 > charBudget) break;
+        if (charCount + line.length + 1 > budget) break;
         result.push(line);
         charCount += line.length + 1;
     }
@@ -183,7 +195,8 @@ export async function bm25PreFilterFiles(rootPath: string, query: string, topK =
     const docs: Array<{ id: string; text: string }> = [];
     const MAX_FILE_SIZE = 512 * 1024;
     const MAX_FILES = 5000;
-    const defaultExcludeGlobs = DEFAULT_EXCLUDES.map(p => `**/${p}/**`);
+    const defaultExcludes = getDefaultExcludes();
+    const defaultExcludeGlobs = defaultExcludes.map(p => `**/${p}/**`);
     const allExcludes = [...excludePatterns, ...defaultExcludeGlobs];
     const textExts = new Set(['.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp', '.cs', '.php', '.vue', '.svelte', '.html', '.css', '.scss', '.less', '.json', '.yaml', '.yml', '.toml', '.xml', '.md', '.txt', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.sql', '.graphql', '.proto', '.tf', '.hcl', '.lua', '.ex', '.exs', '.erl', '.hs', '.ml', '.clj', '.r', '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt', '.env.example', '.gitignore', '.editorconfig']);
     const hasRg = await ripgrepAvailable();
@@ -201,7 +214,7 @@ export async function bm25PreFilterFiles(rootPath: string, query: string, topK =
                 if (filePaths.length >= MAX_FILES) return;
                 const fullPath = path.join(dir, entry.name);
                 const rel = path.relative(rootPath, fullPath);
-                if (DEFAULT_EXCLUDES.some(p => entry.name === p)) continue;
+                if (defaultExcludes.some(p => entry.name === p)) continue;
                 const excluded = allExcludes.some(pat => minimatch(rel, pat, { dot: true }) || minimatch(rel, pat.replace(/^\*\*\//, ''), { dot: true }));
                 if (excluded) continue;
                 if (isSensitive(fullPath)) continue;
@@ -317,7 +330,7 @@ export async function ripgrepFindFiles(rootPath: string, options: {
 } = {}): Promise<string[] | null> {
     const { namePattern = null, pathContains = null, maxResults = 100, excludePatterns = [] } = options;
     const rgArgs = ['--files'];
-    for (const p of DEFAULT_EXCLUDES) {
+    for (const p of getDefaultExcludes()) {
         rgArgs.push('--glob', `!**/${p}`);
         rgArgs.push('--glob', `!**/${p}/**`);
     }

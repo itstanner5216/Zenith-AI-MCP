@@ -2,7 +2,7 @@ import { z } from "zod";
 import { createReadStream } from "fs";
 import { createInterface } from "readline";
 import { readFileContent, tailFile, headFile, offsetReadFile } from '../core/lib.js';
-import { CHAR_BUDGET } from '../core/shared.js';
+import { getCharBudget } from '../core/shared.js';
 import { compressTextFile, computeCompressionBudget, truncateToBudget } from '../core/compression.js';
 import { ToolServer, ToolContext } from './types.js';
 
@@ -45,7 +45,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
         ranges?: Array<{ startLine: number; endLine: number }>;
     }) => {
         const validPath = await ctx.validatePath(args.path);
-        const maxChars = Math.min(args.maxChars ?? 50000, CHAR_BUDGET);
+        const maxChars = Math.min(args.maxChars ?? 50000, getCharBudget());
         if (args.aroundLine !== undefined || (args.ranges && args.ranges.length > 0)) {
             const windows: LineWindow[] = [];
             if (args.aroundLine !== undefined) {

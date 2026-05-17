@@ -206,4 +206,45 @@ describe('ProjectContext — onRootsChanged', () => {
         onRootsChanged(ctx);
         expect(pc._explicit).toBe(false);
     });
+
+    it('refactor-batch path: getProjectContext via ctx is refreshed by onRootsChanged(ctx)', async () => {
+        vi.resetModules();
+        const { getProjectContext, onRootsChanged } = await importProjectContext();
+        // Simulate the ToolContext that refactor_batch.ts passes directly to getProjectContext
+        const ctx = {
+            getAllowedDirectories: () => [],
+            validatePath: async (p) => p,
+            sessionId: 'test-session',
+            validateNewFilePath: async (p) => p,
+            setAllowedDirectories: () => {},
+        };
+        // Obtain the context through ctx (as refactor_batch now does)
+        const pc = getProjectContext(ctx);
+        pc._resolved = true;
+        pc._explicit = true;
+
+        // onRootsChanged is called by server.ts with the same ctx object
+        onRootsChanged(ctx);
+
+        // The cached instance keyed by ctx must have been refreshed
+        expect(pc._explicit).toBe(false);
+        expect(pc._resolved).toBe(true); // refresh() calls _resolve() which sets resolved back to true
+    });
+
+    it('wrapper object does NOT get refreshed by onRootsChanged(ctx)', async () => {
+        vi.resetModules();
+        const { getProjectContext, onRootsChanged } = await importProjectContext();
+        const ctx = { getAllowedDirectories: () => [], validatePath: async (p) => p };
+        // A separate wrapper object (old incorrect pattern)
+        const wrapper = { getAllowedDirectories: () => ctx.getAllowedDirectories() };
+        const pc = getProjectContext(wrapper);
+        pc._resolved = true;
+        pc._explicit = true;
+
+        // Calling onRootsChanged with the original ctx cannot reach the wrapper-keyed instance
+        onRootsChanged(ctx);
+
+        // The wrapper-keyed instance is NOT refreshed
+        expect(pc._explicit).toBe(true);
+    });
 });

@@ -1,8 +1,12 @@
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
     formatSize,
     normalizeLineEndings,
     countOccurrences,
+    applyFileEdits,
     createUnifiedDiff,
     createMinimalDiff,
 } from '../dist/core/lib.js';
@@ -86,6 +90,25 @@ describe('lib countOccurrences', () => {
 
     it('counts correctly when needle appears at start and end', () => {
         expect(countOccurrences('xyzhelloxyz', 'xyz')).toBe(2);
+    });
+
+    it('rejects empty search strings', () => {
+        expect(() => countOccurrences('hello world', '')).toThrow('countOccurrences: search must not be empty');
+    });
+});
+
+describe('lib applyFileEdits', () => {
+    it('rejects empty oldText before attempting to match', async () => {
+        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lib-utils-'));
+        const filePath = path.join(tempDir, 'sample.txt');
+        try {
+            await fs.writeFile(filePath, 'hello world\n', 'utf-8');
+            await expect(
+                applyFileEdits(filePath, [{ oldText: '', newText: 'replacement' }], true)
+            ).rejects.toThrow('applyFileEdits: oldText must not be empty');
+        } finally {
+            try { await fs.rm(tempDir, { recursive: true, force: true }); } catch {}
+        }
     });
 });
 

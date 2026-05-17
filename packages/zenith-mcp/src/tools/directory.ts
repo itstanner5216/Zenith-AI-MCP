@@ -4,7 +4,7 @@ import path from "path";
 import { Dirent } from "fs";
 import { minimatch } from "minimatch";
 import { formatSize } from '../core/lib.js';
-import { DEFAULT_EXCLUDES } from '../core/shared.js';
+import { getDefaultExcludes } from '../core/shared.js';
 import { isSupported, getFileSymbolSummary, getFileSymbols } from '../core/tree-sitter.js';
 import type { ToolServer, ToolContext } from './types.js';
 
@@ -122,7 +122,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                         minimatch(relativePath, `**/${pattern}`, { dot: true }) ||
                         minimatch(relativePath, `**/${pattern}/**`, { dot: true });
                 });
-                const shouldExcludeByDefault = DEFAULT_EXCLUDES.some(p => entry.name === p ||
+                const shouldExcludeByDefault = getDefaultExcludes().some(p => entry.name === p ||
                     minimatch(relativePath, p, { dot: true }) ||
                     minimatch(relativePath, `**/${p}`, { dot: true }));
                 if (shouldExclude || shouldExcludeByDefault)

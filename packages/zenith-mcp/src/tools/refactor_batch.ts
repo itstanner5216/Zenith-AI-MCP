@@ -249,8 +249,6 @@ function parsePayload(payload: string): ParsedPayloadGroup[] {
 // Registration
 // ---------------------------------------------------------------------------
 export function register(server: ToolServer, ctx: ToolContext) {
-    // FsContext only needs getAllowedDirectories; validatePath is optional there.
-    const fsCtx = { getAllowedDirectories: () => ctx.getAllowedDirectories() };
     server.registerTool<RefactorBatchArgs>("refactor_batch", {
         title: "Refactor Batch",
         description: "Apply one edit pattern across multiple similar symbols, with rollback. Core pipeline: loadDiff (symbol bodies + context) → apply (write edits). query is optional — you can skip it and call loadDiff directly with explicit {symbol, file} pairs if you already know the targets (e.g. from search_files). After a successful apply: reapply sends the same cached edit to new targets, restore rolls back any symbol to a prior snapshot. Every apply/reapply/restore snapshots pre-edit text automatically. No default mode — mode is always required.",
@@ -280,7 +278,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
         }),
         annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
     }, async (args: RefactorBatchArgs) => {
-        const pc = getProjectContext(fsCtx);
+        const pc = getProjectContext(ctx);
         // =================================================================
         // QUERY
         // =================================================================
