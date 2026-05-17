@@ -374,7 +374,7 @@ export async function offsetReadFile(filePath: string, offset: number, length: n
                 if (collected.length < length) {
                     collected.push(line);
                 } else {
-                    hasMore = true;
+                    hasMore = length > 0;
                     break;
                 }
             }
