@@ -47,6 +47,9 @@ const EXT_TO_LANG: Record<string, string> = {
     '.mjs':  'javascript',
     '.cjs':  'javascript',
     '.jsx':  'javascript',
+    // JavaScript (additions)
+    '.es':   'javascript',
+    '.es6':  'javascript',
     '.ts':   'typescript',
     '.mts':  'typescript',
     '.cts':  'typescript',
@@ -54,10 +57,15 @@ const EXT_TO_LANG: Record<string, string> = {
     // Python
     '.py':   'python',
     '.pyi':  'python',
+    // Python (additions)
+    '.pyw':  'python',
     // Shell
     '.sh':   'bash',
     '.bash': 'bash',
     '.zsh':  'bash',
+    // Shell / Bash (additions — bash grammar handles ksh/ash syntax)
+    '.ksh':  'bash',
+    '.ash':  'bash',
     // Go
     '.go':   'go',
     // Rust
@@ -73,31 +81,220 @@ const EXT_TO_LANG: Record<string, string> = {
     '.hpp':  'cpp',
     '.hh':   'cpp',
     '.hxx':  'cpp',
+    // C++ (additions — template and module file extensions)
+    '.ipp':  'cpp',
+    '.inl':  'cpp',
+    '.tcc':  'cpp',
+    '.cppm': 'cpp',
+    '.ixx':  'cpp',
     // C#
     '.cs':   'csharp',
+    // C# (additions)
+    '.csx':  'csharp',
     // Kotlin
     '.kt':   'kotlin',
     '.kts':  'kotlin',
     // PHP
     '.php':  'php',
+    // PHP (additions)
+    '.php3':  'php',
+    '.php4':  'php',
+    '.php5':  'php',
+    '.php7':  'php',
+    '.php8':  'php',
+    '.phtml': 'php',
     // Ruby
     '.rb':     'ruby',
     '.rake':   'ruby',
     '.gemspec': 'ruby',
+    // Ruby (additions)
+    '.ru':       'ruby',
+    '.jbuilder': 'ruby',
+    '.rabl':     'ruby',
+    '.podspec':  'ruby',
+    '.arb':      'ruby',
     // Swift
     '.swift': 'swift',
     // Web
     '.css':  'css',
-    '.scss': 'css',
+    '.scss': 'scss',
     // Data formats
     '.json':  'json',
     '.jsonc': 'json',
+    // JSON (additions)
+    '.json5':    'json',
+    '.geojson':  'json',
+    '.topojson': 'json',
+    '.jsonl':    'json',
+    '.ndjson':   'json',
     '.yaml':  'yaml',
     '.yml':   'yaml',
     '.sql':   'sql',
+    // SQL (additions)
+    '.pgsql':  'sql',
+    '.plsql':  'sql',
+    '.mysql':  'sql',
     // Documentation
     '.md':  'markdown',
     '.mdx': 'markdown',
+    // Markdown (additions)
+    '.markdown': 'markdown',
+    '.mdown':    'markdown',
+    '.mkd':      'markdown',
+    '.mkdn':     'markdown',
+    '.mkdown':   'markdown',
+    '.mdwn':     'markdown',
+
+    // --- Full coverage additions (WASM + tags.scm present) ---
+
+    // Dockerfile
+    '.dockerfile': 'dockerfile',
+
+    // GraphQL
+    '.graphql': 'graphql',
+    '.gql':     'graphql',
+
+    // HCL / Terraform / Packer
+    '.tf':      'hcl',
+    '.hcl':     'hcl',
+    '.tfvars':  'hcl',
+    '.nomad':   'hcl',
+
+    // HTML
+    '.html':  'html',
+    '.htm':   'html',
+    '.shtml': 'html',
+    '.xhtml': 'html',
+
+    // Lua
+    '.lua': 'lua',
+
+    // Nix
+    '.nix': 'nix',
+
+    // Prisma
+    '.prisma': 'prisma',
+
+    // Protocol Buffers
+    '.proto': 'proto',
+
+    // Tree-sitter Query Language (the .scm grammar files themselves)
+    '.scm': 'query',
+
+    // Svelte
+    '.svelte': 'svelte',
+
+    // TOML
+    '.toml': 'toml',
+
+    // Vue
+    '.vue': 'vue',
+
+    // XML, SVG, and XML-based formats
+    '.xml':  'xml',
+    '.svg':  'xml',
+    '.xsl':  'xml',
+    '.xslt': 'xml',
+    '.xsd':  'xml',
+    '.wsdl': 'xml',
+    '.plist': 'xml',
+    '.gpx':  'xml',
+    '.kml':  'xml',
+    '.rss':  'xml',
+    '.atom': 'xml',
+
+    // --- Parse-capable only (WASM present, no query file) ---
+
+    // CMake
+    '.cmake': 'cmake',
+
+    // Dart
+    '.dart': 'dart',
+
+    // Elixir
+    '.ex':  'elixir',
+    '.exs': 'elixir',
+
+    // INI / config-style formats
+    '.ini': 'ini',
+    '.cfg': 'ini',
+
+    // Make (fragments — full Makefile detected by filename below)
+    '.mk': 'make',
+
+    // Perl
+    '.pl': 'perl',
+    '.pm': 'perl',
+    '.t':  'perl',
+
+    // R
+    '.r': 'r',
+
+    // Regex pattern files
+    // tree-sitter-regex.wasm + regex-tags.scm exist and capture named groups
+    '.regex': 'regex',
+};
+
+/**
+ * Basename → language for files without a meaningful extension.
+ * Checked as a fallback in getLangForFile when ext is empty or unrecognized.
+ */
+const FILENAME_TO_LANG: Record<string, string> = {
+    // Dockerfile (exact basenames — prefix detection handled in getLangForFile)
+    'Dockerfile':            'dockerfile',
+    'dockerfile':            'dockerfile',
+
+    // Make
+    'Makefile':              'make',
+    'makefile':              'make',
+    'GNUmakefile':           'make',
+    'BSDmakefile':           'make',
+
+    // CMake
+    'CMakeLists.txt':        'cmake',
+
+    // Ruby DSL files (no extension — all use Ruby syntax)
+    'Gemfile':               'ruby',
+    'Rakefile':              'ruby',
+    'Vagrantfile':           'ruby',
+    'Podfile':               'ruby',
+    'Brewfile':              'ruby',
+    'Guardfile':             'ruby',
+    'Capfile':               'ruby',
+    'Berksfile':             'ruby',
+    'Thorfile':              'ruby',
+    'Fastfile':              'ruby',
+    'Appfile':               'ruby',
+    'Matchfile':             'ruby',
+    'Pluginfile':            'ruby',
+    'Snapfile':              'ruby',
+    'Gymfile':               'ruby',
+    'Deliverfile':           'ruby',
+    'Scanfile':              'ruby',
+
+    // Shell dotfiles (bash grammar handles zsh/profile syntax)
+    '.bashrc':               'bash',
+    '.bash_profile':         'bash',
+    '.bash_logout':          'bash',
+    '.bash_aliases':         'bash',
+    '.bash_functions':       'bash',
+    '.zshrc':                'bash',
+    '.zshenv':               'bash',
+    '.zprofile':             'bash',
+    '.zlogout':              'bash',
+    '.zlogin':               'bash',
+    '.profile':              'bash',
+
+    // EditorConfig (INI-style format)
+    '.editorconfig':         'ini',
+
+    // Git config files (INI-style format)
+    '.gitconfig':            'ini',
+    '.gitmodules':           'ini',
+
+    // TOML-format files without .toml extension
+    'Cargo.lock':            'toml',
+    'Pipfile':               'toml',
 };
 
 /**
@@ -105,8 +302,19 @@ const EXT_TO_LANG: Record<string, string> = {
  * Returns null if the extension is not supported.
  */
 export function getLangForFile(filePath?: string): string | null {
-    const ext = path.extname(filePath ?? '').toLowerCase();
-    return EXT_TO_LANG[ext] ?? null;
+    const resolved = filePath ?? '';
+    const ext = path.extname(resolved).toLowerCase();
+    if (ext) {
+        const lang = EXT_TO_LANG[ext];
+        if (lang !== undefined) return lang;
+    }
+    // Fallback: basename-exact lookup for extensionless files
+    const basename = path.basename(resolved);
+    const exactLang = FILENAME_TO_LANG[basename];
+    if (exactLang !== undefined) return exactLang;
+    // Prefix fallback: Dockerfile.* variants (Dockerfile.dev, Dockerfile.prod, etc.)
+    if (basename.startsWith('Dockerfile')) return 'dockerfile';
+    return null;
 }
 
 /**
@@ -502,6 +710,147 @@ const COMPRESSION_ANCHOR_RULES: Record<string, AnchorRuleMap> = {
         with_statement: { kind: 'with', priority: 220 },
         await: { kind: 'await', priority: 180 },
         call: { kind: 'call', priority: 140 },
+    },
+
+    go: {
+        return_statement:   { kind: 'return', priority: 400 },
+        if_statement:       { kind: 'if',     priority: 320 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        select_statement:   { kind: 'switch', priority: 300 },
+        go_statement:       { kind: 'call',   priority: 200 },
+        defer_statement:    { kind: 'defer',  priority: 220 },
+    },
+
+    rust: {
+        return_expression:  { kind: 'return', priority: 400 },
+        if_expression:      { kind: 'if',     priority: 320 },
+        match_expression:   { kind: 'switch', priority: 300 },
+        loop_expression:    { kind: 'loop',   priority: 260 },
+        for_expression:     { kind: 'loop',   priority: 260 },
+        while_expression:   { kind: 'loop',   priority: 250 },
+        try_expression:     { kind: 'try',    priority: 280 },
+        macro_invocation:   { kind: 'call',   priority: 140 },
+    },
+
+    java: {
+        return_statement:        { kind: 'return', priority: 400 },
+        throw_statement:         { kind: 'throw',  priority: 380 },
+        if_statement:            { kind: 'if',     priority: 320 },
+        switch_expression:       { kind: 'switch', priority: 300 },
+        for_statement:           { kind: 'loop',   priority: 260 },
+        enhanced_for_statement:  { kind: 'loop',   priority: 255 },
+        while_statement:         { kind: 'loop',   priority: 250 },
+        do_statement:            { kind: 'loop',   priority: 240 },
+        try_statement:           { kind: 'try',    priority: 280 },
+        catch_clause:            { kind: 'catch',  priority: 270 },
+        method_invocation:       { kind: 'call',   priority: 140 },
+    },
+
+    c: {
+        return_statement:   { kind: 'return', priority: 400 },
+        if_statement:       { kind: 'if',     priority: 320 },
+        switch_statement:   { kind: 'switch', priority: 300 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        while_statement:    { kind: 'loop',   priority: 250 },
+        do_statement:       { kind: 'loop',   priority: 240 },
+    },
+
+    cpp: {
+        return_statement:   { kind: 'return', priority: 400 },
+        throw_statement:    { kind: 'throw',  priority: 380 },
+        if_statement:       { kind: 'if',     priority: 320 },
+        switch_statement:   { kind: 'switch', priority: 300 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        while_statement:    { kind: 'loop',   priority: 250 },
+        do_statement:       { kind: 'loop',   priority: 240 },
+        try_statement:      { kind: 'try',    priority: 280 },
+        catch_clause:       { kind: 'catch',  priority: 270 },
+    },
+
+    csharp: {
+        return_statement:   { kind: 'return', priority: 400 },
+        throw_statement:    { kind: 'throw',  priority: 380 },
+        if_statement:       { kind: 'if',     priority: 320 },
+        switch_statement:   { kind: 'switch', priority: 300 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        foreach_statement:  { kind: 'loop',   priority: 255 },
+        while_statement:    { kind: 'loop',   priority: 250 },
+        do_statement:       { kind: 'loop',   priority: 240 },
+        try_statement:      { kind: 'try',    priority: 280 },
+        catch_clause:       { kind: 'catch',  priority: 270 },
+        await_expression:   { kind: 'await',  priority: 180 },
+    },
+
+    kotlin: {
+        return_expression:    { kind: 'return', priority: 400 },
+        throw_expression:     { kind: 'throw',  priority: 380 },
+        if_expression:        { kind: 'if',     priority: 320 },
+        when_expression:      { kind: 'switch', priority: 300 },
+        for_statement:        { kind: 'loop',   priority: 260 },
+        while_statement:      { kind: 'loop',   priority: 250 },
+        do_while_statement:   { kind: 'loop',   priority: 240 },
+        try_expression:       { kind: 'try',    priority: 280 },
+    },
+
+    php: {
+        return_statement:   { kind: 'return', priority: 400 },
+        throw_expression:   { kind: 'throw',  priority: 380 },
+        if_statement:       { kind: 'if',     priority: 320 },
+        switch_statement:   { kind: 'switch', priority: 300 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        foreach_statement:  { kind: 'loop',   priority: 255 },
+        while_statement:    { kind: 'loop',   priority: 250 },
+        do_statement:       { kind: 'loop',   priority: 240 },
+        try_statement:      { kind: 'try',    priority: 280 },
+        catch_clause:       { kind: 'catch',  priority: 270 },
+    },
+
+    ruby: {
+        return:             { kind: 'return', priority: 400 },
+        raise:              { kind: 'throw',  priority: 380 },
+        if:                 { kind: 'if',     priority: 320 },
+        unless:             { kind: 'if',     priority: 310 },
+        for:                { kind: 'loop',   priority: 260 },
+        while:              { kind: 'loop',   priority: 250 },
+        until:              { kind: 'loop',   priority: 240 },
+        begin:              { kind: 'try',    priority: 280 },
+        rescue:             { kind: 'catch',  priority: 270 },
+    },
+
+    swift: {
+        return_statement:           { kind: 'return', priority: 400 },
+        throw_statement:            { kind: 'throw',  priority: 380 },
+        if_statement:               { kind: 'if',     priority: 320 },
+        guard_statement:            { kind: 'if',     priority: 315 },
+        switch_statement:           { kind: 'switch', priority: 300 },
+        for_in_statement:           { kind: 'loop',   priority: 260 },
+        while_statement:            { kind: 'loop',   priority: 250 },
+        repeat_while_statement:     { kind: 'loop',   priority: 240 },
+        do_statement:               { kind: 'try',    priority: 280 },
+    },
+
+    bash: {
+        if_statement:       { kind: 'if',     priority: 320 },
+        case_statement:     { kind: 'switch', priority: 300 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        while_statement:    { kind: 'loop',   priority: 250 },
+        pipeline:           { kind: 'call',   priority: 140 },
+    },
+
+    lua: {
+        return_statement:   { kind: 'return', priority: 400 },
+        if_statement:       { kind: 'if',     priority: 320 },
+        for_statement:      { kind: 'loop',   priority: 260 },
+        while_statement:    { kind: 'loop',   priority: 250 },
+        repeat_statement:   { kind: 'loop',   priority: 240 },
+        function_call:      { kind: 'call',   priority: 140 },
+    },
+
+    nix: {
+        if_expression:      { kind: 'if',   priority: 320 },
+        assert_expression:  { kind: 'if',   priority: 315 },
+        with_expression:    { kind: 'with', priority: 220 },
+        let_expression:     { kind: 'call', priority: 160 },
     },
 };
 
@@ -958,11 +1307,102 @@ export async function getSymbolStructure(source: string, langName: string, start
         const endRow = endLine - 1;
 
         const DEF_TYPES = new Set([
+            // ── JavaScript / TypeScript (existing) ──────────────────────────────
             'function_declaration', 'function_definition', 'method_definition',
             'arrow_function', 'function', 'method',
             'class_declaration', 'class_definition',
             'function_signature', 'method_signature',
             'lexical_declaration', 'variable_declaration',
+
+            // ── Go ──────────────────────────────────────────────────────────────
+            'method_declaration',       // func (r Recv) Name()
+            'short_var_declaration',    // x := func() {}
+            'type_spec',                // type Foo struct { ... }
+
+            // ── Rust ────────────────────────────────────────────────────────────
+            'function_item',            // fn foo() { }
+            'struct_item',              // struct Foo { }
+            'enum_item',                // enum Foo { }
+            'trait_item',               // trait Foo { }
+            'impl_item',                // impl Foo { }
+            'const_item',               // const X: T = ...
+            'static_item',              // static X: T = ...
+            'mod_item',                 // mod foo { }
+            'type_item',                // type Alias = T;
+
+            // ── Java ────────────────────────────────────────────────────────────
+            'method_declaration',       // (shared with C#, Kotlin, PHP)
+            'interface_declaration',    // (shared with C#, PHP, Kotlin)
+            'enum_declaration',         // (shared with C#, Java)
+            'annotation_type_declaration', // @interface Foo
+
+            // ── C / C++ ─────────────────────────────────────────────────────────
+            'struct_specifier',         // struct Foo { }
+            'union_specifier',          // union Foo { }
+            'enum_specifier',           // enum Foo { }
+            'template_declaration',     // template<T> ...
+            'namespace_definition',     // namespace ns { }
+
+            // ── C# ──────────────────────────────────────────────────────────────
+            'property_declaration',     // public int Foo { get; set; }
+            'constructor_declaration',  // public Foo() { }
+            'event_declaration',        // event EventHandler Foo;
+            'namespace_declaration',    // namespace Ns { }
+
+            // ── Kotlin ──────────────────────────────────────────────────────────
+            'object_declaration',       // object Singleton { }
+            'property_declaration',     // (may overlap with C# — safe)
+            'type_alias',               // typealias Foo = Bar
+
+            // ── PHP ─────────────────────────────────────────────────────────────
+            'namespace_definition',     // namespace Foo\Bar;
+            'trait_declaration',        // trait Foo { }
+
+            // ── Ruby ────────────────────────────────────────────────────────────
+            'singleton_method',         // def self.foo; end
+            'class',                    // class Foo; end
+            'module',                   // module Foo; end
+
+            // ── Swift ───────────────────────────────────────────────────────────
+            'struct_declaration',       // struct Foo { }
+            'protocol_declaration',     // protocol Foo { }
+            'extension_declaration',    // extension Foo { }
+            'typealias_declaration',    // typealias Foo = Bar
+
+            // ── Bash ────────────────────────────────────────────────────────────
+            // 'function_definition' already present
+
+            // ── Lua ─────────────────────────────────────────────────────────────
+            'local_function_declaration', // local function foo() end
+            'function_statement',          // fallback for some Lua grammar variants
+
+            // ── GraphQL ─────────────────────────────────────────────────────────
+            'object_type_definition',       // type Foo { }
+            'input_object_type_definition', // input Foo { }
+            'interface_type_definition',    // interface Foo { }
+            'union_type_definition',        // union Foo = A | B
+            'enum_type_definition',         // enum Direction { }
+            'directive_definition',         // directive @foo on FIELD
+
+            // ── HCL ─────────────────────────────────────────────────────────────
+            'block',                    // resource "aws" "name" { }
+
+            // ── Prisma ──────────────────────────────────────────────────────────
+            'model_declaration',        // model User { }
+            'type_declaration',         // type Alias = ...
+            'datasource_declaration',   // datasource db { }
+            'generator_declaration',    // generator client { }
+
+            // ── Protocol Buffers ────────────────────────────────────────────────
+            'message',                  // message Foo { }
+            'enum',                     // enum Status { }
+            'service',                  // service Foo { }
+            'rpc',                      // rpc Method(...) returns (...)
+
+            // ── Dockerfile ──────────────────────────────────────────────────────
+            'arg_instruction',          // ARG VAR=default
+            'env_instruction',          // ENV KEY=value
+            'from_instruction',         // FROM image AS alias
         ]);
 
         let defNode: Node | null = null;
