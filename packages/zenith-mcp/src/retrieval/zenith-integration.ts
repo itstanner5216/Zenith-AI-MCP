@@ -6,6 +6,7 @@
  * HAZARD 2: Session IDs always passed in by caller.
  */
 
+import { randomUUID } from "node:crypto";
 import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Root, Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
@@ -85,7 +86,7 @@ function sessionIdFromExtra(extra: unknown): string {
     ? maybe.sessionId
     : typeof maybe?.requestId === "string"
       ? maybe.requestId
-      : "default";
+      : randomUUID();
 }
 
 // ── Tool registration hook ───────────────────────────────────────────────────
@@ -202,38 +203,26 @@ export function installRetrievalRequestHandlers(
   pipeline: RetrievalPipeline,
   registry: ZenithToolRegistry,
 ): void {
-  const protocol = server.server as unknown as {
-    _requestHandlers: Map<string, (request: unknown, extra: unknown) => Promise<unknown>>;
-  };
-  const defaultList = protocol._requestHandlers.get("tools/list");
-  const defaultCall = protocol._requestHandlers.get("tools/call");
-
-  if (!defaultList || !defaultCall) {
-    throw new Error("MCP tool handlers are not initialized");
-  }
+  // No private SDK field access needed — the registry is the source of truth.
+  // Every tool registered via createRetrievalAwareToolRegistrar is mirrored
+  // into the registry, so listing/dispatching through the registry produces
+  // the same set of tools as the SDK's internal handler would have.
 
   const errorResult = (message: string): CallToolResult => ({
     content: [{ type: "text", text: message }],
     isError: true,
   });
 
-  server.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
-    const full = (await defaultList(request, extra)) as { tools: Tool[] };
+  type ToolHandler = (args: Record<string, unknown>) => Promise<CallToolResult>;
+
+  server.server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
+    // `getToolsForList` returns Tool[] sourced directly from registry mappings
+    // (see RetrievalPipeline.getToolsForList — every code path returns Tools
+    // pulled from registry.mappings). The objects in `selected` are already
+    // the canonical registry Tools, including the synthetic routing tool when
+    // retrieval is enabled. No further lookup is needed.
     const selected = await pipeline.getToolsForList(sessionIdFromExtra(extra));
-    const fullByName = new Map(full.tools.map((tool) => [tool.name, tool]));
-    const tools: Tool[] = [];
-
-    for (const tool of selected) {
-      if (tool.name === ROUTING_TOOL_NAME) {
-        tools.push(tool);
-        continue;
-      }
-
-      const sdkTool = fullByName.get(tool.name);
-      if (sdkTool) tools.push(sdkTool);
-    }
-
-    return { ...full, tools };
+    return { tools: selected };
   });
 
   server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -250,32 +239,35 @@ export function installRetrievalRequestHandlers(
       }
 
       if (args.describe === true) {
-        const full = (await defaultList({ method: "tools/list" }, extra)) as { tools: Tool[] };
-        const tool = full.tools.find((candidate) => candidate.name === mapping.tool.name) ?? mapping.tool;
         pipeline.recordRouterDescribe(sid, target);
-        return { content: [{ type: "text", text: JSON.stringify(tool, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(mapping.tool, null, 2) }] };
       }
 
       const routedArgs = (args.arguments ?? {}) as Record<string, unknown>;
-      const proxiedRequest = {
-        ...request,
-        params: {
-          ...request.params,
-          name: mapping.tool.name,
-          arguments: routedArgs,
-        },
-      };
-      const result = (await defaultCall(proxiedRequest, extra)) as CallToolResult;
+      const handler = mapping.handler as ToolHandler | undefined;
+      if (!handler) {
+        return errorResult(`Tool ${target} has no handler`);
+      }
+      const result = await handler(routedArgs);
       if (!result.isError) {
         await pipeline.onToolCalled(sid, target, routedArgs, true);
       }
       return result;
     }
 
-    const result = (await defaultCall(request, extra)) as CallToolResult;
+    const key = makeToolKey("zenith", toolName);
+    const mapping = registry.get(key);
+    if (!mapping) {
+      return errorResult(`Tool ${toolName} not found in registry`);
+    }
+    const handler = mapping.handler as ToolHandler | undefined;
+    if (!handler) {
+      return errorResult(`Tool ${toolName} has no registered handler`);
+    }
+    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+    const result = await handler(args);
     if (!result.isError) {
-      const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-      await pipeline.onToolCalled(sid, makeToolKey("zenith", toolName), args, false);
+      await pipeline.onToolCalled(sid, key, args, false);
     }
     return result;
   });

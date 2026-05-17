@@ -4,7 +4,7 @@ import path from 'path';
 
 export const DEFAULT_COMPRESSION_KEEP_RATIO = 0.70;
 
-const _BRIDGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'toon_bridge.js');
+const _BRIDGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'toon_bridge_cli.js');
 
 export function computeCompressionBudget(rawLength: number, maxChars: number, keepRatio = DEFAULT_COMPRESSION_KEEP_RATIO): number {
     if (!Number.isFinite(rawLength) || rawLength <= 0) return 0;

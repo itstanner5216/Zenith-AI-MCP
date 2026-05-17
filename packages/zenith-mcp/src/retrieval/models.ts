@@ -133,6 +133,12 @@ export interface RankingEvent {
   timestamp: number;
 }
 
+// ─── Phase 2: Frequency prior ────────────────────────────────────────────────
+
+export interface FrequencyPriorSource {
+  readRankingEvents(sinceEpochSeconds: number): Promise<RankingEvent[]>;
+}
+
 // ─── Factory helpers ────────────────────────────────────────────────────────
 
 export function defaultRetrievalConfig(overrides?: Partial<RetrievalConfig>): RetrievalConfig {

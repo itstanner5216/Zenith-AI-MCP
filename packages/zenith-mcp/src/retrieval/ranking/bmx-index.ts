@@ -6,6 +6,7 @@
  * query-document similarity scoring atop a restructured TF-IDF core.
  */
 import type { ToolDoc } from "../models.js";
+import { tokenizeLexicalTerms } from "./tokenizer.js";
 
 interface TermData {
   docFreq: number;
@@ -68,10 +69,7 @@ export class BMXIndex {
   // ─── Tokenization ────────────────────────────────────────────────────────
 
   private _tokenize(text: string): string[] {
-    if (!text) return [];
-    const lower = text.toLowerCase();
-    const matches = lower.match(/[a-z0-9_]+/g) ?? [];
-    return matches.filter((t) => t.length > 1 || t === "a" || t === "i");
+    return tokenizeLexicalTerms(text);
   }
 
   // ─── Core math primitives ───────────────────────────────────────────────

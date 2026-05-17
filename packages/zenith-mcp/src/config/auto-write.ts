@@ -8,6 +8,7 @@ import type { ZenithConfig } from "./schema.js";
 // Format helpers — these can read/write arbitrary file paths (unlike adapters
 // which are locked to their own configPath).
 import { readJson5, writeJson5 } from "../adapters/helpers/json5.js";
+import { readJsonc, writeJsonc } from "../adapters/helpers/jsonc.js";
 import { readToml, writeToml } from "../adapters/helpers/toml.js";
 import { readYaml, writeYaml } from "../adapters/helpers/yaml.js";
 
@@ -15,16 +16,18 @@ import { readYaml, writeYaml } from "../adapters/helpers/yaml.js";
 // The server entry that Zenith writes into each platform's MCP config
 // ---------------------------------------------------------------------------
 
-const zenithServerEntry: Record<string, unknown> = {
-  command: "zenith-mcp",
-  args: [],
-};
+function makeZenithServerEntry(): Record<string, unknown> {
+  return {
+    command: "zenith-mcp",
+    args: [],
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Supported MCP config extensions — used for directory scanning
 // ---------------------------------------------------------------------------
 
-const MCP_EXTENSIONS = new Set([".json", ".json5", ".toml", ".yaml", ".yml"]);
+const MCP_EXTENSIONS = new Set([".json", ".jsonc", ".json5", ".toml", ".yaml", ".yml"]);
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -105,7 +108,7 @@ export function autoWriteToMcpConfigs(config: ZenithConfig): AutoWriteResult {
 
     // Write the Zenith server entry via the adapter's read-modify-write flow.
     try {
-      adapter.registerServer("zenith-mcp", zenithServerEntry);
+      adapter.registerServer("zenith-mcp", makeZenithServerEntry());
       written.push(cfgPath);
     } catch {
       // Restore the original content immediately.
@@ -225,6 +228,8 @@ function getFormatHandler(filePath: string): FormatHandler | null {
           writeFileSync(p, JSON.stringify(data, null, 2) + "\n", "utf-8");
         },
       };
+    case ".jsonc":
+      return { read: readJsonc, write: writeJsonc };
     case ".json5":
       return { read: readJson5, write: writeJson5 };
     case ".toml":
@@ -239,16 +244,18 @@ function getFormatHandler(filePath: string): FormatHandler | null {
 
 /**
  * Check if parsed data looks like an MCP configuration file.
- * The universal indicator is a top-level `mcpServers` key.
+ * Recognises both `mcpServers` (Claude, Cursor, etc.) and `mcp` (OpenCode, Zed).
  */
 function isMcpConfig(data: Record<string, unknown>): boolean {
-  return (
-    typeof data === "object" &&
-    data !== null &&
-    "mcpServers" in data &&
-    typeof data.mcpServers === "object" &&
-    data.mcpServers !== null
-  );
+  if (typeof data !== "object" || data === null) return false;
+  const hasServers =
+    ("mcpServers" in data &&
+      typeof data.mcpServers === "object" &&
+      data.mcpServers !== null) ||
+    ("mcp" in data &&
+      typeof data.mcp === "object" &&
+      data.mcp !== null);
+  return hasServers;
 }
 
 function verifyAndWriteMcpConfig(
@@ -301,8 +308,10 @@ function verifyAndWriteMcpConfig(
 
   // Add the Zenith entry and write back.
   try {
-    const mcpServers = data.mcpServers as Record<string, unknown>;
-    mcpServers["zenith-mcp"] = zenithServerEntry;
+    // Support both mcpServers (Claude, Cursor, etc.) and mcp (OpenCode, Zed)
+    const serverStoreKey = "mcpServers" in data ? "mcpServers" : "mcp";
+    const serverStore = data[serverStoreKey] as Record<string, unknown>;
+    serverStore["zenith-mcp"] = makeZenithServerEntry();
     handler.write(filePath, data);
     return { status: "written", message: filePath };
   } catch {

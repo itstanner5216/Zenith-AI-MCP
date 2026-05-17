@@ -60,34 +60,42 @@ class JetBrainsAdapter extends MCPConfigAdapter {
     }
   }
 
-  writeConfig(data: Record<string, any>) {
-    const p = this.configPath()!;
+  writeConfig(data: Record<string, unknown>) {
+    const p = this.configPath();
     this.backup(p);
     mkdirSync(join(p, ".."), { recursive: true });
     writeFileSync(p, JSON.stringify(data, null, 2) + "\n", "utf-8");
   }
 
-  registerServer(name: string, config: Record<string, any>) {
-    const data = this.readConfig();
-    if (!data.mcpServers) data.mcpServers = {};
-    data.mcpServers[name] = config;
+  registerServer(name: string, config: Record<string, unknown>) {
+    const data = this.readConfig() as Record<string, unknown>;
+    const servers =
+      typeof data.mcpServers === "object" &&
+      data.mcpServers !== null &&
+      !Array.isArray(data.mcpServers)
+        ? (data.mcpServers as Record<string, unknown>)
+        : {};
+    servers[name] = config;
+    data.mcpServers = servers;
     this.writeConfig(data);
   }
 
   discoverServers() {
-    const result: Record<string, Record<string, any>> = {};
+    const result: Record<string, Record<string, unknown>> = {};
     for (const p of this.configPaths()) {
       if (!existsSync(p)) continue;
       try {
         const data = JSON.parse(readFileSync(p, "utf-8"));
         if (typeof data !== "object" || data === null || Array.isArray(data)) continue;
-        const servers = (data as Record<string, any>).mcpServers;
+        const servers = (data as Record<string, unknown>).mcpServers;
         if (typeof servers === "object" && servers !== null && !Array.isArray(servers)) {
-          Object.assign(result, servers as Record<string, Record<string, any>>);
+          Object.assign(result, servers as Record<string, Record<string, unknown>>);
         }
-      } catch (e) {
-        console.error(`Failed to read JetBrains config at ${p}: ${e}`);
-        throw e;
+      } catch (error) {
+        console.warn(
+          `Skipping malformed JetBrains MCP config at ${p}: ${(error as Error).message}`,
+        );
+        continue;
       }
     }
     return result;
