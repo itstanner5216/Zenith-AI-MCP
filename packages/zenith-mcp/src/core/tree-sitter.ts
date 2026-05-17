@@ -179,8 +179,13 @@ const EXT_TO_LANG: Record<string, string> = {
     // Protocol Buffers
     '.proto': 'proto',
 
-    // Tree-sitter Query Language (the .scm grammar files themselves)
-    '.scm': 'query',
+    // Tree-sitter Query Language (the .scm grammar files themselves).
+    // NOTE: .scm extension is NOT mapped here because it conflicts with
+    // Scheme source files, which conventionally use .scm. Tree-sitter
+    // query files have a strict naming convention (tags.scm,
+    // highlights.scm, locals.scm, injections.scm) and are matched via
+    // FILENAME_TO_LANG instead, so editors of Scheme code don't get
+    // their files misclassified as tree-sitter query language.
 
     // Svelte
     '.svelte': 'svelte',
@@ -296,6 +301,17 @@ const FILENAME_TO_LANG: Record<string, string> = {
     // TOML-format files without .toml extension
     'Cargo.lock':            'toml',
     'Pipfile':               'toml',
+
+    // Tree-sitter Query Language — canonical basenames inside grammar
+    // source trees. The .scm extension is intentionally NOT mapped in
+    // EXT_TO_LANG because Scheme source files share that extension and
+    // are far more common than tree-sitter query files outside of
+    // grammar-author workflows. These four basenames are the only files
+    // in standard tree-sitter grammar layouts.
+    'tags.scm':              'query',
+    'highlights.scm':        'query',
+    'locals.scm':            'query',
+    'injections.scm':        'query',
 };
 
 /**
