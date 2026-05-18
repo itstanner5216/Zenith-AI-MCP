@@ -10,6 +10,8 @@ export interface ToolMapping {
   tool: Tool;
   handler?: unknown;
   namespace?: string;
+  /** Original Zod input schema for runtime validation before dispatch. */
+  inputZodSchema?: unknown;
 }
 
 export interface PromptMapping {

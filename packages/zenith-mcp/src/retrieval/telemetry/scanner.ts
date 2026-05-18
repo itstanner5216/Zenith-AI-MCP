@@ -45,6 +45,11 @@ const ALL_ALLOWED_FILES: Set<string> = new Set([
 ]);
 
 // ── Denylist ─────────────────────────────────────────────────────────────────
+// Patterns are matched against file/directory NAMES (not paths) using minimatch
+// with { dot: true }. Each `*` matches any characters within the name (no `/`
+// crossing needed since we match basenames only). These are intentionally anchored
+// (must match the whole name) for precision — broader than the old substring
+// matcher where needed via explicit leading/trailing wildcards.
 const DENIED_PATTERNS: string[] = [
   ".env",        // exact: the well-known ".env" file
   ".env.*",      // ".env.production", ".env.local", etc.
@@ -59,17 +64,12 @@ const DENIED_PATTERNS: string[] = [
   "id_ed25519.*",
   "id_dsa",
   "id_ecdsa",
+  "*credentials*",   // any filename containing "credentials" (broad: security-critical)
+  "*secret*",        // any filename containing "secret"
+  "*secrets*",       // any filename containing "secrets"
   "*.aws_credentials",
-  "credentials",       // exact: a file literally named "credentials"
-  "*-credentials",     // separator-based secret filenames such as "aws-credentials"
-  "*-credentials.*",   // suffixed secret filenames such as "aws-credentials.json"
-  "*_credentials",     // separator-based secret filenames such as "gcp_credentials"
-  "*_credentials.*",   // suffixed secret filenames such as "gcp_credentials.json"
-  "*.credentials",     // dedicated credentials extension such as "prod.credentials"
-  ".credentials",      // hidden credentials file
   ".aws",
-  "*.secret",
-  "*.secrets",
+  ".credentials",
 ];
 
 // ── Defaults ─────────────────────────────────────────────────────────────────

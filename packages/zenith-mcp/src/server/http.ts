@@ -236,7 +236,8 @@ app.post('/mcp', async (req, res) => {
 
     await server.connect(transport);
 
-    // Register BEFORE handling so any concurrent request for this session can find it
+    // Pre-register so the session is discoverable if a concurrent request arrives
+    // after the initialize response is sent but before this handler returns.
     sessions.set(sid, {
         type: 'streamable',
         transport,
@@ -248,6 +249,14 @@ app.post('/mcp', async (req, res) => {
 
     try {
         await transport.handleRequest(req, res, req.body);
+
+        // If the SDK rejected initialization (e.g. bad headers, protocol error)
+        // it returns an error response without throwing. In that case the transport
+        // never adopts the session ID and the client never receives it — clean up.
+        if (transport.sessionId !== sid) {
+            removeSession(sid);
+            try { await transport.close(); } catch { /* already dead */ }
+        }
     } catch (err) {
         removeSession(sid);
         try { await transport.close(); } catch { /* best effort — already closed */ }

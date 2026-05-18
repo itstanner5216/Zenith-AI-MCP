@@ -79,6 +79,15 @@ const _MIN_OMISSION_THRESHOLD = 3;
 // Content Type Detection
 // ---------------------------------------------------------------------------
 
+/**
+ * Detects whether text is a multi-line stack trace (not a single-line error).
+ *
+ * Design decision: single-line error messages like "TypeError: Cannot read
+ * property 'x' of undefined" are NOT stack traces — they're error strings that
+ * should flow through normal text compression. This function identifies actual
+ * structural stack traces (multiple frames, exception chains) that benefit from
+ * the dedicated stack-trace formatting path.
+ */
 function _isStackTrace(text: string): boolean {
   const sample = text.slice(0, 2000);
   const lines = sample.split('\n').slice(0, 80);

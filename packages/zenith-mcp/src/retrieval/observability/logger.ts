@@ -1,4 +1,6 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { dirname } from "node:path";
 import type { RankingEvent, RetrievalContext, ScoredTool } from "../models.js";
 
@@ -104,32 +106,86 @@ export class FileRetrievalLogger implements RetrievalLogger {
     await this._appendLine(line);
   }
 
+  // Incremental cache: avoids re-parsing the entire log on every request.
+  // Tracks the file size at which we last read, and appends only new lines.
+  private _cachedEvents: RankingEvent[] = [];
+  private _lastReadSize = 0;
+
   async readRankingEvents(sinceEpochSeconds: number): Promise<RankingEvent[]> {
     await this._ready;
-    let text: string;
+
+    // Check current file size to determine if new data has been appended
+    let fileSize: number;
     try {
-      text = await readFile(this._path, "utf-8");
+      const stats = await stat(this._path);
+      fileSize = stats.size;
     } catch {
       return [];
     }
 
-    const events: RankingEvent[] = [];
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-      const obj = parsed as Record<string, unknown>;
-      if (obj.type === "alert" || obj.group === "shadow") continue;
-      const ts = typeof obj.timestamp === "number" ? obj.timestamp : undefined;
-      if (ts === undefined || ts < sinceEpochSeconds) continue;
-      if (isRankingEventShape(parsed)) events.push(parsed);
+    // If file was truncated/rotated, reset cache
+    if (fileSize < this._lastReadSize) {
+      this._cachedEvents = [];
+      this._lastReadSize = 0;
     }
-    return events;
+
+    // Stream only new bytes (from _lastReadSize onward)
+    if (fileSize > this._lastReadSize) {
+      const newEvents = await this._streamNewEvents(this._lastReadSize);
+      this._cachedEvents.push(...newEvents);
+      this._lastReadSize = fileSize;
+    }
+
+    // Prune expired events from cache head (events are appended chronologically)
+    while (
+      this._cachedEvents.length > 0 &&
+      this._cachedEvents[0].timestamp < sinceEpochSeconds
+    ) {
+      this._cachedEvents.shift();
+    }
+
+    // Return events matching the time window
+    return this._cachedEvents.filter((ev) => ev.timestamp >= sinceEpochSeconds);
+  }
+
+  private _streamNewEvents(startByte: number): Promise<RankingEvent[]> {
+    return new Promise((resolve) => {
+      const events: RankingEvent[] = [];
+      let stream: ReturnType<typeof createReadStream> | null = null;
+
+      try {
+        stream = createReadStream(this._path, {
+          encoding: "utf-8",
+          start: startByte,
+        });
+      } catch {
+        resolve(events);
+        return;
+      }
+
+      const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+      rl.on("line", (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+        const obj = parsed as Record<string, unknown>;
+        if (obj.type === "alert" || obj.group === "shadow") return;
+        if (typeof obj.timestamp !== "number") return;
+        if (isRankingEventShape(parsed)) events.push(parsed);
+      });
+
+      rl.on("close", () => resolve(events));
+      rl.on("error", () => {
+        stream?.destroy();
+        resolve(events);
+      });
+    });
   }
 }

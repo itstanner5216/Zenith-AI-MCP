@@ -88,6 +88,28 @@ function sessionIdFromExtra(extra: unknown): string {
       : "default";
 }
 
+/**
+ * Validates args against the tool's stored Zod schema before dispatch.
+ * Returns a validation error message if invalid, or null if valid/no schema.
+ */
+function validateToolArgs(
+  mapping: { inputZodSchema?: unknown },
+  args: Record<string, unknown>,
+): string | null {
+  const schema = mapping.inputZodSchema;
+  if (!schema || typeof schema !== "object") return null;
+
+  // Zod v4+ uses safeParse; Zod v3 also uses safeParse
+  const zodLike = schema as { safeParse?: (data: unknown) => { success: boolean; error?: { message?: string; issues?: unknown[] } } };
+  if (typeof zodLike.safeParse !== "function") return null;
+
+  const result = zodLike.safeParse(args);
+  if (result.success) return null;
+
+  const errMsg = result.error?.message ?? "Invalid arguments";
+  return errMsg;
+}
+
 // ── Tool registration hook ───────────────────────────────────────────────────
 
 type RegisterToolArgs = [
@@ -117,7 +139,11 @@ export function createRetrievalAwareToolRegistrar(
       let currentName = name;
       const sync = () => {
         const tool = toListedTool(currentName, result as RegisteredToolLike);
-        registry.register(tool, (result as RegisteredToolLike).handler ?? handler);
+        registry.register(
+          tool,
+          (result as RegisteredToolLike).handler ?? handler,
+          config.inputSchema,
+        );
         onRegistryChanged?.();
       };
 
@@ -247,6 +273,13 @@ export function installRetrievalRequestHandlers(
       if (!handler) {
         return errorResult(`Tool ${target} has no handler`);
       }
+
+      // Validate args against tool's Zod schema before dispatch
+      const validationErr = validateToolArgs(mapping, routedArgs);
+      if (validationErr) {
+        return errorResult(`Tool ${target} input validation failed: ${validationErr}`);
+      }
+
       let result: CallToolResult;
       try {
         result = await handler(routedArgs, extra);
@@ -270,6 +303,13 @@ export function installRetrievalRequestHandlers(
       return errorResult(`Tool ${toolName} has no registered handler`);
     }
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+
+    // Validate args against tool's Zod schema before dispatch
+    const validationErr = validateToolArgs(mapping, args);
+    if (validationErr) {
+      return errorResult(`Tool ${toolName} input validation failed: ${validationErr}`);
+    }
+
     let result: CallToolResult;
     try {
       result = await handler(args, extra);
