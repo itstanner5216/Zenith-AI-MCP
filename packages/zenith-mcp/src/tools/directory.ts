@@ -209,7 +209,7 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                 if (totalEntries >= TREE_MAX_ENTRIES)
                     break;
                 const nextPath = path.join(currentPath, entry.name);
-                const entryData: FileTreeEntry = currentDepth < maxDepth
+                const entryData: FileTreeEntry = currentDepth + 1 < maxDepth
                     ? { name: entry.name, children: await buildTree(nextPath, currentDepth + 1, excludePatterns) }
                     : { name: entry.name, children: [] }; // Show as dir stub at max depth
                 result.push(entryData);
