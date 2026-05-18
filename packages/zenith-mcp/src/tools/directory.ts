@@ -53,6 +53,16 @@ export function register(server: ToolServer, ctx: ToolContext): void {
             const excludePatterns = args.excludePatterns ?? [];
             const defaultExcludes = getDefaultExcludes();
 
+            function escapeCtrl(str: string): string {
+                return str.replace(/[\x00-\x1F\x7F]/g, (c: string) => {
+                    const code = c.charCodeAt(0);
+                    if (code === 0x09) return '\\t';
+                    if (code === 0x0A) return '\\n';
+                    if (code === 0x0D) return '\\r';
+                    return `\\x${code.toString(16).padStart(2, '0')}`;
+                });
+            }
+
             function compareEntries(
                 left: { entry: Dirent; size: number },
                 right: { entry: Dirent; size: number },
@@ -120,15 +130,16 @@ export function register(server: ToolServer, ctx: ToolContext): void {
                 processed.sort(compareEntries);
                 for (const { entry, size } of processed) {
                     const rel = relativeBase ? path.join(relativeBase, entry.name) : entry.name;
+                    const safeRel = escapeCtrl(rel);
                     if (entry.isDirectory()) {
-                        lines.push(`${rel}/`);
+                        lines.push(`${safeRel}/`);
                         if (currentDepth + 1 < depth) {
                             const subLines: string[] = await listRecursive(path.join(dirPath, entry.name), currentDepth + 1, rel);
                             lines.push(...subLines);
                         }
                     }
                     else {
-                        lines.push(includeSizes ? `${rel}  ${formatSize(size)}` : rel);
+                        lines.push(includeSizes ? `${safeRel}  ${formatSize(size)}` : safeRel);
                     }
                 }
                 if (truncated) lines.push('[truncated]');

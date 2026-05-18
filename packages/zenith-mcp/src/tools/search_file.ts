@@ -1,7 +1,7 @@
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
-import { getCharBudget, ripgrepAvailable, ripgrepSearch } from '../core/shared.js';
+import { getCharBudget, ripgrepAvailable, ripgrepSearch, lastRipgrepError } from '../core/shared.js';
 import { getLangForFile, findSymbol } from '../core/tree-sitter.js';
 import type { ToolServer, ToolContext } from './types.js';
 
@@ -38,7 +38,8 @@ export function register(server: ToolServer, ctx: ToolContext): void {
             });
 
             if (rgResults === null) {
-                throw new Error('Search failed — ripgrep process error.');
+                const detail = lastRipgrepError ? `: ${lastRipgrepError}` : '';
+                throw new Error(`Search failed — ripgrep process error${detail}`);
             }
             if (rgResults.length === 0) {
                 return { content: [{ type: 'text' as const, text: 'No matches.' }] };

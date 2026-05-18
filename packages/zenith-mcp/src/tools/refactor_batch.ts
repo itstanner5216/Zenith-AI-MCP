@@ -265,7 +265,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
             depth: z.number().int().min(1).max(5).default(1).describe("query: How many hops to traverse the call graph. 1 = direct callers/callees only."),
             selection: z.array(z.union([
                 z.number().int().min(1),
-                z.object({ symbol: z.string(), file: z.string().optional() }),
+                z.object({ symbol: z.string(), file: z.string().optional() }).strict(),
             ])).optional().describe("loadDiff: Which symbols to load. Either numeric indices from a prior query result, or explicit {symbol, file?} pairs. You can skip query and go straight to loadDiff with explicit pairs."),
             contextLines: z.number().int().min(0).max(getMaxContextLines()).default(DEFAULT_CONTEXT).describe("loadDiff: How many lines above and below each symbol body to include as read-only context. Context lines are marked with │ so you can distinguish them from the editable body."),
             loadMore: z.boolean().default(false).describe("loadDiff: When a prior loadDiff was truncated at the char budget, call loadDiff again with loadMore=true to get the next page."),
@@ -274,7 +274,7 @@ export function register(server: ToolServer, ctx: ToolContext) {
             symbolGroup: z.string().optional().describe("reapply: The symbol name from a prior successful apply. The server caches the edit body and reuses it on newTargets."),
             newTargets: z.array(z.union([
                 z.string(),
-                z.object({ symbol: z.string(), file: z.string().optional() }),
+                z.object({ symbol: z.string(), file: z.string().optional() }).strict(),
             ])).optional().describe("reapply: Symbols to apply the cached edit pattern to. Same format as loadDiff selection — names or {symbol, file?} pairs."),
             ack: z.array(z.number().int().min(1)).optional().describe("reapply: When the server flags structurally different targets as outliers, provide their indices here to acknowledge and proceed anyway."),
             symbol: z.string().optional().describe("restore/history: The symbol name. restore rolls it back to a prior snapshot; history lists available snapshots."),

@@ -82,11 +82,30 @@ export function getSensitivePatterns(): string[] {
 }
 
 export function isSensitive(filePath: string): boolean {
-    const rel = path.relative(os.homedir(), filePath);
-    return getSensitivePatterns().some(pat =>
-        minimatch(rel, pat, { dot: true, nocase: true }) ||
-        minimatch(path.basename(filePath), pat.replace(/\*\*\//g, ''), { dot: true, nocase: true })
-    );
+    const absPath = path.resolve(filePath);
+    const rel = path.relative(os.homedir(), absPath);
+    const basename = path.basename(absPath);
+    // Test patterns against: home-relative path, basename, and absolute path segments
+    // This ensures patterns like .config/** work regardless of file location
+    return getSensitivePatterns().some(pat => {
+        const barePattern = pat.replace(/\*\*\//g, '');
+        if (minimatch(rel, pat, { dot: true, nocase: true })) return true;
+        if (minimatch(basename, barePattern, { dot: true, nocase: true })) return true;
+        // For directory-based patterns (e.g. **/.config/**), check if any path segment matches
+        if (pat.includes('/')) {
+            const segments = absPath.split(path.sep);
+            const patParts = pat.replace(/^\*\*\//, '').split('/');
+            const dirPart = patParts[0];
+            if (dirPart && segments.some(seg => seg === dirPart)) {
+                // Rebuild relative path from the matching segment onward
+                const idx = segments.lastIndexOf(dirPart);
+                const fromDir = segments.slice(idx).join('/');
+                const innerPat = patParts.join('/');
+                if (minimatch(fromDir, innerPat, { dot: true, nocase: true })) return true;
+            }
+        }
+        return false;
+    });
 }
 
 const WORD_RE = /[a-z0-9_]+/g;
@@ -283,6 +302,9 @@ export async function bm25PreFilterFiles(rootPath: string, query: string, topK =
 
 export const RG_PATH = '/usr/bin/rg';
 
+/** Last ripgrep error message — populated when ripgrepSearch returns null. */
+export let lastRipgrepError: string | null = null;
+
 export async function ripgrepAvailable() {
     try {
         await fs.access(RG_PATH, fsConstants.X_OK);
@@ -334,6 +356,7 @@ export async function ripgrepSearch(rootPath: string, options: {
         const results: RipgrepResult[] = [];
         let stderr = '';
         let killed = false;
+        lastRipgrepError = null;
         const proc = spawn(RG_PATH, rgArgs, { timeout: 30000 });
         let buffer = '';
         proc.stdout.on('data', (chunk) => {
@@ -367,13 +390,18 @@ export async function ripgrepSearch(rootPath: string, options: {
         proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
         proc.on('close', (code) => {
             if (!killed && (code ?? 0) > 1) {
-                console.error('ripgrep exited with code ' + code, stderr.slice(0, 200));
+                lastRipgrepError = stderr.slice(0, 200) || `ripgrep exited with code ${code}`;
                 resolveP(null);
                 return;
             }
             resolveP(results.slice(0, maxResults));
         });
-        proc.on('error', () => { if (!killed) resolveP(null); });
+        proc.on('error', (err) => {
+            if (!killed) {
+                lastRipgrepError = err.message || 'ripgrep process error';
+                resolveP(null);
+            }
+        });
     });
 }
 

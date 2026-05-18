@@ -224,6 +224,9 @@ function purgeIndexedPath(db: Database.Database, relPath: string): void {
 export async function indexFile(db: Database.Database, repoRoot: string, absFilePath: string): Promise<void> {
     const relPath = path.relative(repoRoot, absFilePath);
 
+    // Guard: reject paths that escape repoRoot
+    if (relPath.startsWith('..') || path.isAbsolute(relPath)) return;
+
     if (!shouldIndexFile(repoRoot, absFilePath)) {
         purgeIndexedPath(db, relPath);
         return;
@@ -233,6 +236,7 @@ export async function indexFile(db: Database.Database, repoRoot: string, absFile
     try {
         source = await fs.readFile(absFilePath, 'utf-8'); // nosemgrep
     } catch {
+        purgeIndexedPath(db, relPath);
         return;
     }
 
@@ -241,10 +245,16 @@ export async function indexFile(db: Database.Database, repoRoot: string, absFile
     if (existing && existing.hash === hash) return;
 
     const langName = getLangForFile(absFilePath);
-    if (!langName) return;
+    if (!langName) {
+        purgeIndexedPath(db, relPath);
+        return;
+    }
 
     const symbols = await getSymbols(source, langName);
-    if (!symbols) return;
+    if (!symbols) {
+        purgeIndexedPath(db, relPath);
+        return;
+    }
 
     const defs = symbols.filter((s: SymbolLike) => s.kind === 'def');
     const refs = symbols.filter((s: SymbolLike) => s.kind === 'ref');
@@ -327,6 +337,20 @@ export async function indexDirectory(db: Database.Database, repoRoot: string, di
     }
 
     await walk(dirPath);
+
+    // Purge stale DB rows for files under this directory that were not visited
+    // (e.g. files under now-excluded directories or deleted files)
+    const dirRelPath = path.relative(repoRoot, dirPath);
+    const prefix = dirRelPath ? dirRelPath + path.sep : '';
+    const indexedFiles = db.prepare<unknown[], { path: string }>(
+        'SELECT path FROM files WHERE path LIKE ?'
+    ).all(`${prefix}%`);
+    const visitedRelPaths = new Set(filePaths.map(f => path.relative(repoRoot, f)));
+    for (const row of indexedFiles) {
+        if (!visitedRelPaths.has(row.path)) {
+            purgeIndexedPath(db, row.path);
+        }
+    }
 
     const BATCH_SIZE = 50;
     for (let i = 0; i < filePaths.length; i += BATCH_SIZE) {
